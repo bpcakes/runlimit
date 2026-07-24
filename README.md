@@ -264,10 +264,31 @@ cargo check \
   --target-dir target/external-consumer
 ```
 
-Publish the crates in dependency order: `runlimit-core`, then
-`runlimit-memory`, then `runlimit-postgres`. A dependent crate's publish dry
-run can resolve only after the preceding version is visible in the crates.io
-index. Remaining work toward a stable release is tracked in `ROADMAP.md`.
+Remaining work toward a stable release is tracked in `ROADMAP.md`.
+
+## Releasing
+
+Prepare a release from a clean checkout:
+
+```sh
+RUNLIMIT_POSTGRES_TEST_DATABASE_URL=postgresql://... \
+  ./scripts/prepare-release.sh 0.1.0
+```
+
+Review the release metadata and hand-written changelog entry, commit them, push
+`master`, and wait for CI to pass on that exact commit. Then publish with:
+
+```sh
+./scripts/publish-release.sh 0.1.0
+```
+
+The publish script requires local `master` to match `origin/master`. It
+publishes `runlimit-core`, waits for crates.io to index it, publishes
+`runlimit-memory`, waits again, and finally publishes `runlimit-postgres`.
+After every crate is indexed, it creates and pushes the matching `v0.1.0` tag.
+If a publish stops partway through, resume explicitly with
+`RESUME_RELEASE=1 ./scripts/publish-release.sh 0.1.0`; already-published crate
+versions are verified before the script continues.
 
 ## License
 

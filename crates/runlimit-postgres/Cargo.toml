@@ -8,6 +8,7 @@ publish.workspace = true
 description = "Replica-safe PostgreSQL rate-limit storage"
 documentation = "https://docs.rs/runlimit-postgres"
 readme = "../../README.md"
+repository.workspace = true
 keywords = ["rate-limit", "throttling", "postgres"]
 categories = ["web-programming", "database"]
 

@@ -8,6 +8,7 @@ publish.workspace = true
 description = "Framework-neutral rate-limit policies, keys, and decisions"
 documentation = "https://docs.rs/runlimit-core"
 readme = "../../README.md"
+repository.workspace = true
 keywords = ["rate-limit", "throttling", "security"]
 categories = ["web-programming"]
 

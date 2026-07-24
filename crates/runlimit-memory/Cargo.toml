@@ -8,6 +8,7 @@ publish.workspace = true
 description = "Hard-bounded in-memory fixed-window rate limiting"
 documentation = "https://docs.rs/runlimit-memory"
 readme = "../../README.md"
+repository.workspace = true
 keywords = ["rate-limit", "throttling", "security"]
 categories = ["web-programming"]
 
