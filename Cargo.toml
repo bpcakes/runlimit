@@ -19,7 +19,7 @@ runlimit-core = { version = "0.1.0", path = "crates/runlimit-core" }
 runlimit-memory = { version = "0.1.0", path = "crates/runlimit-memory" }
 runlimit-postgres = { version = "0.1.0", path = "crates/runlimit-postgres" }
 hmac = "0.12.1"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 sqlx = { version = "0.8.6", default-features = false }
 thiserror = "2.0.12"
 tokio = { version = "1.47.1", default-features = false }
