@@ -1,0 +1,12 @@
+target/
+/.rustc_info.json
+
+.env
+.env.*
+!.env.example
+
+*.log
+.DS_Store
+/.idea/
+/.vscode/
+/.cargo/credentials.toml

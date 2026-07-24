@@ -1,0 +1,27 @@
+//! Framework-neutral contracts shared by Runlimit storage backends.
+//!
+//! This crate defines anchored fixed-window policies, opaque subject keys,
+//! checks, and backend-independent decisions. It deliberately contains no
+//! async runtime, transport framework, or persistence integration.
+//!
+//! Applications own subject normalization and policy selection. Raw subjects
+//! should be converted to [`SubjectKey`] values with [`KeyHasher`] before they
+//! cross into a storage backend.
+
+mod batch;
+mod check;
+mod counter;
+mod decision;
+mod identifier;
+mod key;
+mod policy;
+
+pub use batch::{BatchError, validate_batch};
+pub use check::{Check, CheckError};
+pub use counter::CounterKey;
+pub use decision::{BatchDecision, Decision, Denial};
+pub use identifier::{IdentifierError, MAX_IDENTIFIER_LENGTH, PolicyId, ScopeId};
+pub use key::{KeyHasher, KeyHasherError, SubjectKey};
+pub use policy::{
+    FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, PolicyError, PolicyFingerprint,
+};

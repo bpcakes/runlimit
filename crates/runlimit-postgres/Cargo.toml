@@ -1,0 +1,37 @@
+[package]
+name = "runlimit-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Replica-safe PostgreSQL rate-limit storage"
+documentation = "https://docs.rs/runlimit-postgres"
+readme = "../../README.md"
+keywords = ["rate-limit", "throttling", "postgres"]
+categories = ["web-programming", "database"]
+
+[dependencies]
+runlimit-core.workspace = true
+sha2.workspace = true
+sqlx = { workspace = true, features = [
+    "chrono",
+    "macros",
+    "migrate",
+    "postgres",
+    "runtime-tokio",
+] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+runlimit-memory.workspace = true
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[lints]
+workspace = true

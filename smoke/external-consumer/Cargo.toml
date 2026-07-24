@@ -1,0 +1,22 @@
+[package]
+name = "runlimit-external-consumer-smoke"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+runlimit-core = { version = "0.1.0", path = "../../crates/runlimit-core" }
+runlimit-memory = { version = "0.1.0", path = "../../crates/runlimit-memory" }
+
+# Keep this package outside Runlimit's workspace so it exercises path
+# dependency resolution from an independent consumer.
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

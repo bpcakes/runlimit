@@ -1,0 +1,21 @@
+[package]
+name = "runlimit-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Framework-neutral rate-limit policies, keys, and decisions"
+documentation = "https://docs.rs/runlimit-core"
+readme = "../../README.md"
+keywords = ["rate-limit", "throttling", "security"]
+categories = ["web-programming"]
+
+[dependencies]
+hmac.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

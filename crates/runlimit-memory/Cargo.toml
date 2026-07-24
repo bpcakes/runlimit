@@ -1,0 +1,19 @@
+[package]
+name = "runlimit-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Hard-bounded in-memory fixed-window rate limiting"
+documentation = "https://docs.rs/runlimit-memory"
+readme = "../../README.md"
+keywords = ["rate-limit", "throttling", "security"]
+categories = ["web-programming"]
+
+[dependencies]
+runlimit-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

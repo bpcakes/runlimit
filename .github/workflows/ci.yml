@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +stable fmt --all -- --check
+      - run: cargo +stable clippy --workspace --all-targets -- -D warnings
+      - run: cargo +stable test --workspace
+      - name: Format external consumer
+        run: >-
+          cargo +stable fmt
+          --manifest-path smoke/external-consumer/Cargo.toml
+          -- --check
+      - name: Lint external consumer
+        run: >-
+          cargo +stable clippy
+          --manifest-path smoke/external-consumer/Cargo.toml
+          --all-targets
+          --locked
+          --target-dir target/external-consumer
+          -- -D warnings
+
+  msrv:
+    name: Rust 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +1.88.0 check --workspace --all-targets
+      - name: Check external consumer
+        run: >-
+          cargo +1.88.0 check
+          --manifest-path smoke/external-consumer/Cargo.toml
+          --locked
+          --target-dir target/external-consumer
+
+  postgres:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: runlimit
+          POSTGRES_PASSWORD: runlimit
+          POSTGRES_DB: runlimit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U runlimit -d runlimit"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RUNLIMIT_POSTGRES_TEST_DATABASE_URL: postgresql://runlimit:runlimit@127.0.0.1:5432/runlimit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Run PostgreSQL integration tests
+        run: >-
+          cargo +stable test
+          -p runlimit-postgres
+          --test postgres
+          --
+          --ignored
+          --test-threads=1

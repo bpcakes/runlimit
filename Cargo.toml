@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/runlimit-core",
+    "crates/runlimit-memory",
+    "crates/runlimit-postgres",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+publish = ["crates-io"]
+
+[workspace.dependencies]
+runlimit-core = { version = "0.1.0", path = "crates/runlimit-core" }
+runlimit-memory = { version = "0.1.0", path = "crates/runlimit-memory" }
+runlimit-postgres = { version = "0.1.0", path = "crates/runlimit-postgres" }
+hmac = "0.12.1"
+sha2 = "0.10.9"
+sqlx = { version = "0.8.6", default-features = false }
+thiserror = "2.0.12"
+tokio = { version = "1.47.1", default-features = false }
+zeroize = "1.8.1"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
