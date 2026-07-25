@@ -5,7 +5,9 @@
 //! checks share that window until it expires. `PostgreSQL`'s clock is the sole
 //! time authority, so callers on different hosts do not need synchronized
 //! clocks. Atomic batches use set-based lock, preflight, and update phases, so
-//! their number of SQL phases does not grow with the batch size.
+//! their number of SQL phases does not grow with the batch size. Single checks
+//! combine lock acquisition, time sampling, evaluation, and mutation into one
+//! admission statement inside the transaction.
 //!
 //! # Installation
 //!
@@ -13,9 +15,9 @@
 //! `SQLx`'s `_sqlx_migrations` table with application migrations only when every
 //! participating [`Migrator`] configures
 //! [`Migrator::set_ignore_missing`] to `true`.
-//! A strict application migrator will reject Runlimit's migration version as
-//! unknown. The migration creates `runlimit_fixed_windows` in the connection's
-//! default schema.
+//! A strict application migrator will reject Runlimit's migration versions as
+//! unknown. The first migration creates `runlimit_fixed_windows` in the
+//! connection's default schema.
 //!
 //! [`MIGRATOR`] is the raw bundled migrator with `SQLx`'s strict defaults. It is
 //! intended for an exclusively managed migration history and connection. It
@@ -34,6 +36,9 @@
 //! confirmation. [`CheckError::CommittedResponseInvariant`] means the commit
 //! was confirmed but its response was unusable. Fail closed in all three cases,
 //! and do not blindly retry a check that may already have consumed quota.
+//! Once the database has produced a denial, an explicit rollback failure or
+//! deadline cannot replace that valid decision; the connection is discarded so
+//! closing it rolls back the non-mutating denied transaction.
 //! Dropping a check or cleanup future prevents the backend from reporting its
 //! outcome; if cancellation races with commit, callers must likewise treat the
 //! outcome as unknown. Prefer this backend's configured deadline to a shorter
@@ -278,6 +283,120 @@ CROSS JOIN response
 ORDER BY input.input_position
 ";
 
+// These materialized CTEs form execution barriers, not just an optimizer hint:
+// `count(acquired)` consumes the volatile advisory-lock result, the correlated
+// lateral row lookup cannot run before that count exists, and the second count
+// exhausts the locking lookup before `clock_timestamp()` can be evaluated.
+// Consequently the authoritative sample is taken only after both lock phases.
+const SINGLE_CHECK_SQL: &str = r"
+WITH advisory_lock AS MATERIALIZED (
+    SELECT
+        $1::BIGINT AS lock_id,
+        pg_advisory_xact_lock($1) AS acquired
+),
+advisory_lock_barrier AS MATERIALIZED (
+    SELECT
+        lock_id,
+        count(acquired) AS acquired_count
+    FROM advisory_lock
+    GROUP BY lock_id
+),
+locked_window AS MATERIALIZED (
+    SELECT
+        windows.window_expires_at,
+        windows.used
+    FROM advisory_lock_barrier
+    CROSS JOIN LATERAL (
+        SELECT
+            candidate.window_expires_at,
+            candidate.used
+        FROM runlimit_fixed_windows AS candidate
+        WHERE
+            candidate.config_fingerprint = $4
+            AND candidate.subject_key = $5
+            AND advisory_lock_barrier.acquired_count = 1
+        FOR UPDATE OF candidate
+    ) AS windows
+),
+row_lock_barrier AS MATERIALIZED (
+    SELECT count(*) AS locked_count
+    FROM locked_window
+),
+sample AS MATERIALIZED (
+    SELECT clock_timestamp() AS database_now
+    FROM row_lock_barrier
+),
+evaluation AS MATERIALIZED (
+    SELECT
+        sample.database_now,
+        locked_window.window_expires_at,
+        COALESCE(
+            locked_window.window_expires_at > sample.database_now
+                AND locked_window.used > $8 - $7,
+            FALSE
+        ) AS denied
+    FROM sample
+    LEFT JOIN locked_window ON TRUE
+),
+upserted AS (
+    INSERT INTO runlimit_fixed_windows (
+        policy_id,
+        scope_id,
+        config_fingerprint,
+        subject_key,
+        window_started_at,
+        window_expires_at,
+        used
+    )
+    SELECT
+        $2,
+        $3,
+        $4,
+        $5,
+        evaluation.database_now,
+        evaluation.database_now + $6,
+        $7
+    FROM evaluation
+    WHERE NOT evaluation.denied
+    ON CONFLICT (config_fingerprint, subject_key)
+    DO UPDATE SET
+        policy_id = EXCLUDED.policy_id,
+        scope_id = EXCLUDED.scope_id,
+        window_started_at = CASE
+            WHEN runlimit_fixed_windows.window_expires_at <= EXCLUDED.window_started_at
+                THEN EXCLUDED.window_started_at
+            ELSE runlimit_fixed_windows.window_started_at
+        END,
+        window_expires_at = CASE
+            WHEN runlimit_fixed_windows.window_expires_at <= EXCLUDED.window_started_at
+                THEN EXCLUDED.window_expires_at
+            ELSE runlimit_fixed_windows.window_expires_at
+        END,
+        used = CASE
+            WHEN runlimit_fixed_windows.window_expires_at <= EXCLUDED.window_started_at
+                THEN EXCLUDED.used
+            ELSE runlimit_fixed_windows.used + EXCLUDED.used
+        END
+    WHERE
+        runlimit_fixed_windows.window_expires_at <= EXCLUDED.window_started_at
+        OR runlimit_fixed_windows.used <= $8 - $7
+    RETURNING
+        used,
+        window_expires_at
+)
+SELECT
+    evaluation.database_now,
+    clock_timestamp() AS response_now,
+    evaluation.denied,
+    COALESCE(
+        upserted.window_expires_at,
+        evaluation.window_expires_at
+    ) AS window_expires_at,
+    upserted.used
+FROM evaluation
+LEFT JOIN upserted ON TRUE
+";
+
 const CLEANUP_SQL: &str = include_str!("cleanup_expired.sql");
 
 /// Runtime bounds for `PostgreSQL` admission work.
@@ -472,9 +591,12 @@ impl PostgresLimiter {
     /// are rejected before a connection is acquired because their independent
     /// decision metadata would be ambiguous.
     ///
-    /// If any check is denied, the entire transaction is rolled back and the
-    /// returned denial index is the earliest denied item in caller order.
-    /// Passing an empty slice succeeds without acquiring a database connection.
+    /// If any check is denied, the backend attempts an explicit rollback and
+    /// the returned denial index is the earliest denied item in caller order.
+    /// A rollback error or deadline does not replace the denial because no
+    /// counter was changed; instead, the connection is discarded so socket
+    /// closure rolls the transaction back. Passing an empty slice succeeds
+    /// without acquiring a database connection.
     ///
     /// # Errors
     ///
@@ -496,13 +618,20 @@ impl PostgresLimiter {
         let mut guarded_connection = ConnectionCancellationGuard::new(connection);
         let result =
             run_check_transaction(guarded_connection.connection(), &input, checks, deadline).await;
-        if !result
-            .as_ref()
-            .is_err_and(CheckRunError::client_timeout_won)
-        {
-            guarded_connection.disarm();
+        match result {
+            Ok(outcome) => {
+                if outcome.connection_reusable {
+                    guarded_connection.disarm();
+                }
+                Ok(outcome.decision)
+            }
+            Err(error) => {
+                if !error.client_timeout_won() {
+                    guarded_connection.disarm();
+                }
+                Err(error.into_public())
+            }
         }
-        result.map_err(CheckRunError::into_public)
     }
 
     /// Deletes at most `maximum_rows` expired windows.
@@ -669,6 +798,12 @@ enum CheckRunError {
     Public(CheckError),
     ClientTimedOutBeforeCommit { operation: &'static str },
     ClientCommitTimedOut,
+}
+
+#[derive(Debug)]
+struct CheckRunOutcome {
+    decision: BatchDecision,
+    connection_reusable: bool,
 }
 
 impl CheckRunError {
@@ -844,50 +979,84 @@ async fn run_check_transaction(
     input: &BatchSqlInput,
     checks: &[Check<'_>],
     deadline: Instant,
-) -> Result<BatchDecision, CheckRunError> {
+) -> Result<CheckRunOutcome, CheckRunError> {
     let mut transaction =
         check_before_commit(deadline, "beginning transaction", connection.begin()).await?;
+    set_check_server_timeouts(
+        &mut transaction,
+        deadline,
+        "configuring transaction timeouts",
+    )
+    .await?;
 
-    // Advisory locks cover logical keys that do not have rows yet. Their
-    // stable numeric IDs are sorted independently from exact storage keys so
-    // deliberately colliding batches cannot acquire them in opposite orders.
-    acquire_advisory_locks(&mut transaction, &input.advisory_lock_ids, deadline).await?;
+    let (pending, authoritative_elapsed) = if checks.len() == 1 {
+        execute_single(&mut transaction, input, &checks[0], deadline).await?
+    } else {
+        // Advisory locks cover logical keys that do not have rows yet. Their
+        // stable numeric IDs are sorted independently from exact storage keys
+        // so deliberately colliding batches cannot acquire them in opposite
+        // orders.
+        acquire_advisory_locks(&mut transaction, &input.advisory_lock_ids, deadline).await?;
 
-    // Existing rows may be held by cleanup or a transaction predating the
-    // advisory-lock protocol. Wait for all row locks before sampling database
-    // time, otherwise a contended request could evaluate against stale time.
-    acquire_existing_row_locks(&mut transaction, input, deadline).await?;
+        // Existing rows may be held by cleanup or a transaction predating the
+        // advisory-lock protocol. Wait for all row locks before sampling
+        // database time, otherwise a contended request could evaluate against
+        // stale time.
+        acquire_existing_row_locks(&mut transaction, input, deadline).await?;
 
-    let (pending, authoritative_elapsed) =
-        execute_batch(&mut transaction, input, checks, deadline).await?;
+        execute_batch(&mut transaction, input, checks, deadline).await?
+    };
 
     match pending {
-        PendingBatchOutcome::Denied { index, denial } => {
-            set_check_server_timeouts(&mut transaction, deadline, "rolling back denied batch")
-                .await?;
-            check_before_commit(
-                deadline,
-                "rolling back denied batch",
-                transaction.rollback(),
-            )
-            .await?;
-            Ok(BatchDecision::Denied {
-                index,
-                denial: denial.finish(authoritative_elapsed),
+        PendingBatchOutcome::Denied { index, denial } => Ok(finish_denied_transaction(
+            deadline,
+            index,
+            denial,
+            authoritative_elapsed,
+            transaction.rollback(),
+        )
+        .await),
+        PendingBatchOutcome::Allowed(allowances) => {
+            commit_check(deadline, transaction).await?;
+            Ok(CheckRunOutcome {
+                decision: BatchDecision::Allowed(
+                    allowances
+                        .into_iter()
+                        .map(|allowance| allowance.finish(authoritative_elapsed))
+                        .collect(),
+                ),
+                connection_reusable: true,
             })
         }
-        PendingBatchOutcome::Allowed(allowances) => {
-            set_check_server_timeouts(&mut transaction, deadline, "committing counter batch")
-                .await?;
-            commit_check(deadline, transaction).await?;
-            Ok(BatchDecision::Allowed(
-                allowances
-                    .into_iter()
-                    .map(|allowance| allowance.finish(authoritative_elapsed))
-                    .collect(),
-            ))
-        }
     }
+}
+
+async fn finish_denied_transaction<F>(
+    deadline: Instant,
+    index: usize,
+    denial: PendingDenial,
+    authoritative_elapsed: Duration,
+    rollback: F,
+) -> CheckRunOutcome
+where
+    F: Future<Output = Result<(), sqlx::Error>>,
+{
+    let decision = BatchDecision::Denied {
+        index,
+        denial: denial.finish(authoritative_elapsed),
+    };
+    let connection_reusable = denied_rollback_succeeded(deadline, rollback).await;
+    CheckRunOutcome {
+        decision,
+        connection_reusable,
+    }
+}
+
+async fn denied_rollback_succeeded<F>(deadline: Instant, rollback: F) -> bool
+where
+    F: Future<Output = Result<(), sqlx::Error>>,
+{
+    matches!(timeout_at(deadline, rollback).await, Ok(Ok(())))
 }
 
 async fn check_before_commit<T, F>(
@@ -970,7 +1139,6 @@ async fn acquire_advisory_locks(
     advisory_lock_ids: &[i64],
     deadline: Instant,
 ) -> Result<(), CheckRunError> {
-    set_check_server_timeouts(transaction, deadline, "acquiring logical key lock").await?;
     check_before_commit(deadline, "acquiring logical key lock", async {
         sqlx::query(BATCH_ADVISORY_LOCK_SQL)
             .bind(advisory_lock_ids)
@@ -997,7 +1165,6 @@ async fn acquire_existing_row_locks(
     input: &BatchSqlInput,
     deadline: Instant,
 ) -> Result<(), CheckRunError> {
-    set_check_server_timeouts(transaction, deadline, "acquiring counter row lock").await?;
     check_before_commit(deadline, "acquiring counter row lock", async {
         sqlx::query(BATCH_ROW_LOCK_SQL)
             .bind(input.fingerprints.as_slice())
@@ -1033,7 +1200,12 @@ async fn run_cleanup_transaction(
         connection.begin(),
     )
     .await?;
-    set_maintenance_server_timeouts(&mut transaction, deadline, "deleting expired windows").await?;
+    set_maintenance_server_timeouts(
+        &mut transaction,
+        deadline,
+        "configuring cleanup transaction timeouts",
+    )
+    .await?;
     let result = maintenance_before_commit(
         deadline,
         "deleting expired windows",
@@ -1044,12 +1216,6 @@ async fn run_cleanup_transaction(
     .await?;
     let rows_affected = result.rows_affected();
 
-    set_maintenance_server_timeouts(
-        &mut transaction,
-        deadline,
-        "committing expired-window cleanup",
-    )
-    .await?;
     commit_maintenance(deadline, transaction).await?;
     Ok(rows_affected)
 }
@@ -1140,13 +1306,111 @@ async fn execute_batch(
     ))
 }
 
+async fn execute_single(
+    transaction: &mut Transaction<'_, Postgres>,
+    input: &BatchSqlInput,
+    check: &Check<'_>,
+    deadline: Instant,
+) -> Result<(PendingBatchOutcome, Duration), CheckRunError> {
+    let row = check_before_commit(
+        deadline,
+        "evaluating counter",
+        sqlx::query(SINGLE_CHECK_SQL)
+            .bind(input.advisory_lock_ids[0])
+            .bind(&input.policy_ids[0])
+            .bind(&input.scope_ids[0])
+            .bind(input.fingerprints[0].as_slice())
+            .bind(input.subjects[0].as_slice())
+            .bind(input.windows[0])
+            .bind(input.costs[0])
+            .bind(input.limits[0])
+            .fetch_one(&mut **transaction),
+    )
+    .await?;
+
+    let database_now: DateTime<Utc> = row
+        .try_get("database_now")
+        .map_err(CheckError::DefinitelyNotConsumed)?;
+    let response_now: DateTime<Utc> = row
+        .try_get("response_now")
+        .map_err(CheckError::DefinitelyNotConsumed)?;
+    let denied: bool = row
+        .try_get("denied")
+        .map_err(CheckError::DefinitelyNotConsumed)?;
+    let expires_at: Option<DateTime<Utc>> = row
+        .try_get("window_expires_at")
+        .map_err(CheckError::DefinitelyNotConsumed)?;
+    let used: Option<i64> = row
+        .try_get("used")
+        .map_err(CheckError::DefinitelyNotConsumed)?;
+    let authoritative_elapsed = authoritative_elapsed(database_now, response_now);
+
+    if denied {
+        if used.is_some() {
+            return Err(
+                CheckError::StorageInvariant("denied single check returned stored usage").into(),
+            );
+        }
+        let expires_at = expires_at.ok_or(CheckError::StorageInvariant(
+            "denied single check returned no window expiry",
+        ))?;
+        return Ok((
+            PendingBatchOutcome::Denied {
+                index: 0,
+                denial: PendingDenial {
+                    limit: check.policy().limit(),
+                    retry_from_sample: duration_until(expires_at, database_now)?,
+                },
+            },
+            authoritative_elapsed,
+        ));
+    }
+
+    if expires_at.is_none() && used.is_none() {
+        // A statement takes its READ COMMITTED snapshot before it can wait for
+        // the advisory lock. If another transaction inserts this fresh key
+        // while this statement waits, the row-lock CTE cannot see that row,
+        // while INSERT ... ON CONFLICT can see and lock the now-current row.
+        // A rejected conflict update therefore advances us to a fresh
+        // statement snapshot. The advisory lock remains held, and the regular
+        // batch phases reacquire the exact row lock before sampling time.
+        acquire_existing_row_locks(transaction, input, deadline).await?;
+        return execute_batch(transaction, input, std::slice::from_ref(check), deadline).await;
+    }
+
+    let expires_at = expires_at.ok_or(CheckError::StorageInvariant(
+        "allowed single check returned no window expiry",
+    ))?;
+    let used = used.ok_or(CheckError::StorageInvariant(
+        "allowed single check returned no stored usage",
+    ))?;
+    let used = u64::try_from(used)
+        .map_err(|_| CheckError::StorageInvariant("stored usage is negative"))?;
+    let remaining =
+        check
+            .policy()
+            .limit()
+            .checked_sub(used)
+            .ok_or(CheckError::StorageInvariant(
+                "stored usage exceeds its policy limit",
+            ))?;
+
+    Ok((
+        PendingBatchOutcome::Allowed(vec![PendingAllowance {
+            limit: check.policy().limit(),
+            remaining,
+            reset_from_sample: duration_until(expires_at, database_now)?,
+        }]),
+        authoritative_elapsed,
+    ))
+}
+
 async fn preflight_batch(
     transaction: &mut Transaction<'_, Postgres>,
     input: &BatchSqlInput,
     checks: &[Check<'_>],
     deadline: Instant,
 ) -> Result<BatchPreflight, CheckRunError> {
-    set_check_server_timeouts(transaction, deadline, "preflighting counter batch").await?;
     let preflight_row = check_before_commit(
         deadline,
         "preflighting counter batch",
@@ -1211,7 +1475,6 @@ async fn upsert_batch(
     database_now: DateTime<Utc>,
     deadline: Instant,
 ) -> Result<(Vec<PendingAllowance>, DateTime<Utc>), CheckRunError> {
-    set_check_server_timeouts(transaction, deadline, "updating counter batch").await?;
     let rows = check_before_commit(
         deadline,
         "updating counter batch",
@@ -1407,6 +1670,59 @@ mod tests {
         assert_eq!(allowed.reset_after(), Some(Duration::from_millis(170)));
         assert_eq!(denied.retry_after(), Some(Duration::from_millis(70)));
         assert_eq!(denied.retry_after_seconds(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn denied_decision_survives_rollback_failure_and_discards_connection() {
+        let outcome = finish_denied_transaction(
+            Instant::now() + Duration::from_secs(1),
+            2,
+            PendingDenial {
+                limit: 10,
+                retry_from_sample: Duration::from_millis(150),
+            },
+            Duration::from_millis(20),
+            std::future::ready(Err(sqlx::Error::Protocol(
+                "injected rollback failure".to_owned(),
+            ))),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome.decision,
+            BatchDecision::Denied {
+                index: 2,
+                denial: Denial::QuotaExceeded {
+                    limit: 10,
+                    retry_after
+                }
+            } if retry_after == Duration::from_millis(130)
+        ));
+        assert!(!outcome.connection_reusable);
+    }
+
+    #[tokio::test]
+    async fn denied_decision_survives_rollback_deadline_and_discards_connection() {
+        let outcome = finish_denied_transaction(
+            Instant::now(),
+            0,
+            PendingDenial {
+                limit: 1,
+                retry_from_sample: Duration::from_millis(50),
+            },
+            Duration::ZERO,
+            std::future::pending(),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome.decision,
+            BatchDecision::Denied {
+                index: 0,
+                denial: Denial::QuotaExceeded { limit: 1, .. }
+            }
+        ));
+        assert!(!outcome.connection_reusable);
     }
 
     #[test]

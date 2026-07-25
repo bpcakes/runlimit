@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- Reject in-memory atomic batches that can never fit in a target shard with a
+  structural `MemoryStoreError` instead of a retryable capacity denial.
+- Reduce PostgreSQL single-check admission to one evaluation statement inside
+  the transaction and configure transaction-local timeouts once after `BEGIN`.
+- Reserve heap space for HOT counter updates with an additive PostgreSQL
+  `fillfactor` migration and document workload-specific autovacuum monitoring
+  and tuning.
+
+### Fixed
+
+- Preserve a valid PostgreSQL denial when rollback confirmation fails or its
+  client deadline expires; the affected connection is discarded.
+
 ## [0.1.0] - 2026-07-24
 
 ### Added

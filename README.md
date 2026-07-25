@@ -156,9 +156,14 @@ same time can each admit traffic against different counters.
 - Each check removes at most the configured number of expired entries from its
   shard. An atomic batch receives that allowance once for each check, on the
   shard targeted by that check.
+- An atomic batch targeting more distinct keys at one shard than that shard can
+  ever hold returns
+  `MemoryStoreError::BatchExceedsShardCapacity { shard_index, key_count,
+  capacity }`. This is a structural error: waiting for expiry cannot make the
+  batch fit.
 - A new key that cannot fit in its shard is denied with
   `Denial::StorageCapacity`, optionally including the earliest known retry
-  duration.
+  duration when the same operation may fit after existing entries expire.
 
 If application code panics while holding a shard lock, that shard remains
 poisoned. Every later operation touching it returns
@@ -198,7 +203,7 @@ Distributed database capacity enforcement is a tracked follow-up. Until it is
 implemented, do not expose PostgreSQL as the only defense against
 attacker-controlled key cardinality.
 
-Before serving traffic, apply the bundled migration with
+Before serving traffic, apply the bundled migrations with
 `PostgresLimiter::migrate()`. In a database where application and library
 migrations share SQLx's `_sqlx_migrations` table, every participating migrator
 must enable `Migrator::set_ignore_missing(true)` so each one tolerates versions
@@ -211,6 +216,59 @@ either Runlimit migrator against the shared history.
 Periodically call `cleanup_expired(maximum_rows)` to bound maintenance work;
 expired rows do not affect correctness before cleanup.
 
+The counter table is update-heavy. Each admission after a counter row's initial
+insert updates that row and leaves a dead heap tuple. In-window increments of
+`used` can use PostgreSQL HOT updates, but starting a new anchored window also
+changes the indexed `window_expires_at` value, so window renewals cannot be HOT
+and also leave dead index entries. Deleting expired rows adds more dead tuples.
+The bundled additive migration sets the table `fillfactor` to 80, reserving
+page space for HOT counter updates at the cost of a larger live heap; it does
+not remove the need for autovacuum. It remains separate from 0.1.0's
+create-table migration so existing SQLx histories retain the published
+checksum.
+
+Tune autovacuum for churn rather than accepting its table-wide defaults
+unchanged. The following is a reasonable starting point, not a capacity
+guarantee:
+
+```sql
+ALTER TABLE runlimit_fixed_windows SET (
+    autovacuum_vacuum_threshold = 500,
+    autovacuum_vacuum_scale_factor = 0.01,
+    autovacuum_analyze_threshold = 500,
+    autovacuum_analyze_scale_factor = 0.02
+);
+```
+
+PostgreSQL schedules vacuum after approximately the threshold plus the scale
+factor times the estimated live rows. Lower the values for a large or
+high-throughput counter table, and ensure the cluster's autovacuum workers and
+cost limits can keep up. Monitor the live/dead tuple estimates, HOT-update
+ratio, vacuum cadence, and heap/index bytes together:
+
+```sql
+SELECT
+    n_live_tup,
+    n_dead_tup,
+    n_tup_upd,
+    n_tup_hot_upd,
+    last_autovacuum,
+    autovacuum_count,
+    pg_size_pretty(pg_relation_size(relid)) AS heap_size,
+    pg_size_pretty(pg_indexes_size(relid)) AS index_size
+FROM pg_stat_user_tables
+WHERE relid = 'runlimit_fixed_windows'::regclass;
+```
+
+Alert when dead tuples or relation bytes keep rising across completed
+autovacuums while live cardinality is stable. Check for long-running
+transactions that prevent tuple removal before adding more vacuum capacity.
+Ordinary vacuum makes dead space reusable but does not return relation files to
+the operating system. The fillfactor migration likewise does not rewrite pages
+created by 0.1.0; if an existing table or expiry index already needs repacking,
+plan `REINDEX INDEX CONCURRENTLY` for a confirmed bloated index or an online
+table repack. Use locking `VACUUM FULL` only in a separate maintenance window.
+
 No running database is needed to compile Runlimit or its smoke consumer.
 Database integration tests should use a disposable PostgreSQL instance.
 
@@ -218,6 +276,9 @@ Database errors must fail closed. `runlimit_postgres::CheckError` distinguishes
 operations that definitely did not consume quota from commit outcomes that may
 have consumed it. Inspect `may_have_consumed_quota()` for observability and do
 not blindly retry an unknown commit as part of a non-idempotent operation.
+When a read-only denial has already been produced, a rollback failure does not
+replace it with an error; Runlimit returns the denial and discards that
+connection.
 `MaintenanceError` makes the corresponding distinction for cleanup; inspect
 `may_have_removed_rows()` before deciding whether an unconfirmed cleanup needs
 to be retried.

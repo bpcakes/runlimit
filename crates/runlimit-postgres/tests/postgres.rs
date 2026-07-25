@@ -15,13 +15,37 @@ use runlimit_core::{
 };
 use runlimit_memory::{Clock, MemoryStore, MemoryStoreConfig};
 use runlimit_postgres::{CheckError, MIGRATOR, MaintenanceError, PostgresConfig, PostgresLimiter};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, migrate::Migrate, postgres::PgPoolOptions};
 use tokio::{sync::Barrier, time::sleep};
 
 const TEST_DATABASE_URL: &str = "RUNLIMIT_POSTGRES_TEST_DATABASE_URL";
 const CLEANUP_SQL: &str = include_str!("../src/cleanup_expired.sql");
 const TEST_HOST_MIGRATION_VERSION: i64 = 20_260_722_000_000;
+const PUBLISHED_CREATE_MIGRATION_VERSION: i64 = 20_260_723_000_000;
+const FILLFACTOR_MIGRATION_VERSION: i64 = 20_260_725_000_000;
+const ADVISORY_LOCK_DOMAIN: &[u8] = b"runlimit/postgres-advisory-lock/v1\0";
+const PUBLISHED_CREATE_MIGRATION_SHA384: [u8; 48] = [
+    0x31, 0xd9, 0x3f, 0xde, 0x98, 0xc2, 0x36, 0x4a, 0x33, 0x06, 0x2e, 0x37, 0x35, 0x08, 0xf5, 0x63,
+    0xb4, 0x86, 0xdf, 0x28, 0x98, 0xf8, 0xe7, 0x73, 0x65, 0x91, 0x8e, 0x81, 0xda, 0x89, 0x80, 0xa8,
+    0xe7, 0x4b, 0xf9, 0xc6, 0x30, 0x22, 0xd2, 0x51, 0xae, 0xb3, 0xd5, 0x80, 0x67, 0xe9, 0x80, 0xec,
+];
 static NEXT_POLICY: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn published_create_migration_is_immutable_and_fillfactor_is_additive() {
+    let migrations = MIGRATOR.iter().collect::<Vec<_>>();
+
+    assert!(migrations.len() >= 2);
+    assert_eq!(migrations[0].version, PUBLISHED_CREATE_MIGRATION_VERSION);
+    assert_eq!(migrations[1].version, FILLFACTOR_MIGRATION_VERSION);
+    assert_eq!(
+        migrations[0].checksum.as_ref(),
+        PUBLISHED_CREATE_MIGRATION_SHA384
+    );
+    assert!(!migrations[0].sql.contains("fillfactor"));
+    assert!(migrations[1].sql.contains("SET (fillfactor = 80)"));
+}
 
 async fn test_pool(maximum_connections: u32) -> PgPool {
     let database_url = std::env::var(TEST_DATABASE_URL)
@@ -91,6 +115,19 @@ async fn drop_migration_test_schema(setup_pool: PgPool, pool: PgPool, schema: &s
     setup_pool.close().await;
 }
 
+async fn counter_table_options(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        r"
+SELECT COALESCE(reloptions, ARRAY[]::TEXT[])
+FROM pg_catalog.pg_class
+WHERE oid = 'runlimit_fixed_windows'::regclass
+",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read counter table storage options")
+}
+
 fn unique_policy(label: &str, limit: u64, window: Duration) -> FixedWindowPolicy {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -114,6 +151,16 @@ fn unique_policy(label: &str, limit: u64, window: Duration) -> FixedWindowPolicy
 
 fn key(value: u8) -> SubjectKey {
     SubjectKey::from_digest([value; 32])
+}
+
+fn advisory_lock_id(check: &Check<'_>) -> i64 {
+    let mut digest = Sha256::new();
+    digest.update(ADVISORY_LOCK_DOMAIN);
+    digest.update(check.counter_key().to_bytes());
+    let digest = digest.finalize();
+    let mut id_bytes = [0_u8; 8];
+    id_bytes.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(id_bytes)
 }
 
 fn test_config() -> PostgresConfig {
@@ -320,6 +367,32 @@ WHERE
     .fetch_one(pool)
     .await
     .expect("read test counter usage")
+}
+
+async fn wait_for_advisory_waiters(pool: &PgPool, query_fragment: &str, minimum: i64) {
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            r"
+SELECT count(*)
+FROM pg_stat_activity
+WHERE
+    datname = current_database()
+    AND state = 'active'
+    AND wait_event_type = 'Lock'
+    AND wait_event = 'advisory'
+    AND position($1 IN query) > 0
+",
+        )
+        .bind(query_fragment)
+        .fetch_one(pool)
+        .await
+        .expect("inspect advisory-lock waiters");
+        if waiting >= minimum {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("did not observe {minimum} advisory-lock waiter(s) running {query_fragment:?}");
 }
 
 async fn insert_counter_window(
@@ -641,20 +714,18 @@ async fn migration_coexists_with_an_ignore_missing_host_and_discards_errors() {
         .await
         .expect("Runlimit migration remains repeatable");
 
-    let runlimit_version = MIGRATOR
+    let mut expected_versions = MIGRATOR
         .iter()
-        .next()
-        .expect("Runlimit has a migration")
-        .version;
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
     let applied_versions =
         sqlx::query_scalar::<_, i64>("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await
             .expect("read shared migration history");
-    assert_eq!(
-        applied_versions,
-        [TEST_HOST_MIGRATION_VERSION, runlimit_version]
-    );
+    expected_versions.push(TEST_HOST_MIGRATION_VERSION);
+    expected_versions.sort_unstable();
+    assert_eq!(applied_versions, expected_versions);
 
     let tables_exist = sqlx::query_as::<_, (bool, bool)>(
         r"
@@ -673,7 +744,7 @@ SELECT
     // this single-connection pool.
     sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2")
         .bind(vec![0_u8; 48])
-        .bind(runlimit_version)
+        .bind(PUBLISHED_CREATE_MIGRATION_VERSION)
         .execute(&pool)
         .await
         .expect("corrupt Runlimit checksum for the failure-path test");
@@ -689,7 +760,7 @@ SELECT
     assert!(matches!(
         error,
         sqlx::migrate::MigrateError::VersionMismatch(version)
-            if version == runlimit_version
+            if version == PUBLISHED_CREATE_MIGRATION_VERSION
     ));
 
     let replacement_backend: i32 = tokio::time::timeout(
@@ -702,6 +773,63 @@ SELECT
     assert_ne!(
         replacement_backend, locked_backend,
         "the possibly locked migration session must not return to the pool"
+    );
+
+    drop(limiter);
+    drop_migration_test_schema(setup_pool, pool, &schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn migration_upgrades_the_published_0_1_table_additively() {
+    let (setup_pool, pool, schema) = isolated_migration_test_pools(1).await;
+    let published_create_migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == PUBLISHED_CREATE_MIGRATION_VERSION)
+        .expect("published create migration remains bundled");
+
+    let mut connection = pool
+        .acquire()
+        .await
+        .expect("acquire published-migration setup connection");
+    connection
+        .ensure_migrations_table()
+        .await
+        .expect("create published migration history");
+    connection
+        .apply(published_create_migration)
+        .await
+        .expect("apply published create migration");
+    drop(connection);
+
+    assert!(
+        !counter_table_options(&pool)
+            .await
+            .iter()
+            .any(|option| option.starts_with("fillfactor=")),
+        "the published 0.1.0 migration unexpectedly contains storage tuning"
+    );
+
+    let limiter = PostgresLimiter::new(pool.clone());
+    limiter
+        .migrate()
+        .await
+        .expect("apply additive migrations to the published schema");
+
+    let applied_versions =
+        sqlx::query_scalar::<_, i64>("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .expect("read upgraded migration history");
+    let expected_versions = MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    assert_eq!(applied_versions, expected_versions);
+    let table_options = counter_table_options(&pool).await;
+    assert!(
+        table_options.iter().any(|option| option == "fillfactor=80"),
+        "upgraded table options do not reserve space for HOT updates: {table_options:?}"
     );
 
     drop(limiter);
@@ -801,7 +929,7 @@ SELECT EXISTS (
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
-async fn migration_primary_key_is_counter_key_and_metadata_is_retained() {
+async fn migration_sets_counter_key_fillfactor_and_retains_metadata() {
     let pool = test_pool(1).await;
     let primary_key_columns = sqlx::query_scalar::<_, String>(
         r"
@@ -822,6 +950,12 @@ ORDER BY key_columns.position
     .await
     .expect("read migrated primary-key columns");
     assert_eq!(primary_key_columns, ["config_fingerprint", "subject_key"]);
+
+    let table_options = counter_table_options(&pool).await;
+    assert!(
+        table_options.iter().any(|option| option == "fillfactor=80"),
+        "migrated table options do not reserve space for HOT updates: {table_options:?}"
+    );
 
     let policy = unique_policy("counter-key-metadata", 3, Duration::from_secs(60));
     let subject = key(155);
@@ -1461,6 +1595,135 @@ async fn concurrent_pools_never_over_admit() {
     }
 
     assert_eq!(admitted, 12);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn concurrent_fresh_single_checks_advance_the_waiters_snapshot() {
+    let pool = test_pool(6).await;
+    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let policy = Arc::new(unique_policy(
+        "concurrent-fresh-single",
+        1,
+        Duration::from_secs(10),
+    ));
+    let subject = key(156);
+    let check = Check::new(&policy, subject);
+    let logical_lock_id = advisory_lock_id(&check);
+
+    let mut blocker = pool.begin().await.expect("begin logical-lock blocker");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(logical_lock_id)
+        .execute(&mut *blocker)
+        .await
+        .expect("hold the fresh key's logical lock");
+
+    let barrier = Arc::new(Barrier::new(3));
+    let mut tasks = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let task_limiter = limiter.clone();
+        let task_policy = Arc::clone(&policy);
+        let task_barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            task_barrier.wait().await;
+            task_limiter.check(&Check::new(&task_policy, subject)).await
+        }));
+    }
+    barrier.wait().await;
+
+    wait_for_advisory_waiters(&pool, "WITH advisory_lock AS MATERIALIZED", 2).await;
+
+    blocker.commit().await.expect("release fresh-key lock");
+
+    let mut allowed = 0;
+    let mut denied = 0;
+    for task in tasks {
+        let decision = task
+            .await
+            .expect("fresh-key check task does not panic")
+            .expect("snapshot fallback returns a decision");
+        allowed += usize::from(decision.is_allowed());
+        denied += usize::from(decision.is_denied());
+    }
+    let stored = stored_counter_usage(&pool, &policy, subject).await;
+    let deleted = delete_counter(&pool, &policy, subject).await;
+
+    assert_eq!(allowed, 1);
+    assert_eq!(denied, 1);
+    assert_eq!(stored, 1);
+    assert_eq!(deleted, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
+    let pool = test_pool(8).await;
+    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let target_policy = Arc::new(unique_policy(
+        "mixed-fresh-target",
+        1,
+        Duration::from_secs(10),
+    ));
+    let companion_policy = Arc::new(unique_policy(
+        "mixed-fresh-companion",
+        1,
+        Duration::from_secs(10),
+    ));
+    let target_subject = key(157);
+    let companion_subject = key(158);
+    let target_check = Check::new(&target_policy, target_subject);
+    let logical_lock_id = advisory_lock_id(&target_check);
+
+    let mut blocker = pool.begin().await.expect("begin mixed-path lock blocker");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(logical_lock_id)
+        .execute(&mut *blocker)
+        .await
+        .expect("hold the mixed-path target's logical lock");
+
+    let batch_limiter = limiter.clone();
+    let batch_target_policy = Arc::clone(&target_policy);
+    let batch_companion_policy = Arc::clone(&companion_policy);
+    let batch = tokio::spawn(async move {
+        batch_limiter
+            .check_all(&[
+                Check::new(&batch_target_policy, target_subject),
+                Check::new(&batch_companion_policy, companion_subject),
+            ])
+            .await
+    });
+    wait_for_advisory_waiters(&pool, "WITH RECURSIVE acquired(position, locked)", 1).await;
+
+    let single_limiter = limiter.clone();
+    let single_policy = Arc::clone(&target_policy);
+    let single = tokio::spawn(async move {
+        single_limiter
+            .check(&Check::new(&single_policy, target_subject))
+            .await
+    });
+    wait_for_advisory_waiters(&pool, "WITH advisory_lock AS MATERIALIZED", 1).await;
+
+    blocker.commit().await.expect("release mixed-path lock");
+
+    let batch = batch
+        .await
+        .expect("fresh-key batch task does not panic")
+        .expect("fresh-key batch succeeds");
+    let single = single
+        .await
+        .expect("fresh-key single task does not panic")
+        .expect("fresh-key single returns a decision");
+    let target_stored = stored_counter_usage(&pool, &target_policy, target_subject).await;
+    let companion_stored = stored_counter_usage(&pool, &companion_policy, companion_subject).await;
+    let target_deleted = delete_counter(&pool, &target_policy, target_subject).await;
+    let companion_deleted = delete_counter(&pool, &companion_policy, companion_subject).await;
+
+    assert!(matches!(batch, BatchDecision::Allowed(ref decisions) if decisions.len() == 2));
+    assert!(single.is_denied());
+    assert_eq!(target_stored, 1);
+    assert_eq!(companion_stored, 1);
+    assert_eq!(target_deleted, 1);
+    assert_eq!(companion_deleted, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

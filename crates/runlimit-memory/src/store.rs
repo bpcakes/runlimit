@@ -245,7 +245,8 @@ impl<C: Clock> MemoryStore<C> {
     /// # Errors
     ///
     /// Returns an error before quota consumption when the batch exceeds its
-    /// configured bound, contains a duplicate key, or a touched shard is
+    /// configured bound, contains a duplicate key, targets more distinct keys
+    /// at one shard than that shard can ever store, or a touched shard is
     /// poisoned.
     ///
     #[allow(clippy::too_many_lines)]
@@ -280,16 +281,27 @@ impl<C: Clock> MemoryStore<C> {
             );
         }
 
+        let mut checks_per_shard = vec![0_usize; shard_indexes.len()];
+        for check in &prepared {
+            checks_per_shard[check.shard_position] += 1;
+        }
+        for (&shard_index, &key_count) in shard_indexes.iter().zip(&checks_per_shard) {
+            let capacity = self.config.shard_capacity(shard_index);
+            if key_count > capacity {
+                return Err(MemoryStoreError::BatchExceedsShardCapacity {
+                    shard_index,
+                    key_count,
+                    capacity,
+                });
+            }
+        }
+
         let mut locked_shards = self.lock_shards(&shard_indexes)?;
         let observed_millis = self.clock.now().as_millis();
         let now_millis = locked_shards
             .iter()
             .map(|(_, shard)| shard.latest_observed_millis)
             .fold(observed_millis, u128::max);
-        let mut checks_per_shard = vec![0_usize; locked_shards.len()];
-        for check in &prepared {
-            checks_per_shard[check.shard_position] += 1;
-        }
         for ((_, shard), check_count) in locked_shards.iter_mut().zip(checks_per_shard) {
             shard.latest_observed_millis = now_millis;
             let cleanup_limit = self
@@ -426,6 +438,19 @@ pub enum MemoryStoreError {
     /// The atomic batch violated a backend-independent structural requirement.
     #[error(transparent)]
     InvalidBatch(#[from] BatchError),
+    /// An atomic batch can never fit in one shard, regardless of expiry.
+    #[error(
+        "batch targets {key_count} distinct keys at memory-store shard {shard_index}, \
+         but that shard can store at most {capacity}"
+    )]
+    BatchExceedsShardCapacity {
+        /// Index of the shard that cannot hold all targeted keys.
+        shard_index: usize,
+        /// Number of distinct batch keys targeting the shard.
+        key_count: usize,
+        /// Hard key capacity of the shard.
+        capacity: usize,
+    },
     /// A shard mutex was poisoned and remains unavailable.
     #[error("memory-store shard {shard_index} is poisoned and unavailable")]
     PoisonedShard {
@@ -438,8 +463,9 @@ pub enum MemoryStoreError {
 mod tests {
     use std::{
         sync::{
-            Arc, Mutex,
+            Arc, Barrier, Mutex,
             atomic::{AtomicBool, AtomicU64, Ordering},
+            mpsc,
         },
         thread,
         time::Duration,
@@ -536,6 +562,36 @@ mod tests {
 
     fn subject(byte: u8) -> SubjectKey {
         SubjectKey::from_digest([byte; 32])
+    }
+
+    fn subjects_for_shard<C: Clock>(
+        store: &MemoryStore<C>,
+        policy: &FixedWindowPolicy,
+        shard_index: usize,
+        count: usize,
+    ) -> Vec<SubjectKey> {
+        assert!(shard_index < store.shards.len());
+        let mut subjects = Vec::with_capacity(count);
+
+        for value in 0_u64..10_000 {
+            let mut digest = [0_u8; 32];
+            digest[..8].copy_from_slice(&value.to_le_bytes());
+            let candidate = SubjectKey::from_digest(digest);
+            let counter_key = Check::new(policy, candidate).counter_key();
+            if store.shard_index(&counter_key) == shard_index {
+                subjects.push(candidate);
+                if subjects.len() == count {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            subjects.len(),
+            count,
+            "could not find enough subjects for shard {shard_index}"
+        );
+        subjects
     }
 
     #[test]
@@ -767,6 +823,128 @@ mod tests {
     }
 
     #[test]
+    fn a_cross_shard_batch_preserves_input_order_and_updates_each_shard() {
+        let store = MemoryStore::with_clock(
+            MemoryStoreConfig::new(4)
+                .unwrap()
+                .with_shard_count(2)
+                .unwrap(),
+            ManualClock::default(),
+        );
+        let policy = policy("auth.login", "client", 10, Duration::from_secs(60));
+        let shard_zero = subjects_for_shard(&store, &policy, 0, 1)[0];
+        let shard_one = subjects_for_shard(&store, &policy, 1, 2);
+        let checks = [
+            Check::with_cost(&policy, shard_one[0], 2).unwrap(),
+            Check::with_cost(&policy, shard_zero, 3).unwrap(),
+            Check::with_cost(&policy, shard_one[1], 4).unwrap(),
+        ];
+
+        assert_eq!(
+            store.check_all(&checks),
+            Ok(BatchDecision::Allowed(vec![
+                Decision::allowed(10, 8, Duration::from_secs(60)),
+                Decision::allowed(10, 7, Duration::from_secs(60)),
+                Decision::allowed(10, 6, Duration::from_secs(60)),
+            ]))
+        );
+        assert_eq!(store.shards[0].lock().unwrap().entries.len(), 1);
+        assert_eq!(store.shards[1].lock().unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn a_full_shard_denies_a_batch_while_another_shard_has_room() {
+        let store = MemoryStore::with_clock(
+            MemoryStoreConfig::new(6)
+                .unwrap()
+                .with_shard_count(2)
+                .unwrap(),
+            ManualClock::default(),
+        );
+        let policy = policy("auth.login", "client", 10, Duration::from_secs(60));
+        let crowded = subjects_for_shard(&store, &policy, 0, 4);
+        let other = subjects_for_shard(&store, &policy, 1, 1)[0];
+
+        for key in &crowded[..2] {
+            assert!(
+                store
+                    .check(&Check::new(&policy, *key))
+                    .unwrap()
+                    .is_allowed()
+            );
+        }
+        let checks = [
+            Check::new(&policy, other),
+            Check::new(&policy, crowded[2]),
+            Check::new(&policy, crowded[3]),
+        ];
+
+        assert_eq!(
+            store.check_all(&checks),
+            Ok(BatchDecision::Denied {
+                index: 2,
+                denial: Denial::StorageCapacity {
+                    retry_after: Some(Duration::from_secs(60)),
+                },
+            })
+        );
+        assert_eq!(store.shards[0].lock().unwrap().entries.len(), 2);
+        assert_eq!(store.shards[1].lock().unwrap().entries.len(), 0);
+
+        assert!(
+            store
+                .check(&Check::new(&policy, crowded[2]))
+                .unwrap()
+                .is_allowed()
+        );
+        assert!(
+            store
+                .check(&Check::new(&policy, other))
+                .unwrap()
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn an_unsatisfiable_per_shard_batch_returns_a_structural_error() {
+        let store = MemoryStore::with_clock(
+            MemoryStoreConfig::new(4)
+                .unwrap()
+                .with_shard_count(2)
+                .unwrap(),
+            ManualClock::default(),
+        );
+        let policy = policy("auth.login", "client", 2, Duration::from_secs(60));
+        let keys = subjects_for_shard(&store, &policy, 0, 3);
+        let other = subjects_for_shard(&store, &policy, 1, 1)[0];
+        let other_check = Check::new(&policy, other);
+        assert_eq!(
+            store.check(&other_check),
+            Ok(Decision::allowed(2, 1, Duration::from_secs(60)))
+        );
+        let checks = [
+            other_check,
+            Check::new(&policy, keys[0]),
+            Check::new(&policy, keys[1]),
+            Check::new(&policy, keys[2]),
+        ];
+
+        assert_eq!(
+            store.check_all(&checks),
+            Err(MemoryStoreError::BatchExceedsShardCapacity {
+                shard_index: 0,
+                key_count: 3,
+                capacity: 2,
+            })
+        );
+        assert_eq!(store.stats().unwrap().entries(), 1);
+        assert_eq!(
+            store.check(&other_check),
+            Ok(Decision::allowed(2, 0, Duration::from_secs(60)))
+        );
+    }
+
+    #[test]
     fn expiry_cleanup_is_bounded_and_capacity_remains_hard_bounded() {
         let clock = ManualClock::default();
         let config = MemoryStoreConfig::new(3)
@@ -803,6 +981,69 @@ mod tests {
                 .is_allowed()
         );
         assert_eq!(store.stats().unwrap().entries(), 3);
+    }
+
+    #[test]
+    fn a_cross_shard_batch_attributes_cleanup_to_each_checks_target() {
+        let clock = ManualClock::default();
+        let store = MemoryStore::with_clock(
+            MemoryStoreConfig::new(8)
+                .unwrap()
+                .with_shard_count(2)
+                .unwrap()
+                .with_max_expired_removals_per_check(1)
+                .unwrap(),
+            clock.clone(),
+        );
+        let policy = policy("auth.login", "client", 10, Duration::from_secs(1));
+        let shard_zero = subjects_for_shard(&store, &policy, 0, 6);
+        let shard_one = subjects_for_shard(&store, &policy, 1, 5);
+
+        for key in shard_zero[..4].iter().chain(&shard_one[..4]) {
+            assert!(
+                store
+                    .check(&Check::new(&policy, *key))
+                    .unwrap()
+                    .is_allowed()
+            );
+        }
+        clock.advance(Duration::from_secs(1));
+
+        let checks = [
+            Check::new(&policy, shard_zero[4]),
+            Check::new(&policy, shard_one[4]),
+            Check::new(&policy, shard_zero[5]),
+        ];
+        assert!(
+            matches!(
+                store.check_all(&checks),
+                Ok(BatchDecision::Allowed(ref decisions)) if decisions.len() == 3
+            ),
+            "the two checks targeting shard 0 need two cleanup slots"
+        );
+
+        let shard = store.shards[0].lock().unwrap();
+        assert_eq!(shard.entries.len(), 4);
+        assert_eq!(
+            shard
+                .expirations
+                .iter()
+                .filter(|expiration| expiration.expires_at_millis <= 1_000)
+                .count(),
+            2
+        );
+        drop(shard);
+
+        let shard = store.shards[1].lock().unwrap();
+        assert_eq!(shard.entries.len(), 4);
+        assert_eq!(
+            shard
+                .expirations
+                .iter()
+                .filter(|expiration| expiration.expires_at_millis <= 1_000)
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -981,6 +1222,79 @@ mod tests {
             .sum::<usize>();
 
         assert_eq!(allowed, 25);
+    }
+
+    #[test]
+    fn concurrent_cross_shard_batches_lock_consistently_and_never_over_admit() {
+        const THREAD_COUNT: usize = 8;
+        const CALLS_PER_THREAD: usize = 64;
+
+        let store = MemoryStore::with_clock(
+            MemoryStoreConfig::new(2)
+                .unwrap()
+                .with_shard_count(2)
+                .unwrap(),
+            ManualClock::default(),
+        );
+        let limit = u64::try_from(THREAD_COUNT * CALLS_PER_THREAD).unwrap();
+        let policy = policy("auth.login", "client", limit, Duration::from_secs(60));
+        let first = subjects_for_shard(&store, &policy, 0, 1)[0];
+        let second = subjects_for_shard(&store, &policy, 1, 1)[0];
+        let store = Arc::new(store);
+        let policy = Arc::new(policy);
+        let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+        let (finished_sender, finished_receiver) = mpsc::channel();
+
+        let threads = (0..THREAD_COUNT)
+            .map(|thread_index| {
+                let store = Arc::clone(&store);
+                let policy = Arc::clone(&policy);
+                let barrier = Arc::clone(&barrier);
+                let finished_sender = finished_sender.clone();
+                thread::spawn(move || {
+                    for call_index in 0..CALLS_PER_THREAD {
+                        barrier.wait();
+                        let subjects = if (thread_index + call_index) % 2 == 0 {
+                            [first, second]
+                        } else {
+                            [second, first]
+                        };
+                        let checks = subjects.map(|subject| Check::new(policy.as_ref(), subject));
+                        let result = store.check_all(&checks).unwrap();
+                        assert!(
+                            matches!(
+                                result,
+                                BatchDecision::Allowed(ref decisions)
+                                    if decisions.len() == checks.len()
+                            ),
+                            "every call through the configured limit must be allowed: {result:?}"
+                        );
+                    }
+                    finished_sender.send(()).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(finished_sender);
+
+        for _ in 0..THREAD_COUNT {
+            finished_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cross-shard batches must not deadlock");
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(store.stats().unwrap().entries(), 2);
+        for key in [first, second] {
+            assert_eq!(
+                store.check(&Check::new(policy.as_ref(), key)),
+                Ok(Decision::denied(Denial::QuotaExceeded {
+                    limit,
+                    retry_after: Duration::from_secs(60),
+                }))
+            );
+        }
     }
 
     #[test]

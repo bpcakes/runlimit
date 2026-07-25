@@ -42,6 +42,8 @@ impl MemoryStoreConfig {
     ///
     /// The global key capacity is divided into fixed per-shard capacities. A
     /// full shard denies a new key even when another shard has unused capacity.
+    /// An atomic batch that targets more distinct keys at a shard than its
+    /// fixed capacity is rejected as structurally unsatisfiable.
     ///
     /// # Errors
     ///
