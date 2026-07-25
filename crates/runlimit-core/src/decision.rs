@@ -10,6 +10,9 @@ use std::time::Duration;
 /// Distributed backends may return a safe upper bound measured with their
 /// authoritative clock, which can overstate the duration at the caller by
 /// commit and transport time.
+///
+/// With the `serde` feature, this is an object tagged by `reason`. Durations
+/// use Serde's exact `{ "secs": ..., "nanos": ... }` representation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Denial {
@@ -68,6 +71,9 @@ enum Outcome {
 /// Allowed outcomes report quota remaining after the check and the
 /// backend-reported time until the anchored window resets. Denied outcomes
 /// carry a [`Denial`].
+///
+/// With the `serde` feature, this is an object tagged by `outcome`. Invalid
+/// allowed metadata, such as `remaining` exceeding `limit`, is rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Decision {
     outcome: Outcome,
@@ -166,7 +172,10 @@ impl Decision {
 /// An allowed batch contains one allowed decision for each input check, in the
 /// same order. A denied batch reports the original input index that failed.
 /// Backends must not consume any check when returning [`BatchDecision::Denied`].
+///
+/// With the `serde` feature, this is an object tagged by `outcome`.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum BatchDecision {
     /// Every input check was allowed.
     Allowed(Vec<Decision>),
@@ -197,6 +206,225 @@ impl BatchDecision {
             Self::Denied { index: 0, denial } => Ok(Decision::denied(denial)),
             batch => Err(batch),
         }
+    }
+}
+
+#[cfg(feature = "serde")]
+fn validate_denial(denial: &Denial) -> Result<(), &'static str> {
+    match denial {
+        Denial::QuotaExceeded { limit, .. } => {
+            if *limit == 0 {
+                return Err("a quota denial limit must be greater than zero");
+            }
+            if *limit > crate::MAX_LIMIT {
+                return Err("a quota denial limit exceeds the portable maximum");
+            }
+        }
+        Denial::StorageCapacity { .. } => {}
+    }
+    Ok(())
+}
+
+#[cfg(feature = "serde")]
+fn validate_decision(decision: &Decision) -> Result<(), &'static str> {
+    match decision.outcome {
+        Outcome::Allowed(allowance) => {
+            if allowance.limit == 0 {
+                return Err("an allowed decision limit must be greater than zero");
+            }
+            if allowance.limit > crate::MAX_LIMIT {
+                return Err("an allowed decision limit exceeds the portable maximum");
+            }
+            if allowance.remaining > allowance.limit {
+                return Err("allowed decision remaining quota exceeds its limit");
+            }
+            Ok(())
+        }
+        Outcome::Denied(denial) => validate_denial(&denial),
+    }
+}
+
+#[cfg(feature = "serde")]
+fn validate_batch_decision(batch: &BatchDecision) -> Result<(), &'static str> {
+    match batch {
+        BatchDecision::Allowed(decisions) => {
+            if decisions.iter().any(Decision::is_denied) {
+                return Err("an allowed batch cannot contain a denied decision");
+            }
+            for decision in decisions {
+                validate_decision(decision)?;
+            }
+            Ok(())
+        }
+        BatchDecision::Denied { denial, .. } => validate_denial(denial),
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+enum DenialRef {
+    QuotaExceeded { limit: u64, retry_after: Duration },
+    StorageCapacity { retry_after: Option<Duration> },
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
+enum DenialWire {
+    QuotaExceeded { limit: u64, retry_after: Duration },
+    StorageCapacity { retry_after: Option<Duration> },
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Denial {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        validate_denial(self).map_err(<S::Error as serde::ser::Error>::custom)?;
+        let wire = match *self {
+            Self::QuotaExceeded { limit, retry_after } => {
+                DenialRef::QuotaExceeded { limit, retry_after }
+            }
+            Self::StorageCapacity { retry_after } => DenialRef::StorageCapacity { retry_after },
+        };
+        serde::Serialize::serialize(&wire, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Denial {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <DenialWire as serde::Deserialize>::deserialize(deserializer)?;
+        let denial = match wire {
+            DenialWire::QuotaExceeded { limit, retry_after } => {
+                Self::QuotaExceeded { limit, retry_after }
+            }
+            DenialWire::StorageCapacity { retry_after } => Self::StorageCapacity { retry_after },
+        };
+        validate_denial(&denial).map_err(serde::de::Error::custom)?;
+        Ok(denial)
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum DecisionRef<'a> {
+    Allowed {
+        limit: u64,
+        remaining: u64,
+        reset_after: Duration,
+    },
+    Denied {
+        denial: &'a Denial,
+    },
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum DecisionWire {
+    Allowed {
+        limit: u64,
+        remaining: u64,
+        reset_after: Duration,
+    },
+    Denied {
+        denial: Denial,
+    },
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Decision {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        validate_decision(self).map_err(<S::Error as serde::ser::Error>::custom)?;
+        let wire = match &self.outcome {
+            Outcome::Allowed(allowance) => DecisionRef::Allowed {
+                limit: allowance.limit,
+                remaining: allowance.remaining,
+                reset_after: allowance.reset_after,
+            },
+            Outcome::Denied(denial) => DecisionRef::Denied { denial },
+        };
+        serde::Serialize::serialize(&wire, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Decision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <DecisionWire as serde::Deserialize>::deserialize(deserializer)?;
+        let decision = match wire {
+            DecisionWire::Allowed {
+                limit,
+                remaining,
+                reset_after,
+            } => Self::allowed(limit, remaining, reset_after),
+            DecisionWire::Denied { denial } => Self::denied(denial),
+        };
+        validate_decision(&decision).map_err(serde::de::Error::custom)?;
+        Ok(decision)
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum BatchDecisionRef<'a> {
+    Allowed { decisions: &'a [Decision] },
+    Denied { index: usize, denial: &'a Denial },
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum BatchDecisionWire {
+    Allowed { decisions: Vec<Decision> },
+    Denied { index: usize, denial: Denial },
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for BatchDecision {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        validate_batch_decision(self).map_err(<S::Error as serde::ser::Error>::custom)?;
+        let wire = match self {
+            Self::Allowed(decisions) => BatchDecisionRef::Allowed { decisions },
+            Self::Denied { index, denial } => BatchDecisionRef::Denied {
+                index: *index,
+                denial,
+            },
+        };
+        serde::Serialize::serialize(&wire, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for BatchDecision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <BatchDecisionWire as serde::Deserialize>::deserialize(deserializer)?;
+        let batch = match wire {
+            BatchDecisionWire::Allowed { decisions } => Self::Allowed(decisions),
+            BatchDecisionWire::Denied { index, denial } => Self::Denied { index, denial },
+        };
+        validate_batch_decision(&batch).map_err(serde::de::Error::custom)?;
+        Ok(batch)
     }
 }
 

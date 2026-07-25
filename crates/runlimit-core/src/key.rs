@@ -1,9 +1,8 @@
 use std::fmt;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use thiserror::Error;
-use zeroize::Zeroizing;
 
 use crate::{FixedWindowPolicy, PolicyId, ScopeId};
 
@@ -16,6 +15,9 @@ type HmacSha256 = Hmac<Sha256>;
 /// The inner digest is intentionally omitted from [`Debug`] output. Construct
 /// keys with [`KeyHasher`] unless the input is already a cryptographically
 /// opaque 32-byte digest.
+///
+/// This type deliberately does not implement Serde traits, even when the
+/// crate's `serde` feature is enabled, to avoid accidental key disclosure.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SubjectKey([u8; 32]);
 
@@ -52,15 +54,32 @@ impl fmt::Debug for SubjectKey {
 ///
 /// Applications should keep one stable secret per deployment. Rotating it
 /// deliberately starts new counters because all derived subject keys change.
+///
+/// The raw secret is not retained after construction. Instead, the hasher
+/// caches key-equivalent, precomputed HMAC state. Cloning a hasher copies that
+/// state; each copy zeroizes its SHA-256 state and buffered input when dropped.
+/// Treat a live [`KeyHasher`] as secret material. [`Debug`](fmt::Debug) never
+/// exposes its state.
 pub struct KeyHasher {
-    secret: Zeroizing<Vec<u8>>,
+    template: HmacSha256,
+}
+
+impl Clone for KeyHasher {
+    fn clone(&self) -> Self {
+        Self {
+            template: self.template.clone(),
+        }
+    }
 }
 
 impl KeyHasher {
     /// Minimum accepted secret length in bytes.
     pub const MINIMUM_SECRET_LENGTH: usize = 32;
 
-    /// Constructs a hasher by copying a secret into zeroizing storage.
+    /// Constructs a hasher by precomputing zeroizing keyed HMAC state.
+    ///
+    /// The supplied raw secret is borrowed only for construction and is not
+    /// retained by the returned hasher.
     ///
     /// # Errors
     ///
@@ -75,9 +94,12 @@ impl KeyHasher {
             });
         }
 
-        Ok(Self {
-            secret: Zeroizing::new(secret.to_vec()),
-        })
+        let Ok(mut template) = HmacSha256::new_from_slice(secret) else {
+            unreachable!("HMAC-SHA-256 accepts keys of every length");
+        };
+        template.update(KEY_DOMAIN);
+
+        Ok(Self { template })
     }
 
     /// Hashes a normalized subject within an explicit policy and scope.
@@ -90,13 +112,7 @@ impl KeyHasher {
         scope_id: &ScopeId,
         subject: impl AsRef<[u8]>,
     ) -> SubjectKey {
-        // Construct this state per derivation: hmac 0.12's cloneable keyed
-        // state does not implement Zeroize, so caching it would retain a
-        // second long-lived, key-equivalent secret outside `self.secret`.
-        let Ok(mut mac) = HmacSha256::new_from_slice(&self.secret) else {
-            unreachable!("HMAC-SHA-256 accepts keys of every length");
-        };
-        mac.update(KEY_DOMAIN);
+        let mut mac = self.template.clone();
         mac.update(policy_id.as_str().as_bytes());
         mac.update(&[0]);
         mac.update(scope_id.as_str().as_bytes());
@@ -216,5 +232,49 @@ mod tests {
     #[test]
     fn hasher_debug_output_is_redacted() {
         assert_eq!(format!("{:?}", hasher()), "KeyHasher([REDACTED])");
+    }
+
+    #[test]
+    fn hashing_matches_stable_protocol_vectors() {
+        let policy = policy("auth.login", "identity");
+
+        assert_eq!(
+            hasher()
+                .hash_for(&policy, b"user@example.test")
+                .into_bytes(),
+            [
+                0x7e, 0x8c, 0x35, 0x4d, 0x1a, 0x9b, 0x8c, 0x11, 0xeb, 0xf5, 0xfd, 0x5f, 0xcb, 0x82,
+                0x58, 0x6f, 0xda, 0xce, 0xbe, 0xf1, 0xff, 0x15, 0x82, 0x9f, 0xe0, 0xb0, 0x79, 0xd1,
+                0x31, 0x22, 0xbc, 0x21,
+            ]
+        );
+        assert_eq!(
+            KeyHasher::new([0x24; 80])
+                .unwrap()
+                .hash_for(&policy, b"user@example.test")
+                .into_bytes(),
+            [
+                0x23, 0xa7, 0x30, 0xd0, 0x57, 0x8e, 0xec, 0x28, 0xe3, 0xf5, 0x7d, 0xd3, 0x96, 0x32,
+                0xd8, 0xd8, 0x7b, 0x99, 0x87, 0x79, 0x56, 0xc9, 0xcd, 0x7d, 0xfe, 0x26, 0x84, 0x7b,
+                0x17, 0x61, 0x8b, 0xd0,
+            ]
+        );
+    }
+
+    #[test]
+    fn cloned_hasher_uses_independently_zeroizing_keyed_state() {
+        let policy = policy("auth.login", "identity");
+        let original = hasher();
+        let cloned = original.clone();
+        let expected = original.hash_for(&policy, b"user@example.test");
+
+        drop(original);
+
+        assert_eq!(
+            cloned.hash_for(&policy, b"user@example.test"),
+            expected,
+            "dropping the original must not invalidate the clone"
+        );
+        assert_eq!(format!("{cloned:?}"), "KeyHasher([REDACTED])");
     }
 }

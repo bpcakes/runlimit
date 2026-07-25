@@ -62,6 +62,9 @@ macro_rules! identifier_type {
         ///
         /// Values contain between 1 and 128 bytes and may use ASCII letters,
         /// digits, `-`, `.`, `_`, `:`, and `/`. Identifiers are case-sensitive.
+        ///
+        /// With the `serde` feature, this type uses a Serde string and applies
+        /// the same validation when deserializing.
         #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name(Box<str>);
 
@@ -127,6 +130,27 @@ macro_rules! identifier_type {
         impl AsRef<str> for $name {
             fn as_ref(&self) -> &str {
                 self.as_str()
+            }
+        }
+
+        #[cfg(feature = "serde")]
+        impl serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        #[cfg(feature = "serde")]
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
             }
         }
     };

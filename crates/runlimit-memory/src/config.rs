@@ -5,6 +5,11 @@ const DEFAULT_MAX_EXPIRED_REMOVALS: usize = 8;
 const DEFAULT_MAX_BATCH_SIZE: usize = 32;
 
 /// Configuration for a hard-bounded [`MemoryStore`](crate::MemoryStore).
+///
+/// With the `serde` feature, this is an object containing `max_keys`,
+/// `shard_count`, `max_expired_removals_per_check`, and `max_batch_size`.
+/// Only `max_keys` is required when deserializing; omitted bounds use the same
+/// defaults as the constructors.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryStoreConfig {
     max_keys: usize,
@@ -120,6 +125,78 @@ impl MemoryStoreConfig {
         let base = self.max_keys / self.shard_count;
         let extra = usize::from(shard_index < self.max_keys % self.shard_count);
         base + extra
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize)]
+struct MemoryStoreConfigRef {
+    max_keys: usize,
+    shard_count: usize,
+    max_expired_removals_per_check: usize,
+    max_batch_size: usize,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryStoreConfigWire {
+    max_keys: usize,
+    #[serde(default = "default_shard_count")]
+    shard_count: usize,
+    #[serde(default = "default_max_expired_removals")]
+    max_expired_removals_per_check: usize,
+    #[serde(default = "default_max_batch_size")]
+    max_batch_size: usize,
+}
+
+#[cfg(feature = "serde")]
+const fn default_shard_count() -> usize {
+    DEFAULT_SHARD_COUNT
+}
+
+#[cfg(feature = "serde")]
+const fn default_max_expired_removals() -> usize {
+    DEFAULT_MAX_EXPIRED_REMOVALS
+}
+
+#[cfg(feature = "serde")]
+const fn default_max_batch_size() -> usize {
+    DEFAULT_MAX_BATCH_SIZE
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for MemoryStoreConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde::Serialize::serialize(
+            &MemoryStoreConfigRef {
+                max_keys: self.max_keys(),
+                shard_count: self.shard_count(),
+                max_expired_removals_per_check: self.max_expired_removals_per_check(),
+                max_batch_size: self.max_batch_size(),
+            },
+            serializer,
+        )
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for MemoryStoreConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <MemoryStoreConfigWire as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(wire.max_keys)
+            .and_then(|config| config.with_shard_count(wire.shard_count))
+            .and_then(|config| {
+                config.with_max_expired_removals_per_check(wire.max_expired_removals_per_check)
+            })
+            .and_then(|config| config.with_max_batch_size(wire.max_batch_size))
+            .map_err(serde::de::Error::custom)
     }
 }
 

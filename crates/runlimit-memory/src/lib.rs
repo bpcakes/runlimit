@@ -5,6 +5,12 @@
 //! a shard is full, a new subject is denied until bounded cleanup frees space.
 //! An atomic batch that can never fit in one shard returns a structural
 //! [`MemoryStoreError`] instead of a retryable capacity denial.
+//! The store also implements [`runlimit_core::Limiter`] for async generic
+//! adapters while retaining its synchronous inherent check methods.
+//!
+//! The optional `serde` feature enables validated [`MemoryStoreConfig`]
+//! loading, read-only [`MemoryStoreStats`] serialization, and the corresponding
+//! `runlimit-core` metadata feature.
 
 mod clock;
 mod config;

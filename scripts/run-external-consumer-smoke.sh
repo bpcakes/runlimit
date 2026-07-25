@@ -164,6 +164,13 @@ for crate in "${CRATES[@]}"; do
       --config "$PATCH_CONFIG" \
       --locked \
       --all-targets
+  CARGO_TARGET_DIR="$BUILD_TARGET_DIR" \
+    cargo "+${MSRV_TOOLCHAIN}" test \
+      --manifest-path "$manifest" \
+      --config "$PATCH_CONFIG" \
+      --locked \
+      --all-targets \
+      --all-features
 done
 
 rm -f "$CONSUMER_DIR/Cargo.lock"

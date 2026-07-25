@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             None => println!("check {index} denied; retry time unavailable"),
         },
+        _ => return Err("unsupported batch decision variant".into()),
     }
 
     Ok(())

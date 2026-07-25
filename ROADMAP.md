@@ -13,7 +13,8 @@ two storage backends. Before publishing a stable release:
 4. [x] Define shared portable upper bounds for limits and window durations,
    rejecting nonportable policies in core and preserving exact memory and
    PostgreSQL time arithmetic at the boundary.
-5. [ ] Add optional Axum and Tonic adapters without moving proxy trust,
-   subject normalization, or response-body policy into Runlimit.
+5. [ ] Build optional Axum and Tonic adapters over the shared `Limiter` trait
+   without moving proxy trust, subject normalization, or response-body policy
+   into Runlimit.
 6. [ ] Evaluate an optional GCRA/token-bucket backend for non-authentication
    use cases without changing fixed-window semantics.

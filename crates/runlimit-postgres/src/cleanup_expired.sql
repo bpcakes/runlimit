@@ -1,5 +1,5 @@
 WITH authoritative_time AS MATERIALIZED (
-    SELECT clock_timestamp() AS sampled_at
+    SELECT pg_catalog.clock_timestamp() AS sampled_at
 )
 DELETE FROM runlimit_fixed_windows AS windows
 USING (

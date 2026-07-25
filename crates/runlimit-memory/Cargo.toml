@@ -12,9 +12,19 @@ repository.workspace = true
 keywords = ["rate-limit", "throttling", "security"]
 categories = ["web-programming"]
 
+[features]
+serde = ["dep:serde", "runlimit-core/serde"]
+
 [dependencies]
 runlimit-core.workspace = true
+serde = { workspace = true, optional = true }
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints]
 workspace = true

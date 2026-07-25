@@ -6,6 +6,7 @@ use crate::{PolicyFingerprint, SubjectKey};
 ///
 /// Backends must use both the policy configuration fingerprint and opaque
 /// subject key when comparing, ordering, locking, or persisting counters.
+/// This storage key deliberately does not implement Serde traits.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CounterKey {
     fingerprint: PolicyFingerprint,

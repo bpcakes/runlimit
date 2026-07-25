@@ -87,6 +87,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             None => println!("check {index} denied; retry time unavailable"),
         },
+        _ => return Err("unsupported batch decision variant".into()),
     }
 
     Ok(())
@@ -102,6 +103,53 @@ cargo check \
   --locked \
   --target-dir target/external-consumer
 ```
+
+## Generic backend API
+
+Async application adapters can be generic over `runlimit_core::Limiter` and
+swap storage backends without depending on an async-runtime abstraction:
+
+```rust
+use runlimit_core::{BatchDecision, Check, Limiter};
+
+async fn admit<L: Limiter>(
+    limiter: &L,
+    checks: &[Check<'_>],
+) -> Result<BatchDecision, L::Error> {
+    limiter.check_all(checks).await
+}
+```
+
+`Limiter` uses static dispatch with no required future boxing and returns
+`Send` futures. It is intentionally not object-safe; use a generic parameter
+for test-time backend substitution, or implement `Limiter` on an
+application-owned enum for runtime selection.
+
+The inherent `MemoryStore::check` and `MemoryStore::check_all` APIs remain
+synchronous. In generic code the trait methods are selected automatically. To
+request the async trait method from a concrete memory store, use a fully
+qualified call such as `Limiter::check(&store, &check).await`.
+
+## Optional Serde support
+
+Each crate has an opt-in `serde` feature. Enabling it on a backend also enables
+it for `runlimit-core`:
+
+```toml
+[dependencies]
+runlimit-memory = { version = "0.1.0", features = ["serde"] }
+```
+
+The feature serializes validated policy and scope identifiers as strings;
+fixed-window policies without their derived fingerprint; tagged
+`Decision`/`Denial`/`BatchDecision` values; and backend configuration values.
+`MemoryStoreStats` is also serializable for telemetry. Durations retain their
+exact seconds and nanoseconds. Deserialization rejects unknown fields and
+values that violate Runlimit's constructors or decision invariants.
+
+`SubjectKey`, `CounterKey`, `PolicyFingerprint`, `KeyHasher`, and live backend
+instances deliberately do not implement Serde traits. Keep opaque storage keys
+and hashing secrets out of generic configuration and telemetry paths.
 
 ## Fixed-window semantics
 
@@ -136,6 +184,10 @@ Applications normalize subjects before passing them to Runlimit. Construct
 stored keys with `KeyHasher`, which uses domain-separated HMAC-SHA-256 and
 requires a secret of at least 32 bytes. Raw emails, account IDs, session IDs,
 and IP addresses should not enter storage, logs, metrics labels, or errors.
+`KeyHasher` precomputes key-equivalent HMAC state instead of retaining the raw
+secret or rebuilding the key schedule for every subject. Treat a live hasher
+and its clones as secret material; their debug output is redacted and their
+underlying SHA-256 state and buffered input are wiped when dropped.
 
 Use one stable secret across every replica sharing a backend. Rotating the
 secret starts fresh counters because every derived subject key changes. Deploy
@@ -169,8 +221,12 @@ If application code panics while holding a shard lock, that shard remains
 poisoned. Every later operation touching it returns
 `MemoryStoreError::PoisonedShard` without resetting its counters. With the
 default one-shard configuration, this makes the entire store unavailable.
-Keep admissions failed closed, alert operators, and replace the store only as
-an explicit recovery action; replacement resets all process-local counters.
+Keep admissions failed closed and alert operators. As an explicit availability
+tradeoff, `MemoryStore::recover_poisoned()` atomically empties only poisoned
+shards, clears their poison flags, preserves healthy-shard counters, and
+returns the number recovered. Resetting those counters can admit requests that
+their lost state would have denied; replacing the store is a broader reset
+with the same security consequence for every shard.
 
 Treat every `MemoryStoreError` as an admission failure; it is distinct from a
 normal quota denial returned in a `Decision` or `BatchDecision`.
@@ -182,6 +238,16 @@ process restarts. `PostgresLimiter` uses PostgreSQL time as its authority,
 locks batch keys in deterministic order, and commits an allowed batch in one
 transaction. Atomic batches use set-based lock, preflight, and update phases,
 so the number of SQL phases stays fixed as the bounded batch size grows.
+Authoritative time calls are explicitly resolved as
+`pg_catalog.clock_timestamp()`, so a caller-controlled `search_path` cannot
+substitute another clock function.
+
+`PostgresConfig::pool_acquire_timeout` bounds waiting for a pooled connection.
+After acquisition, the check or cleanup receives a fresh
+`operation_timeout` budget for transaction begin, statements, lock waits,
+rollback, and commit. If an application also imposes an outer timeout, allow
+for both configured budgets plus scheduling overhead; cancelling around commit
+can leave its outcome unknown.
 
 Runlimit's `pg_advisory_xact_lock(bigint)` protocol uses a database-wide
 namespace shared by every application and role connected to that database. An
@@ -211,7 +277,10 @@ owned by the others. The exported raw `MIGRATOR` keeps SQLx's strict default
 and is suitable only when Runlimit exclusively owns that migration history and
 connection. An application that must retain a strict host migrator should
 vendor the bundled Runlimit SQL as an application-owned migration and not run
-either Runlimit migrator against the shared history.
+either Runlimit migrator against the shared history. The exact bundled
+statements are available as `CREATE_RUNLIMIT_FIXED_WINDOWS_SQL` and
+`SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL` so hosts can vendor them without
+reaching into crate source files.
 
 Periodically call `cleanup_expired(maximum_rows)` to bound maintenance work;
 expired rows do not affect correctness before cleanup.
@@ -333,22 +402,22 @@ Prepare a release from a clean checkout:
 
 ```sh
 RUNLIMIT_POSTGRES_TEST_DATABASE_URL=postgresql://... \
-  ./scripts/prepare-release.sh 0.1.0
+  ./scripts/prepare-release.sh X.Y.Z
 ```
 
 Review the release metadata and hand-written changelog entry, commit them, push
 `master`, and wait for CI to pass on that exact commit. Then publish with:
 
 ```sh
-./scripts/publish-release.sh 0.1.0
+./scripts/publish-release.sh X.Y.Z
 ```
 
 The publish script requires local `master` to match `origin/master`. It
 publishes `runlimit-core`, waits for crates.io to index it, publishes
 `runlimit-memory`, waits again, and finally publishes `runlimit-postgres`.
-After every crate is indexed, it creates and pushes the matching `v0.1.0` tag.
+After every crate is indexed, it creates and pushes the matching `vX.Y.Z` tag.
 If a publish stops partway through, resume explicitly with
-`RESUME_RELEASE=1 ./scripts/publish-release.sh 0.1.0`; already-published crate
+`RESUME_RELEASE=1 ./scripts/publish-release.sh X.Y.Z`; already-published crate
 versions are verified before the script continues.
 
 ## License

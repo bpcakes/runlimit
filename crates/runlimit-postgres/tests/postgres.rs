@@ -14,7 +14,10 @@ use runlimit_core::{
     MAX_WINDOW_MILLIS, PolicyId, ScopeId, SubjectKey,
 };
 use runlimit_memory::{Clock, MemoryStore, MemoryStoreConfig};
-use runlimit_postgres::{CheckError, MIGRATOR, MaintenanceError, PostgresConfig, PostgresLimiter};
+use runlimit_postgres::{
+    CREATE_RUNLIMIT_FIXED_WINDOWS_SQL, CheckError, MIGRATOR, MaintenanceError, PostgresConfig,
+    PostgresLimiter, SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL,
+};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, migrate::Migrate, postgres::PgPoolOptions};
 use tokio::{sync::Barrier, time::sleep};
@@ -43,8 +46,16 @@ fn published_create_migration_is_immutable_and_fillfactor_is_additive() {
         migrations[0].checksum.as_ref(),
         PUBLISHED_CREATE_MIGRATION_SHA384
     );
-    assert!(!migrations[0].sql.contains("fillfactor"));
-    assert!(migrations[1].sql.contains("SET (fillfactor = 80)"));
+    assert_eq!(
+        migrations[0].sql.as_ref(),
+        CREATE_RUNLIMIT_FIXED_WINDOWS_SQL
+    );
+    assert_eq!(
+        migrations[1].sql.as_ref(),
+        SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL
+    );
+    assert!(!CREATE_RUNLIMIT_FIXED_WINDOWS_SQL.contains("fillfactor"));
+    assert!(SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL.contains("SET (fillfactor = 80)"));
 }
 
 async fn test_pool(maximum_connections: u32) -> PgPool {
@@ -199,137 +210,45 @@ const FIXED_WINDOW_TRANSITIONS: [TransitionStep; 6] = [
         name: "new window",
         at_millis: 0,
         cost: 2,
-        expected: Decision::allowed(5, 3, Duration::from_millis(10)),
+        expected: Decision::allowed(5, 3, Duration::from_secs(10)),
     },
     TransitionStep {
         name: "live increment",
-        at_millis: 3,
+        at_millis: 3_000,
         cost: 2,
-        expected: Decision::allowed(5, 1, Duration::from_millis(7)),
+        expected: Decision::allowed(5, 1, Duration::from_secs(7)),
     },
     TransitionStep {
         name: "live denial",
-        at_millis: 3,
+        at_millis: 3_000,
         cost: 2,
         expected: Decision::denied(Denial::QuotaExceeded {
             limit: 5,
-            retry_after: Duration::from_millis(7),
+            retry_after: Duration::from_secs(7),
         }),
     },
     TransitionStep {
         name: "exact fill after denial",
-        at_millis: 9,
+        at_millis: 9_000,
         cost: 1,
-        expected: Decision::allowed(5, 0, Duration::from_millis(1)),
+        expected: Decision::allowed(5, 0, Duration::from_secs(1)),
     },
     TransitionStep {
         name: "full-window denial",
-        at_millis: 9,
+        at_millis: 9_000,
         cost: 1,
         expected: Decision::denied(Denial::QuotaExceeded {
             limit: 5,
-            retry_after: Duration::from_millis(1),
+            retry_after: Duration::from_secs(1),
         }),
     },
     TransitionStep {
         name: "exact-expiry renewal",
-        at_millis: 10,
+        at_millis: 10_000,
         cost: 3,
-        expected: Decision::allowed(5, 2, Duration::from_millis(10)),
+        expected: Decision::allowed(5, 2, Duration::from_secs(10)),
     },
 ];
-
-async fn create_transition_clock(pool: &PgPool) -> String {
-    let schema_suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is after the Unix epoch")
-        .as_nanos();
-    let schema = format!("runlimit_transition_{}_{}", process::id(), schema_suffix);
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(pool)
-        .await
-        .expect("create transition-test schema");
-    sqlx::query(&format!(
-        r"
-CREATE TABLE {schema}.authoritative_clock (
-    sampled_at TIMESTAMPTZ NOT NULL
-)
-"
-    ))
-    .execute(pool)
-    .await
-    .expect("create transition-test clock table");
-    sqlx::query(&format!(
-        r"
-INSERT INTO {schema}.authoritative_clock (sampled_at)
-VALUES (TIMESTAMPTZ '2040-01-01 00:00:00+00')
-"
-    ))
-    .execute(pool)
-    .await
-    .expect("initialize transition-test clock");
-    sqlx::query(&format!(
-        r"
-CREATE FUNCTION {schema}.clock_timestamp()
-RETURNS TIMESTAMPTZ
-LANGUAGE sql
-STABLE
-AS $function$
-    SELECT sampled_at
-    FROM {schema}.authoritative_clock
-$function$
-"
-    ))
-    .execute(pool)
-    .await
-    .expect("create transition-test clock function");
-    schema
-}
-
-async fn connect_with_transition_clock(schema: &str) -> PgPool {
-    let database_url =
-        std::env::var(TEST_DATABASE_URL).expect("test URL remains available during test");
-    let connection_schema = schema.to_owned();
-    PgPoolOptions::new()
-        .max_connections(2)
-        .after_connect(move |connection, _metadata| {
-            let search_path_sql =
-                format!("SET search_path = {connection_schema}, pg_catalog, public");
-            Box::pin(async move {
-                sqlx::query(&search_path_sql).execute(connection).await?;
-                Ok(())
-            })
-        })
-        .connect(&database_url)
-        .await
-        .expect("connect pool with the transition-test clock")
-}
-
-async fn set_transition_clock(
-    pool: &PgPool,
-    schema: &str,
-    now_millis: u64,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(&format!(
-        r"
-UPDATE {schema}.authoritative_clock
-SET sampled_at =
-    TIMESTAMPTZ '2040-01-01 00:00:00+00'
-    + $1::BIGINT * INTERVAL '1 millisecond'
-"
-    ))
-    .bind(i64::try_from(now_millis).expect("test clock fits PostgreSQL BIGINT"))
-    .execute(pool)
-    .await
-    .map(|_| ())
-}
-
-async fn drop_transition_clock(pool: &PgPool, schema: &str) {
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(pool)
-        .await
-        .expect("drop transition-test schema");
-}
 
 async fn delete_counter(pool: &PgPool, policy: &FixedWindowPolicy, subject: SubjectKey) -> u64 {
     sqlx::query(
@@ -489,6 +408,46 @@ async fn isolated_cleanup_test_pools(maximum_connections: u32) -> (PgPool, PgPoo
     .expect("create isolated cleanup-test table");
 
     (setup_pool, pool, schema)
+}
+
+async fn create_pool_budget_delay_triggers(setup_pool: &PgPool, schema: &str) {
+    let trigger_sql = format!(
+        r"
+CREATE FUNCTION {schema}.sleep_during_admission()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    PERFORM pg_catalog.pg_sleep(0.1);
+    RETURN NEW;
+END
+$function$;
+
+CREATE TRIGGER sleep_during_admission
+BEFORE INSERT ON {schema}.runlimit_fixed_windows
+FOR EACH ROW
+EXECUTE FUNCTION {schema}.sleep_during_admission();
+
+CREATE FUNCTION {schema}.sleep_during_cleanup()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    PERFORM pg_catalog.pg_sleep(0.1);
+    RETURN OLD;
+END
+$function$;
+
+CREATE TRIGGER sleep_during_cleanup
+BEFORE DELETE ON {schema}.runlimit_fixed_windows
+FOR EACH ROW
+EXECUTE FUNCTION {schema}.sleep_during_cleanup();
+"
+    );
+    sqlx::raw_sql(&trigger_sql)
+        .execute(setup_pool)
+        .await
+        .expect("create delayed admission and cleanup triggers");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -692,6 +651,94 @@ SELECT EXISTS (
         .execute(&setup_pool)
         .await
         .expect("drop isolated cleanup-timeout schema");
+    setup_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn pool_wait_does_not_spend_admission_or_cleanup_operation_budget() {
+    let (setup_pool, pool, schema) = isolated_cleanup_test_pools(1).await;
+    let policy = unique_policy("pool-budget-survivor", 1, Duration::from_secs(60));
+    let subject = key(155);
+    create_pool_budget_delay_triggers(&setup_pool, &schema).await;
+
+    let config = PostgresConfig::new()
+        .with_pool_acquire_timeout(Duration::from_secs(1))
+        .expect("one-second pool budget is valid")
+        .with_operation_timeout(Duration::from_millis(250))
+        .expect("250-millisecond operation budget is valid");
+    let limiter = PostgresLimiter::with_config(pool.clone(), config);
+
+    let held_connection = pool
+        .acquire()
+        .await
+        .expect("hold the only pool connection before admission");
+    let admission_barrier = Arc::new(Barrier::new(2));
+    let waiting_barrier = Arc::clone(&admission_barrier);
+    let waiting_limiter = limiter.clone();
+    let waiting_policy = policy.clone();
+    let admission = tokio::spawn(async move {
+        waiting_barrier.wait().await;
+        waiting_limiter
+            .check(&Check::new(&waiting_policy, subject))
+            .await
+    });
+    admission_barrier.wait().await;
+    sleep(Duration::from_millis(200)).await;
+    drop(held_connection);
+
+    let decision = admission
+        .await
+        .expect("admission task does not panic")
+        .expect("admission receives a fresh operation budget after pool wait");
+    assert!(decision.is_allowed());
+    assert_eq!(decision.remaining(), Some(0));
+
+    sqlx::query(
+        r"
+UPDATE runlimit_fixed_windows
+SET
+    window_started_at = pg_catalog.clock_timestamp() - INTERVAL '2 seconds',
+    window_expires_at = pg_catalog.clock_timestamp() - INTERVAL '1 second'
+WHERE
+    config_fingerprint = $1
+    AND subject_key = $2
+",
+    )
+    .bind(policy.fingerprint().as_bytes().as_slice())
+    .bind(subject.as_bytes().as_slice())
+    .execute(&pool)
+    .await
+    .expect("expire the admitted counter before cleanup");
+
+    let held_connection = pool
+        .acquire()
+        .await
+        .expect("hold the only pool connection before cleanup");
+    let cleanup_barrier = Arc::new(Barrier::new(2));
+    let waiting_barrier = Arc::clone(&cleanup_barrier);
+    let waiting_limiter = limiter.clone();
+    let cleanup = tokio::spawn(async move {
+        waiting_barrier.wait().await;
+        waiting_limiter.cleanup_expired(1).await
+    });
+    cleanup_barrier.wait().await;
+    sleep(Duration::from_millis(200)).await;
+    drop(held_connection);
+
+    let removed = cleanup
+        .await
+        .expect("cleanup task does not panic")
+        .expect("cleanup receives a fresh operation budget after pool wait");
+    assert_eq!(removed, 1);
+    assert!(!counter_exists(&pool, &policy, subject).await);
+
+    drop(limiter);
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&setup_pool)
+        .await
+        .expect("drop isolated pool-budget schema");
     setup_pool.close().await;
 }
 
@@ -1205,122 +1252,115 @@ ON runlimit_fixed_windows
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
-async fn a_window_expiring_exactly_at_the_clock_sample_resets() {
-    let setup_pool = test_pool(1).await;
-    let policy = unique_policy("exact-expiry-boundary", 1, Duration::from_secs(5));
+async fn search_path_clock_shadow_cannot_hijack_admission_or_cleanup_time() {
+    let (setup_pool, table_pool, schema) = isolated_cleanup_test_pools(1).await;
+    let policy = unique_policy("clock-shadow", 1, Duration::from_secs(3_600));
     let subject = key(10);
     let check = Check::new(&policy, subject);
-
-    sqlx::query(
-        r"
-DROP SCHEMA IF EXISTS runlimit_test_exact_clock CASCADE
-",
-    )
-    .execute(&setup_pool)
-    .await
-    .expect("drop stale exact-clock schema");
-    sqlx::query("CREATE SCHEMA runlimit_test_exact_clock")
-        .execute(&setup_pool)
+    let setup_limiter = PostgresLimiter::with_config(table_pool.clone(), test_config());
+    let first = setup_limiter
+        .check(&check)
         .await
-        .expect("create exact-clock schema");
-    sqlx::query(
+        .expect("initialize an active window");
+    assert!(first.is_allowed());
+
+    sqlx::query(&format!(
         r"
-CREATE FUNCTION runlimit_test_exact_clock.clock_timestamp()
+CREATE FUNCTION {schema}.clock_timestamp()
 RETURNS TIMESTAMPTZ
 LANGUAGE sql
 IMMUTABLE
-AS $$
-    SELECT TIMESTAMPTZ '2040-01-01 00:00:00+00'
-$$
-",
-    )
+AS $function$
+    SELECT TIMESTAMPTZ '2100-01-01 00:00:00+00'
+$function$
+"
+    ))
     .execute(&setup_pool)
     .await
-    .expect("create exact-clock function");
-    sqlx::query(
-        r"
-INSERT INTO runlimit_fixed_windows (
-    policy_id,
-    scope_id,
-    config_fingerprint,
-    subject_key,
-    window_started_at,
-    window_expires_at,
-    used
-)
-VALUES (
-    $1,
-    $2,
-    $3,
-    $4,
-    TIMESTAMPTZ '2039-12-31 23:59:59.999+00',
-    TIMESTAMPTZ '2040-01-01 00:00:00+00',
-    1
-)
-",
-    )
-    .bind(policy.id().as_str())
-    .bind(policy.scope().as_str())
-    .bind(policy.fingerprint().as_bytes().as_slice())
-    .bind(subject.as_bytes().as_slice())
-    .execute(&setup_pool)
-    .await
-    .expect("insert counter expiring exactly at the test clock");
+    .expect("create malicious clock shadow");
 
     let database_url =
         std::env::var(TEST_DATABASE_URL).expect("test URL remains available during test");
-    let exact_clock_pool = PgPoolOptions::new()
+    let connection_schema = schema.clone();
+    let shadowed_pool = PgPoolOptions::new()
         .max_connections(2)
-        .after_connect(|connection, _metadata| {
+        .after_connect(move |connection, _metadata| {
+            let search_path_sql = format!("SET search_path = {connection_schema}, pg_catalog");
             Box::pin(async move {
-                sqlx::query("SET search_path = runlimit_test_exact_clock, pg_catalog, public")
-                    .execute(connection)
-                    .await?;
+                sqlx::query(&search_path_sql).execute(connection).await?;
                 Ok(())
             })
         })
         .connect(&database_url)
         .await
-        .expect("connect pool with the exact test clock");
-    let limiter = PostgresLimiter::with_config(exact_clock_pool.clone(), test_config());
+        .expect("connect fresh pool with malicious clock first in search_path");
+    let limiter = PostgresLimiter::with_config(shadowed_pool.clone(), test_config());
 
-    let reset = limiter.check(&check).await;
+    let denied = limiter
+        .check(&check)
+        .await
+        .expect("authoritative clock remains callable");
+    let removed = limiter
+        .cleanup_expired(10)
+        .await
+        .expect("cleanup uses authoritative clock");
+    let stored_used = stored_counter_usage(&shadowed_pool, &policy, subject).await;
 
     drop(limiter);
-    exact_clock_pool.close().await;
-    let deleted_rows = delete_counter(&setup_pool, &policy, subject).await;
-    sqlx::query("DROP SCHEMA runlimit_test_exact_clock CASCADE")
+    shadowed_pool.close().await;
+    drop(setup_limiter);
+    let deleted_rows = delete_counter(&table_pool, &policy, subject).await;
+    table_pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&setup_pool)
         .await
-        .expect("drop exact-clock schema");
+        .expect("drop clock-shadow schema");
     setup_pool.close().await;
 
-    let reset = reset.expect("a window expiring at the sample resets");
-    assert!(reset.is_allowed());
-    assert_eq!(reset.remaining(), Some(0));
+    assert!(
+        denied.is_denied(),
+        "a search_path-resolved future clock would incorrectly renew the active window"
+    );
+    assert_eq!(
+        removed, 0,
+        "a search_path-resolved future clock would incorrectly delete the active window"
+    );
+    assert_eq!(stored_used, 1);
     assert_eq!(deleted_rows, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn memory_and_postgres_share_fixed_window_transition_semantics() {
-    let setup_pool = test_pool(1).await;
-    let clock_schema = create_transition_clock(&setup_pool).await;
-    let postgres_pool = connect_with_transition_clock(&clock_schema).await;
+    let postgres_pool = test_pool(2).await;
     let postgres = PostgresLimiter::with_config(postgres_pool.clone(), test_config());
     let memory_clock = ConformanceClock::default();
     let memory = MemoryStore::with_clock(
         MemoryStoreConfig::new(1).expect("test memory capacity is valid"),
         memory_clock.clone(),
     );
-    let policy = unique_policy("fixed-window-conformance", 5, Duration::from_millis(10));
+    let policy = unique_policy("fixed-window-conformance", 5, Duration::from_secs(10));
     let subject = key(11);
 
     let observations = async {
         let mut observations = Vec::with_capacity(FIXED_WINDOW_TRANSITIONS.len());
         for step in FIXED_WINDOW_TRANSITIONS {
             memory_clock.set(step.at_millis);
-            set_transition_clock(&setup_pool, &clock_schema, step.at_millis).await?;
+            if step.at_millis == 10_000 {
+                sqlx::query(
+                    r"
+UPDATE runlimit_fixed_windows
+SET window_expires_at = pg_catalog.clock_timestamp()
+WHERE
+    config_fingerprint = $1
+    AND subject_key = $2
+",
+                )
+                .bind(policy.fingerprint().as_bytes().as_slice())
+                .bind(subject.as_bytes().as_slice())
+                .execute(&postgres_pool)
+                .await?;
+            }
 
             let check = Check::with_cost(&policy, subject, step.cost)?;
             let memory_decision = memory.check(&check)?;
@@ -1331,17 +1371,28 @@ async fn memory_and_postgres_share_fixed_window_transition_semantics() {
     }
     .await;
 
-    let deleted_rows = delete_counter(&setup_pool, &policy, subject).await;
+    let deleted_rows = delete_counter(&postgres_pool, &policy, subject).await;
     drop(postgres);
     postgres_pool.close().await;
-    drop_transition_clock(&setup_pool, &clock_schema).await;
-    setup_pool.close().await;
 
     let observations = observations.expect("both backends replay the transition sequence");
     for (step, memory_decision, postgres_decision) in observations {
         assert_eq!(
-            memory_decision, postgres_decision,
-            "backends diverged at the '{}' transition",
+            memory_decision.is_allowed(),
+            postgres_decision.is_allowed(),
+            "backends disagreed on admission at the '{}' transition",
+            step.name
+        );
+        assert_eq!(
+            memory_decision.limit(),
+            postgres_decision.limit(),
+            "backends disagreed on the limit at the '{}' transition",
+            step.name
+        );
+        assert_eq!(
+            memory_decision.remaining(),
+            postgres_decision.remaining(),
+            "backends disagreed on remaining quota at the '{}' transition",
             step.name
         );
         assert_eq!(
@@ -1349,9 +1400,13 @@ async fn memory_and_postgres_share_fixed_window_transition_semantics() {
             "memory returned the wrong '{}' transition",
             step.name
         );
-        assert_eq!(
-            postgres_decision, step.expected,
-            "PostgreSQL returned the wrong '{}' transition",
+        let postgres_duration = postgres_decision
+            .reset_after()
+            .or_else(|| postgres_decision.retry_after())
+            .expect("fixed-window decision contains a duration");
+        assert!(
+            postgres_duration <= policy.window(),
+            "PostgreSQL returned an overlong duration at the '{}' transition",
             step.name
         );
     }

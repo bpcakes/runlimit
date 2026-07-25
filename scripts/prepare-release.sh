@@ -153,10 +153,24 @@ cargo "+${STABLE_TOOLCHAIN}" clippy \
   --locked \
   -- \
   -D warnings
+cargo "+${STABLE_TOOLCHAIN}" clippy \
+  --workspace \
+  --all-targets \
+  --all-features \
+  --locked \
+  -- \
+  -D warnings
 cargo "+${STABLE_TOOLCHAIN}" test --workspace --locked
+cargo "+${STABLE_TOOLCHAIN}" test --workspace --all-features --locked
+cargo "+${STABLE_TOOLCHAIN}" test \
+  -p runlimit-memory \
+  --release \
+  --locked \
+  corrupt_quota_state_fails_closed_in_release_builds
 RUSTDOCFLAGS="-D warnings" \
-  cargo "+${STABLE_TOOLCHAIN}" doc --workspace --no-deps --locked
+  cargo "+${STABLE_TOOLCHAIN}" doc --workspace --all-features --no-deps --locked
 cargo "+${MSRV_TOOLCHAIN}" check --workspace --all-targets --locked
+cargo "+${MSRV_TOOLCHAIN}" check --workspace --all-targets --all-features --locked
 
 EXTERNAL_TARGET_DIR="$ROOT_DIR/target/release-external-consumer"
 cargo "+${MSRV_TOOLCHAIN}" test \
@@ -177,6 +191,14 @@ MSRV_TOOLCHAIN="$MSRV_TOOLCHAIN" \
 cargo "+${STABLE_TOOLCHAIN}" test \
   -p runlimit-postgres \
   --test postgres \
+  --locked \
+  -- \
+  --ignored \
+  --test-threads=1
+cargo "+${STABLE_TOOLCHAIN}" test \
+  -p runlimit-postgres \
+  --test postgres \
+  --all-features \
   --locked \
   -- \
   --ignored \

@@ -1,15 +1,13 @@
 use std::{
-    collections::{
-        BTreeSet, HashMap,
-        hash_map::{Entry as MapEntry, RandomState},
-    },
-    hash::BuildHasher,
+    collections::{BTreeSet, HashMap, hash_map::Entry as MapEntry},
+    fmt,
+    hash::{BuildHasherDefault, Hash, Hasher},
     sync::{Mutex, MutexGuard},
     time::Duration,
 };
 
 use runlimit_core::{
-    BatchDecision, BatchError, Check, CounterKey, Decision, Denial, validate_batch,
+    BatchDecision, BatchError, Check, CounterKey, Decision, Denial, Limiter, validate_batch,
 };
 use thiserror::Error;
 
@@ -27,11 +25,44 @@ struct Expiration {
     key: CounterKey,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrehashedCounterKey(CounterKey);
+
+impl Hash for PrehashedCounterKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(counter_key_hash(self.0));
+    }
+}
+
+#[derive(Default)]
+struct PassThroughHasher(u64);
+
+impl Hasher for PassThroughHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // `PrehashedCounterKey` always uses `write_u64`. Keep the required
+        // byte-oriented fallback well-defined in case that implementation is
+        // changed later.
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+type EntryMap = HashMap<PrehashedCounterKey, Entry, BuildHasherDefault<PassThroughHasher>>;
+
 #[derive(Debug)]
 struct Shard {
     capacity: usize,
     latest_observed_millis: u128,
-    entries: HashMap<CounterKey, Entry>,
+    entries: EntryMap,
     expirations: BTreeSet<Expiration>,
 }
 
@@ -40,7 +71,7 @@ impl Shard {
         Self {
             capacity,
             latest_observed_millis: 0,
-            entries: HashMap::new(),
+            entries: HashMap::with_hasher(BuildHasherDefault::default()),
             expirations: BTreeSet::new(),
         }
     }
@@ -63,7 +94,7 @@ impl Shard {
                 .expirations
                 .pop_first()
                 .expect("the first expiration was present");
-            let removed = self.entries.remove(&expiration.key);
+            let removed = self.entries.remove(&PrehashedCounterKey(expiration.key));
             debug_assert_eq!(
                 removed.map(|entry| entry.expires_at_millis),
                 Some(expiration.expires_at_millis),
@@ -86,9 +117,10 @@ impl Shard {
     fn quota_denial(&self, check: &PreparedCheck, now_millis: u128) -> Option<Denial> {
         let entry = self
             .entries
-            .get(&check.counter_key)
+            .get(&PrehashedCounterKey(check.counter_key))
             .filter(|entry| entry.expires_at_millis > now_millis)?;
-        (check.cost > check.limit - entry.used).then(|| Denial::QuotaExceeded {
+        let remaining = remaining_quota(check.limit, entry.used);
+        (check.cost > remaining).then(|| Denial::QuotaExceeded {
             limit: check.limit,
             retry_after: duration_from_millis(entry.expires_at_millis.saturating_sub(now_millis)),
         })
@@ -105,14 +137,19 @@ impl Shard {
             key: check.counter_key,
         };
 
-        match self.entries.entry(check.counter_key) {
+        match self.entries.entry(PrehashedCounterKey(check.counter_key)) {
             MapEntry::Occupied(mut occupied) => {
                 if occupied.get().expires_at_millis > now_millis {
                     let entry = occupied.get_mut();
-                    entry.used += check.cost;
+                    let remaining = remaining_quota(check.limit, entry.used);
+                    debug_assert!(
+                        check.cost <= remaining,
+                        "quota denial must be checked before consumption"
+                    );
+                    entry.used = entry.used.saturating_add(check.cost);
                     return Decision::allowed(
                         check.limit,
-                        check.limit - entry.used,
+                        remaining.saturating_sub(check.cost),
                         duration_from_millis(entry.expires_at_millis.saturating_sub(now_millis)),
                     );
                 }
@@ -135,7 +172,7 @@ impl Shard {
         debug_assert!(inserted, "an inserted entry must have one expiration");
         Decision::allowed(
             check.limit,
-            check.limit - check.cost,
+            remaining_quota(check.limit, check.cost),
             duration_from_millis(expires_at_millis.saturating_sub(now_millis)),
         )
     }
@@ -174,14 +211,38 @@ impl PreparedCheck {
 ///
 /// If application code panics while a shard is locked, that shard remains
 /// poisoned and every later operation touching it fails closed with
-/// [`MemoryStoreError::PoisonedShard`]. Replace the store explicitly rather
-/// than automatically resetting quota for counters whose consistency is
-/// unknown.
+/// [`MemoryStoreError::PoisonedShard`]. [`MemoryStore::recover_poisoned`] is an
+/// explicit availability tradeoff: it restores poisoned shards by discarding
+/// their counters rather than trusting state whose consistency is unknown.
 pub struct MemoryStore<C = SystemClock> {
     config: MemoryStoreConfig,
     clock: C,
-    shard_hasher: RandomState,
     shards: Box<[Mutex<Shard>]>,
+}
+
+impl<C> fmt::Debug for MemoryStore<C> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let poisoned_shards = self
+            .shards
+            .iter()
+            .filter(|shard| shard.is_poisoned())
+            .count();
+
+        formatter
+            .debug_struct("MemoryStore")
+            .field("config", &self.config)
+            .field("poisoned_shards", &poisoned_shards)
+            .field("shard_state", &Redacted)
+            .finish_non_exhaustive()
+    }
+}
+
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
 }
 
 impl MemoryStore<SystemClock> {
@@ -204,7 +265,6 @@ impl<C: Clock> MemoryStore<C> {
         Self {
             config,
             clock,
-            shard_hasher: RandomState::new(),
             shards,
         }
     }
@@ -228,7 +288,11 @@ impl<C: Clock> MemoryStore<C> {
         if let Some(denial) = shard.quota_denial(&prepared, now_millis) {
             return Ok(Decision::denied(denial));
         }
-        if !shard.entries.contains_key(&counter_key) && shard.entries.len() >= shard.capacity {
+        if !shard
+            .entries
+            .contains_key(&PrehashedCounterKey(counter_key))
+            && shard.entries.len() >= shard.capacity
+        {
             return Ok(Decision::denied(Denial::StorageCapacity {
                 retry_after: shard.capacity_retry_after(now_millis),
             }));
@@ -321,7 +385,10 @@ impl<C: Clock> MemoryStore<C> {
                 });
             }
 
-            if !shard.entries.contains_key(&check.counter_key) {
+            if !shard
+                .entries
+                .contains_key(&PrehashedCounterKey(check.counter_key))
+            {
                 let projected_len = shard.entries.len() + pending_insertions[check.shard_position];
                 if projected_len >= shard.capacity {
                     return Ok(BatchDecision::Denied {
@@ -376,9 +443,48 @@ impl<C: Clock> MemoryStore<C> {
         Ok(())
     }
 
+    /// Rebuilds every poisoned shard and returns the number recovered.
+    ///
+    /// A poisoned shard's internal consistency is unknown, so recovery
+    /// discards all counters in that shard before clearing its mutex poison
+    /// flag. This can admit requests that the discarded counters would have
+    /// denied. Healthy shards and their active counters are left unchanged.
+    ///
+    /// Until this method is called, operations touching a poisoned shard
+    /// continue to fail closed with [`MemoryStoreError::PoisonedShard`].
+    /// Recovery is safe to invoke through an [`std::sync::Arc`]. It locks every
+    /// shard in index order before changing any of them, so concurrent checks
+    /// observe either the pre-recovery poisoned store or the complete recovered
+    /// state, never a partially reopened multi-shard store.
+    pub fn recover_poisoned(&self) -> usize {
+        let mut locked_shards = Vec::with_capacity(self.shards.len());
+
+        for (shard_index, shard_mutex) in self.shards.iter().enumerate() {
+            match shard_mutex.lock() {
+                Ok(shard) => locked_shards.push((shard_index, shard_mutex, shard, false)),
+                Err(poisoned) => {
+                    locked_shards.push((shard_index, shard_mutex, poisoned.into_inner(), true));
+                }
+            }
+        }
+
+        let mut recovered = 0;
+        for (shard_index, shard_mutex, shard, was_poisoned) in &mut locked_shards {
+            if !*was_poisoned {
+                continue;
+            }
+
+            **shard = Shard::new(self.config.shard_capacity(*shard_index));
+            shard_mutex.clear_poison();
+            recovered += 1;
+        }
+
+        recovered
+    }
+
     fn shard_index(&self, key: &CounterKey) -> usize {
         #[allow(clippy::cast_possible_truncation)]
-        let hash = self.shard_hasher.hash_one(key) as usize;
+        let hash = counter_key_hash(*key) as usize;
         hash % self.shards.len()
     }
 
@@ -400,6 +506,42 @@ impl<C: Clock> MemoryStore<C> {
     }
 }
 
+fn counter_key_hash(key: CounterKey) -> u64 {
+    // Subject keys are opaque HMAC-SHA-256 output (or caller-supplied
+    // cryptographically opaque digests), so their bits are already uniform
+    // and attacker-resistant. Mix in the policy fingerprint so successive
+    // configurations of one subject do not all collide, without paying for a
+    // second keyed hash.
+    leading_u64(key.subject().as_bytes())
+        ^ leading_u64(key.fingerprint().as_bytes()).rotate_left(32)
+}
+
+const fn leading_u64(bytes: &[u8; 32]) -> u64 {
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+fn remaining_quota(limit: u64, used: u64) -> u64 {
+    debug_assert!(
+        used <= limit,
+        "stored quota usage ({used}) exceeded its policy limit ({limit})"
+    );
+    limit.saturating_sub(used)
+}
+
+impl<C: Clock> Limiter for MemoryStore<C> {
+    type Error = MemoryStoreError;
+
+    async fn check(&self, check: &Check<'_>) -> Result<Decision, Self::Error> {
+        MemoryStore::check(self, check)
+    }
+
+    async fn check_all(&self, checks: &[Check<'_>]) -> Result<BatchDecision, Self::Error> {
+        MemoryStore::check_all(self, checks)
+    }
+}
+
 fn duration_from_millis(millis: u128) -> Duration {
     Duration::from_millis(
         u64::try_from(millis)
@@ -408,6 +550,9 @@ fn duration_from_millis(millis: u128) -> Duration {
 }
 
 /// Current bounded-store usage.
+///
+/// With the `serde` feature, this serializes as an object containing `entries`,
+/// `capacity`, and `shard_count`. Telemetry is intentionally serialize-only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryStoreStats {
     entries: usize,
@@ -429,6 +574,31 @@ impl MemoryStoreStats {
     /// Returns the number of independently locked shards.
     pub const fn shard_count(self) -> usize {
         self.shard_count
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize)]
+struct MemoryStoreStatsWire {
+    entries: usize,
+    capacity: usize,
+    shard_count: usize,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for MemoryStoreStats {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde::Serialize::serialize(
+            &MemoryStoreStatsWire {
+                entries: self.entries(),
+                capacity: self.capacity(),
+                shard_count: self.shard_count(),
+            },
+            serializer,
+        )
     }
 }
 
@@ -472,11 +642,14 @@ mod tests {
     };
 
     use runlimit_core::{
-        BatchDecision, BatchError, Check, Decision, Denial, FixedWindowPolicy, MAX_LIMIT,
-        MAX_WINDOW, MAX_WINDOW_MILLIS, PolicyId, ScopeId, SubjectKey,
+        BatchDecision, BatchError, Check, Decision, Denial, FixedWindowPolicy, KeyHasher,
+        MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, PolicyId, ScopeId, SubjectKey,
     };
 
-    use super::{Entry, Expiration, MemoryStore, MemoryStoreError};
+    use super::{
+        Entry, Expiration, MemoryStore, MemoryStoreError, PrehashedCounterKey, counter_key_hash,
+        remaining_quota,
+    };
     use crate::{Clock, MemoryStoreConfig};
 
     #[derive(Clone, Default)]
@@ -592,6 +765,132 @@ mod tests {
             "could not find enough subjects for shard {shard_index}"
         );
         subjects
+    }
+
+    #[test]
+    fn hmac_subjects_are_evenly_and_deterministically_sharded() {
+        const SHARD_COUNT: usize = 16;
+        const SUBJECT_COUNT: u64 = 4_096;
+
+        let config = MemoryStoreConfig::new(SHARD_COUNT)
+            .unwrap()
+            .with_shard_count(SHARD_COUNT)
+            .unwrap();
+        let first = MemoryStore::with_clock(config.clone(), ManualClock::default());
+        let second = MemoryStore::with_clock(config, ManualClock::default());
+        let policy = policy("auth.login", "client", 2, Duration::from_secs(60));
+        let key_hasher = KeyHasher::new([0x42; 32]).unwrap();
+        let mut counts = [0_usize; SHARD_COUNT];
+
+        for value in 0_u64..SUBJECT_COUNT {
+            let subject = key_hasher.hash_for(&policy, value.to_le_bytes());
+            let key = Check::new(&policy, subject).counter_key();
+            let first_index = first.shard_index(&key);
+
+            assert_eq!(first_index, second.shard_index(&key));
+            counts[first_index] += 1;
+        }
+
+        assert!(
+            counts.iter().all(|&count| (176..=336).contains(&count)),
+            "uniform HMAC output should spread across every shard: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn the_entries_map_distinguishes_deliberate_prehash_collisions() {
+        let first_policy = policy("auth.login", "client", 1, Duration::from_secs(60));
+        let second_policy = policy("auth.reset", "client", 2, Duration::from_secs(60));
+        let first_subject = SubjectKey::from_digest([0_u8; 32]);
+        let first_key = Check::new(&first_policy, first_subject).counter_key();
+
+        let zero_second_key =
+            Check::new(&second_policy, SubjectKey::from_digest([0_u8; 32])).counter_key();
+        let colliding_subject_word =
+            counter_key_hash(first_key) ^ counter_key_hash(zero_second_key);
+        let mut second_digest = [0_u8; 32];
+        second_digest[..8].copy_from_slice(&colliding_subject_word.to_le_bytes());
+        let second_subject = SubjectKey::from_digest(second_digest);
+        let second_key = Check::new(&second_policy, second_subject).counter_key();
+
+        assert_ne!(first_key, second_key);
+        assert_eq!(counter_key_hash(first_key), counter_key_hash(second_key));
+
+        let store =
+            MemoryStore::with_clock(MemoryStoreConfig::new(4).unwrap(), ManualClock::default());
+        let first_check = Check::new(&first_policy, first_subject);
+        let second_check = Check::new(&second_policy, second_subject);
+
+        assert!(store.check(&first_check).unwrap().is_allowed());
+        assert!(store.check(&second_check).unwrap().is_allowed());
+        assert_eq!(store.stats().unwrap().entries(), 2);
+        assert!(store.check(&first_check).unwrap().is_denied());
+        assert!(store.check(&second_check).unwrap().is_allowed());
+    }
+
+    #[test]
+    fn remaining_quota_reaches_zero_without_wrapping() {
+        assert_eq!(remaining_quota(3, 0), 3);
+        assert_eq!(remaining_quota(3, 3), 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "stored quota usage (4) exceeded its policy limit (3)")]
+    fn corrupt_quota_state_trips_the_debug_invariant() {
+        let _ = remaining_quota(3, 4);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn corrupt_quota_state_fails_closed_in_release_builds() {
+        let policy = policy("auth.login", "client", 3, Duration::from_secs(60));
+        let check = Check::new(&policy, subject(1));
+        let key = check.counter_key();
+        let store =
+            MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
+        {
+            let mut shard = store.shards[0].lock().unwrap();
+            shard.entries.insert(
+                PrehashedCounterKey(key),
+                Entry {
+                    used: 4,
+                    expires_at_millis: 60_000,
+                },
+            );
+            assert!(shard.expirations.insert(Expiration {
+                expires_at_millis: 60_000,
+                key,
+            }));
+        }
+
+        assert_eq!(
+            store.check(&check),
+            Ok(Decision::denied(Denial::QuotaExceeded {
+                limit: 3,
+                retry_after: Duration::from_secs(60),
+            }))
+        );
+    }
+
+    #[test]
+    fn debug_output_is_useful_without_exposing_counter_state() {
+        let store =
+            MemoryStore::with_clock(MemoryStoreConfig::new(8).unwrap(), ManualClock::default());
+        let policy = policy("auth.login", "client", 2, Duration::from_secs(60));
+        store
+            .check(&Check::new(&policy, subject(0xab)))
+            .expect("store is available");
+
+        let output = format!("{store:?}");
+
+        assert!(output.starts_with("MemoryStore { config: MemoryStoreConfig"));
+        assert!(output.contains("max_keys: 8"));
+        assert!(output.contains("poisoned_shards: 0"));
+        assert!(output.contains("shard_state: [REDACTED]"));
+        assert!(!output.contains("CounterKey"));
+        assert!(!output.contains("expires_at_millis"));
+        assert!(!output.contains("used:"));
     }
 
     #[test]
@@ -1135,7 +1434,7 @@ mod tests {
             assert_eq!(shard.entries.len(), 1);
             assert_eq!(shard.expirations.len(), 1);
             assert_eq!(
-                shard.entries.get(&key),
+                shard.entries.get(&PrehashedCounterKey(key)),
                 Some(&Entry {
                     used: 1,
                     expires_at_millis: 5,
@@ -1329,6 +1628,100 @@ mod tests {
         assert_eq!(
             store.clear(),
             Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+        );
+    }
+
+    #[test]
+    fn explicit_recovery_resets_only_poisoned_shards_behind_an_arc() {
+        let clock = PanicOnceClock::default();
+        let store = Arc::new(MemoryStore::with_clock(
+            MemoryStoreConfig::new(4)
+                .unwrap()
+                .with_shard_count(2)
+                .unwrap(),
+            clock.clone(),
+        ));
+        let policy = policy("auth.login", "client", 1, Duration::from_secs(60));
+        let reset_subject = subjects_for_shard(&store, &policy, 0, 1)[0];
+        let retained_subject = subjects_for_shard(&store, &policy, 1, 1)[0];
+        let reset_check = Check::new(&policy, reset_subject);
+        let retained_check = Check::new(&policy, retained_subject);
+
+        assert!(store.check(&reset_check).unwrap().is_allowed());
+        assert!(store.check(&retained_check).unwrap().is_allowed());
+        clock.panic_once();
+        let panicked_store = Arc::clone(&store);
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ = panicked_store.check(&reset_check);
+        }));
+        assert!(panic_result.is_err());
+
+        assert_eq!(
+            store.check(&reset_check),
+            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+        );
+        assert!(store.check(&retained_check).unwrap().is_denied());
+        assert!(format!("{store:?}").contains("poisoned_shards: 1"));
+
+        assert_eq!(store.recover_poisoned(), 1);
+        assert_eq!(
+            store.recover_poisoned(),
+            0,
+            "recovery must be idempotent when no new panic occurs"
+        );
+        assert_eq!(store.stats().unwrap().entries(), 1);
+        assert!(
+            store.check(&reset_check).unwrap().is_allowed(),
+            "the recovered shard starts with empty quota state"
+        );
+        assert!(
+            store.check(&retained_check).unwrap().is_denied(),
+            "healthy-shard quota state must survive recovery"
+        );
+        assert!(format!("{store:?}").contains("poisoned_shards: 0"));
+    }
+
+    #[test]
+    fn recovery_reopens_every_shard_poisoned_by_an_unwinding_batch() {
+        let clock = PanicOnceClock::default();
+        let store = Arc::new(MemoryStore::with_clock(
+            MemoryStoreConfig::new(2)
+                .unwrap()
+                .with_shard_count(2)
+                .unwrap(),
+            clock.clone(),
+        ));
+        let policy = policy("auth.login", "client", 1, Duration::from_secs(60));
+        let shard_zero = subjects_for_shard(&store, &policy, 0, 1)[0];
+        let shard_one = subjects_for_shard(&store, &policy, 1, 1)[0];
+        let checks = [
+            Check::new(&policy, shard_one),
+            Check::new(&policy, shard_zero),
+        ];
+
+        clock.panic_once();
+        let panicked_store = Arc::clone(&store);
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ = panicked_store.check_all(&checks);
+        }));
+        assert!(panic_result.is_err());
+        assert_eq!(
+            store.check(&checks[0]),
+            Err(MemoryStoreError::PoisonedShard { shard_index: 1 })
+        );
+        assert_eq!(
+            store.check(&checks[1]),
+            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+        );
+
+        assert_eq!(store.recover_poisoned(), 2);
+        assert_eq!(store.stats().unwrap().entries(), 0);
+        assert!(
+            matches!(
+                store.check_all(&checks),
+                Ok(BatchDecision::Allowed(ref decisions)) if decisions.len() == 2
+            ),
+            "all shards must be usable after one atomic recovery"
         );
     }
 }

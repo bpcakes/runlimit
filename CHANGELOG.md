@@ -7,8 +7,28 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Add a shared async `Limiter` trait for statically dispatched adapters across
+  the memory and PostgreSQL backends.
+- Add opt-in, invariant-preserving Serde support for public policy, decision,
+  backend configuration, and memory telemetry value types.
+- Add `Debug` for `MemoryStore`, `Clone` for `KeyHasher`, explicit poisoned
+  shard recovery, and public constants for each bundled PostgreSQL migration.
+
 ### Changed
 
+- Precompute `KeyHasher`'s zeroizing HMAC state so each subject derivation
+  avoids rebuilding the SHA-256 key schedule.
+- Use already-uniform counter-key material directly for memory shard selection
+  and entry hashing, and make quota arithmetic fail closed if stored usage ever
+  exceeds its invariant.
+- Resolve PostgreSQL's authoritative clock explicitly through `pg_catalog` and
+  give pool acquisition a separate timeout so a connection survivor receives
+  a fresh database-operation budget.
+- Mark PostgreSQL `CheckError`, `MaintenanceError`, `PostgresConfigError`, and
+  core `BatchDecision` as non-exhaustive so 0.x releases can add variants
+  without breaking consumers.
 - Reject in-memory atomic batches that can never fit in a target shard with a
   structural `MemoryStoreError` instead of a retryable capacity denial.
 - Reduce PostgreSQL single-check admission to one evaluation statement inside

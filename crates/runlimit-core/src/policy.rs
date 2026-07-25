@@ -29,6 +29,8 @@ pub const MAX_WINDOW: Duration = Duration::from_millis(MAX_WINDOW_MILLIS);
 /// Storage backends include this value in counter keys. Consequently, changing
 /// a limit or window starts an independent counter instead of reinterpreting
 /// state created under the old configuration.
+///
+/// This storage-key component deliberately does not implement Serde traits.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PolicyFingerprint([u8; 32]);
 
@@ -73,6 +75,10 @@ fn write_hex(formatter: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
 ///
 /// Windows have exact whole-millisecond precision. A policy owns its
 /// application-defined identifier and scope so it can be reused by checks.
+///
+/// With the `serde` feature, the wire object contains `id`, `scope`, `limit`,
+/// and `window_millis`. The derived fingerprint is deliberately omitted and
+/// recomputed through [`FixedWindowPolicy::new`] when deserializing.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FixedWindowPolicy {
     id: PolicyId,
@@ -143,6 +149,60 @@ impl FixedWindowPolicy {
     /// Returns the deterministic configuration fingerprint.
     pub const fn fingerprint(&self) -> PolicyFingerprint {
         self.fingerprint
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize)]
+struct FixedWindowPolicyRef<'a> {
+    id: &'a PolicyId,
+    scope: &'a ScopeId,
+    limit: u64,
+    window_millis: u64,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixedWindowPolicyWire {
+    id: PolicyId,
+    scope: ScopeId,
+    limit: u64,
+    window_millis: u64,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for FixedWindowPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde::Serialize::serialize(
+            &FixedWindowPolicyRef {
+                id: self.id(),
+                scope: self.scope(),
+                limit: self.limit(),
+                window_millis: self.window_millis(),
+            },
+            serializer,
+        )
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for FixedWindowPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <FixedWindowPolicyWire as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(
+            wire.id,
+            wire.scope,
+            wire.limit,
+            Duration::from_millis(wire.window_millis),
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

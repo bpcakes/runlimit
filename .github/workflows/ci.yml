@@ -29,8 +29,21 @@ jobs:
       # Swatinem/rust-cache v2.9.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
       - run: cargo +stable fmt --all -- --check
-      - run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo +stable test --workspace --locked
+      - name: Lint default features
+        run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
+      - name: Lint all features
+        run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Test default features
+        run: cargo +stable test --workspace --locked
+      - name: Test all features
+        run: cargo +stable test --workspace --all-features --locked
+      - name: Test release fail-closed quota invariant
+        run: >-
+          cargo +stable test
+          -p runlimit-memory
+          --release
+          --locked
+          corrupt_quota_state_fails_closed_in_release_builds
       - name: Format external consumer
         run: >-
           cargo +stable fmt
@@ -70,7 +83,10 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
       # Swatinem/rust-cache v2.9.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
-      - run: cargo +1.88.0 check --workspace --all-targets --locked
+      - name: Check default features
+        run: cargo +1.88.0 check --workspace --all-targets --locked
+      - name: Check all features
+        run: cargo +1.88.0 check --workspace --all-targets --all-features --locked
       - name: Check external consumer
         run: >-
           cargo +1.88.0 check
@@ -104,11 +120,21 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       # Swatinem/rust-cache v2.9.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
-      - name: Run PostgreSQL integration tests
+      - name: Run PostgreSQL integration tests (default features)
         run: >-
           cargo +stable test
           -p runlimit-postgres
           --test postgres
+          --locked
+          --
+          --ignored
+          --test-threads=1
+      - name: Run PostgreSQL integration tests (all features)
+        run: >-
+          cargo +stable test
+          -p runlimit-postgres
+          --test postgres
+          --all-features
           --locked
           --
           --ignored

@@ -8,6 +8,10 @@
 //! their number of SQL phases does not grow with the batch size. Single checks
 //! combine lock acquisition, time sampling, evaluation, and mutation into one
 //! admission statement inside the transaction.
+//! [`PostgresLimiter`] implements [`runlimit_core::Limiter`] for async generic
+//! adapters.
+//! The optional `serde` feature enables validated [`PostgresConfig`] loading
+//! and the corresponding `runlimit-core` policy and response metadata.
 //!
 //! # Installation
 //!
@@ -24,7 +28,9 @@
 //! does not add [`PostgresLimiter::migrate`]'s protection against returning a
 //! possibly session-locked connection to a pool after an error or cancellation.
 //! Applications that retain a strict host migrator should vendor the bundled
-//! Runlimit SQL as an application-owned migration instead of invoking either
+//! Runlimit SQL as application-owned migrations, in order, using
+//! [`CREATE_RUNLIMIT_FIXED_WINDOWS_SQL`] and
+//! [`SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL`] instead of invoking either
 //! Runlimit migrator against the shared history.
 //!
 //! # Failure semantics
@@ -41,8 +47,8 @@
 //! closing it rolls back the non-mutating denied transaction.
 //! Dropping a check or cleanup future prevents the backend from reporting its
 //! outcome; if cancellation races with commit, callers must likewise treat the
-//! outcome as unknown. Prefer this backend's configured deadline to a shorter
-//! outer timeout.
+//! outcome as unknown. Prefer this backend's configured acquisition and
+//! operation budgets to a shorter outer timeout.
 //!
 //! The advisory-lock `v1` domain and derivation are a cross-replica protocol.
 //! They must not be changed in place: replicas from a rolling deployment must
@@ -64,7 +70,7 @@
 use std::{future::Future, time::Duration};
 
 use runlimit_core::{
-    BatchDecision, BatchError, Check, CounterKey, Decision, Denial, validate_batch,
+    BatchDecision, BatchError, Check, CounterKey, Decision, Denial, Limiter, validate_batch,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -75,7 +81,27 @@ use sqlx::{
     types::chrono::{DateTime, Utc},
 };
 use thiserror::Error;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
+
+/// SQL for the immutable `20260723000000_create_runlimit_fixed_windows`
+/// migration.
+///
+/// Strict host migrators can copy this SQL into their application-owned
+/// migration stream instead of running [`MIGRATOR`] against a shared
+/// `_sqlx_migrations` history. Apply it before
+/// [`SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL`].
+pub const CREATE_RUNLIMIT_FIXED_WINDOWS_SQL: &str =
+    include_str!("../migrations/20260723000000_create_runlimit_fixed_windows.sql");
+
+/// SQL for the additive
+/// `20260725000000_set_runlimit_fixed_windows_fillfactor` migration.
+///
+/// Strict host migrators can copy this SQL into their application-owned
+/// migration stream after [`CREATE_RUNLIMIT_FIXED_WINDOWS_SQL`]. The
+/// application remains responsible for assigning versions that fit its own
+/// migration history.
+pub const SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL: &str =
+    include_str!("../migrations/20260725000000_set_runlimit_fixed_windows_fillfactor.sql");
 
 /// Raw bundled migrations required by [`PostgresLimiter`].
 ///
@@ -165,7 +191,7 @@ WITH input AS (
     )
 ),
 sample AS (
-    SELECT clock_timestamp() AS database_now
+    SELECT pg_catalog.clock_timestamp() AS database_now
 ),
 first_denial AS (
     SELECT
@@ -184,7 +210,7 @@ first_denial AS (
 )
 SELECT
     sample.database_now,
-    clock_timestamp() AS response_now,
+    pg_catalog.clock_timestamp() AS response_now,
     first_denial.input_index,
     first_denial.window_expires_at
 FROM sample
@@ -266,7 +292,7 @@ upserted AS (
         window_expires_at
 ),
 response AS (
-    SELECT clock_timestamp() AS response_now
+    SELECT pg_catalog.clock_timestamp() AS response_now
     FROM upserted
     HAVING count(*) >= 0
 )
@@ -286,7 +312,8 @@ ORDER BY input.input_position
 // These materialized CTEs form execution barriers, not just an optimizer hint:
 // `count(acquired)` consumes the volatile advisory-lock result, the correlated
 // lateral row lookup cannot run before that count exists, and the second count
-// exhausts the locking lookup before `clock_timestamp()` can be evaluated.
+// exhausts the locking lookup before `pg_catalog.clock_timestamp()` can be
+// evaluated.
 // Consequently the authoritative sample is taken only after both lock phases.
 const SINGLE_CHECK_SQL: &str = r"
 WITH advisory_lock AS MATERIALIZED (
@@ -323,7 +350,7 @@ row_lock_barrier AS MATERIALIZED (
     FROM locked_window
 ),
 sample AS MATERIALIZED (
-    SELECT clock_timestamp() AS database_now
+    SELECT pg_catalog.clock_timestamp() AS database_now
     FROM row_lock_barrier
 ),
 evaluation AS MATERIALIZED (
@@ -386,7 +413,7 @@ upserted AS (
 )
 SELECT
     evaluation.database_now,
-    clock_timestamp() AS response_now,
+    pg_catalog.clock_timestamp() AS response_now,
     evaluation.denied,
     COALESCE(
         upserted.window_expires_at,
@@ -400,9 +427,15 @@ LEFT JOIN upserted ON TRUE
 const CLEANUP_SQL: &str = include_str!("cleanup_expired.sql");
 
 /// Runtime bounds for `PostgreSQL` admission work.
+///
+/// With the `serde` feature, this is an object containing `max_batch_size`,
+/// `pool_acquire_timeout`, and `operation_timeout`. Durations use Serde's exact
+/// `{ "secs": ..., "nanos": ... }` representation. Every field may be omitted
+/// when deserializing to use the constructor defaults.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PostgresConfig {
     max_batch_size: usize,
+    pool_acquire_timeout: Duration,
     operation_timeout: Duration,
 }
 
@@ -410,10 +443,16 @@ impl PostgresConfig {
     /// Default maximum number of checks in one atomic batch.
     pub const DEFAULT_MAX_BATCH_SIZE: usize = 32;
 
-    /// Default total deadline for one check or cleanup operation.
+    /// Default budget for acquiring a connection from the pool.
+    pub const DEFAULT_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// Default deadline for database work after acquiring a connection.
     pub const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 
-    /// Largest accepted online-operation deadline.
+    /// Largest accepted pool-acquisition budget.
+    pub const MAXIMUM_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Largest accepted database-operation deadline.
     pub const MAXIMUM_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 
     /// Returns the conservative defaults suitable for an online admission
@@ -421,6 +460,7 @@ impl PostgresConfig {
     pub const fn new() -> Self {
         Self {
             max_batch_size: Self::DEFAULT_MAX_BATCH_SIZE,
+            pool_acquire_timeout: Self::DEFAULT_POOL_ACQUIRE_TIMEOUT,
             operation_timeout: Self::DEFAULT_OPERATION_TIMEOUT,
         }
     }
@@ -438,10 +478,37 @@ impl PostgresConfig {
         Ok(self)
     }
 
-    /// Sets the total deadline for a check, batch, or cleanup statement.
+    /// Sets the budget for acquiring a connection from the pool.
     ///
-    /// The deadline covers pool acquisition, lock waits, statements, rollback,
-    /// and commit. It is intentionally not applied to schema migrations.
+    /// A successful acquisition receives a fresh
+    /// [`Self::operation_timeout`] budget. This timeout is intentionally not
+    /// applied to schema migrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `timeout` is zero or exceeds 60 seconds.
+    pub fn with_pool_acquire_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<Self, PostgresConfigError> {
+        if timeout.is_zero() {
+            return Err(PostgresConfigError::ZeroPoolAcquireTimeout);
+        }
+        if timeout > Self::MAXIMUM_POOL_ACQUIRE_TIMEOUT {
+            return Err(PostgresConfigError::PoolAcquireTimeoutTooLong {
+                actual: timeout,
+                maximum: Self::MAXIMUM_POOL_ACQUIRE_TIMEOUT,
+            });
+        }
+        self.pool_acquire_timeout = timeout;
+        Ok(self)
+    }
+
+    /// Sets the deadline for database work after acquiring a connection.
+    ///
+    /// The fresh deadline covers transaction begin, lock waits, statements,
+    /// rollback, and commit. It is intentionally not applied to pool
+    /// acquisition or schema migrations.
     ///
     /// # Errors
     ///
@@ -468,7 +535,12 @@ impl PostgresConfig {
         self.max_batch_size
     }
 
-    /// Returns the total deadline applied to an operation.
+    /// Returns the budget for acquiring a connection from the pool.
+    pub const fn pool_acquire_timeout(self) -> Duration {
+        self.pool_acquire_timeout
+    }
+
+    /// Returns the deadline applied after a connection is acquired.
     pub const fn operation_timeout(self) -> Duration {
         self.operation_timeout
     }
@@ -480,12 +552,92 @@ impl Default for PostgresConfig {
     }
 }
 
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize)]
+struct PostgresConfigRef {
+    max_batch_size: usize,
+    pool_acquire_timeout: Duration,
+    operation_timeout: Duration,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostgresConfigWire {
+    #[serde(default = "default_postgres_max_batch_size")]
+    max_batch_size: usize,
+    #[serde(default = "default_postgres_pool_acquire_timeout")]
+    pool_acquire_timeout: Duration,
+    #[serde(default = "default_postgres_operation_timeout")]
+    operation_timeout: Duration,
+}
+
+#[cfg(feature = "serde")]
+const fn default_postgres_max_batch_size() -> usize {
+    PostgresConfig::DEFAULT_MAX_BATCH_SIZE
+}
+
+#[cfg(feature = "serde")]
+const fn default_postgres_pool_acquire_timeout() -> Duration {
+    PostgresConfig::DEFAULT_POOL_ACQUIRE_TIMEOUT
+}
+
+#[cfg(feature = "serde")]
+const fn default_postgres_operation_timeout() -> Duration {
+    PostgresConfig::DEFAULT_OPERATION_TIMEOUT
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for PostgresConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde::Serialize::serialize(
+            &PostgresConfigRef {
+                max_batch_size: self.max_batch_size(),
+                pool_acquire_timeout: self.pool_acquire_timeout(),
+                operation_timeout: self.operation_timeout(),
+            },
+            serializer,
+        )
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for PostgresConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <PostgresConfigWire as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new()
+            .with_max_batch_size(wire.max_batch_size)
+            .and_then(|config| config.with_pool_acquire_timeout(wire.pool_acquire_timeout))
+            .and_then(|config| config.with_operation_timeout(wire.operation_timeout))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Invalid `PostgreSQL` backend configuration.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PostgresConfigError {
     /// A zero maximum batch size would reject every nonempty batch.
     #[error("max_batch_size must be greater than zero")]
     ZeroBatchSize,
+    /// A zero acquisition budget cannot permit waiting for a pool connection.
+    #[error("PostgreSQL pool acquisition timeout must be greater than zero")]
+    ZeroPoolAcquireTimeout,
+    /// A pool-acquisition budget longer than one minute is not operationally
+    /// bounded enough for this backend.
+    #[error("PostgreSQL pool acquisition timeout {actual:?} exceeds maximum {maximum:?}")]
+    PoolAcquireTimeoutTooLong {
+        /// Supplied timeout.
+        actual: Duration,
+        /// Largest accepted timeout.
+        maximum: Duration,
+    },
     /// A zero deadline cannot permit database work.
     #[error("PostgreSQL rate-limit operation timeout must be greater than zero")]
     ZeroOperationTimeout,
@@ -600,8 +752,9 @@ impl PostgresLimiter {
     ///
     /// # Errors
     ///
-    /// Database failures before commit are
-    /// [`CheckError::DefinitelyNotConsumed`]. Any commit error is
+    /// Pool-acquisition or operation timeout before commit is
+    /// [`CheckError::TimedOutBeforeCommit`]. Other database failures before
+    /// commit are [`CheckError::DefinitelyNotConsumed`]. Any commit error is
     /// conservatively classified as [`CheckError::CommitOutcomeUnknown`].
     pub async fn check_all(&self, checks: &[Check<'_>]) -> Result<BatchDecision, CheckError> {
         validate_batch(checks, self.config.max_batch_size())?;
@@ -613,8 +766,12 @@ impl PostgresLimiter {
         // pool slot. Every database phase then consumes the exact same key
         // arrays, preventing identity drift between locking and mutation.
         let input = BatchSqlInput::from_checks(checks);
+        let connection =
+            acquire_check_connection(&self.pool, self.config.pool_acquire_timeout()).await?;
+        // Pool contention does not consume the database-work budget. A
+        // survivor receives a fresh deadline for begin, statements, locks,
+        // rollback, and commit.
         let deadline = Instant::now() + self.config.operation_timeout();
-        let connection = acquire_check_connection(&self.pool, deadline).await?;
         let mut guarded_connection = ConnectionCancellationGuard::new(connection);
         let result =
             run_check_transaction(guarded_connection.connection(), &input, checks, deadline).await;
@@ -643,8 +800,9 @@ impl PostgresLimiter {
     /// # Errors
     ///
     /// Returns an error if `PostgreSQL` rejects the maintenance transaction or
-    /// it exceeds [`PostgresConfig::operation_timeout`]. A commit error or
-    /// commit timeout means rows may have been removed; inspect
+    /// if either [`PostgresConfig::pool_acquire_timeout`] or the fresh
+    /// [`PostgresConfig::operation_timeout`] budget is exceeded. A commit error
+    /// or commit timeout means rows may have been removed; inspect
     /// [`MaintenanceError::may_have_removed_rows`]. Cleanup only targets
     /// already-expired rows and never consumes quota.
     pub async fn cleanup_expired(&self, maximum_rows: u32) -> Result<u64, MaintenanceError> {
@@ -652,8 +810,9 @@ impl PostgresLimiter {
             return Ok(0);
         }
 
+        let connection =
+            acquire_maintenance_connection(&self.pool, self.config.pool_acquire_timeout()).await?;
         let deadline = Instant::now() + self.config.operation_timeout();
-        let connection = acquire_maintenance_connection(&self.pool, deadline).await?;
         let mut guarded_connection = ConnectionCancellationGuard::new(connection);
         let result =
             run_cleanup_transaction(guarded_connection.connection(), maximum_rows, deadline).await;
@@ -667,8 +826,27 @@ impl PostgresLimiter {
     }
 }
 
+impl Limiter for PostgresLimiter {
+    type Error = CheckError;
+
+    fn check(
+        &self,
+        check: &Check<'_>,
+    ) -> impl Future<Output = Result<Decision, Self::Error>> + Send {
+        PostgresLimiter::check(self, check)
+    }
+
+    fn check_all(
+        &self,
+        checks: &[Check<'_>],
+    ) -> impl Future<Output = Result<BatchDecision, Self::Error>> + Send {
+        PostgresLimiter::check_all(self, checks)
+    }
+}
+
 /// Failure from a quota check.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CheckError {
     /// The atomic batch violated a backend-independent structural requirement.
     #[error(transparent)]
@@ -682,14 +860,15 @@ pub enum CheckError {
     #[error("PostgreSQL rate-limit commit outcome is unknown; quota may have been consumed")]
     CommitOutcomeUnknown(#[source] sqlx::Error),
 
-    /// The total deadline elapsed before commit started.
+    /// The pool-acquisition budget or operation deadline elapsed before commit
+    /// started.
     #[error("PostgreSQL rate-limit check timed out while {operation}; quota was not consumed")]
     TimedOutBeforeCommit {
         /// Database phase that exhausted the deadline.
         operation: &'static str,
     },
 
-    /// The total deadline elapsed after commit started.
+    /// The operation deadline elapsed after commit started.
     #[error("PostgreSQL rate-limit commit timed out; quota may have been consumed")]
     CommitTimedOut,
 
@@ -722,12 +901,14 @@ impl CheckError {
 
 /// Failure from bounded expired-window cleanup.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MaintenanceError {
     /// `PostgreSQL` did not commit the cleanup transaction, so no rows were
     /// removed.
     #[error("PostgreSQL expired-window cleanup failed before commit; no rows were removed")]
     Database(#[source] sqlx::Error),
-    /// The total deadline elapsed before cleanup commit started.
+    /// The pool-acquisition budget or operation deadline elapsed before cleanup
+    /// commit started.
     #[error("PostgreSQL expired-window cleanup timed out while {operation}; no rows were removed")]
     TimedOutBeforeCommit {
         /// Database phase that exhausted the deadline.
@@ -738,7 +919,7 @@ pub enum MaintenanceError {
         "PostgreSQL expired-window cleanup commit outcome is unknown; rows may have been removed"
     )]
     CommitOutcomeUnknown(#[source] sqlx::Error),
-    /// The total deadline elapsed after cleanup commit started.
+    /// The operation deadline elapsed after cleanup commit started.
     #[error("PostgreSQL expired-window cleanup commit timed out; rows may have been removed")]
     CommitTimedOut,
 }
@@ -754,8 +935,10 @@ fn single_decision_from_batch(batch: BatchDecision) -> Result<Decision, CheckErr
     batch
         .try_into_single_decision()
         .map_err(|invalid| match invalid {
-            BatchDecision::Allowed(_) => CheckError::CommittedResponseInvariant,
             BatchDecision::Denied { .. } => CheckError::ResponseInvariant,
+            // A future outcome may describe already-committed quota, so keep
+            // the public error's consumption classification conservative.
+            _ => CheckError::CommittedResponseInvariant,
         })
 }
 
@@ -964,9 +1147,9 @@ impl PendingDenial {
 
 async fn acquire_check_connection(
     pool: &PgPool,
-    deadline: Instant,
+    acquire_timeout: Duration,
 ) -> Result<PoolConnection<Postgres>, CheckError> {
-    timeout_at(deadline, pool.acquire())
+    timeout(acquire_timeout, pool.acquire())
         .await
         .map_err(|_| CheckError::TimedOutBeforeCommit {
             operation: "acquiring database connection",
@@ -1179,9 +1362,9 @@ async fn acquire_existing_row_locks(
 
 async fn acquire_maintenance_connection(
     pool: &PgPool,
-    deadline: Instant,
+    acquire_timeout: Duration,
 ) -> Result<PoolConnection<Postgres>, MaintenanceError> {
-    timeout_at(deadline, pool.acquire())
+    timeout(acquire_timeout, pool.acquire())
         .await
         .map_err(|_| MaintenanceError::TimedOutBeforeCommit {
             operation: "acquiring database connection",
@@ -1729,10 +1912,22 @@ mod tests {
     fn configuration_bounds_batches_and_deadlines() {
         let defaults = PostgresConfig::new();
         assert_eq!(defaults.max_batch_size(), 32);
+        assert_eq!(defaults.pool_acquire_timeout(), Duration::from_secs(3));
         assert_eq!(defaults.operation_timeout(), Duration::from_secs(3));
         assert_eq!(
             defaults.with_max_batch_size(0),
             Err(PostgresConfigError::ZeroBatchSize)
+        );
+        assert_eq!(
+            defaults.with_pool_acquire_timeout(Duration::ZERO),
+            Err(PostgresConfigError::ZeroPoolAcquireTimeout)
+        );
+        assert_eq!(
+            defaults.with_pool_acquire_timeout(Duration::from_secs(61)),
+            Err(PostgresConfigError::PoolAcquireTimeoutTooLong {
+                actual: Duration::from_secs(61),
+                maximum: Duration::from_secs(60),
+            })
         );
         assert_eq!(
             defaults.with_operation_timeout(Duration::ZERO),
@@ -1845,11 +2040,30 @@ mod tests {
 
     #[test]
     fn cleanup_query_is_bounded_and_nonblocking() {
-        assert_eq!(CLEANUP_SQL.matches("clock_timestamp()").count(), 1);
+        assert_eq!(
+            CLEANUP_SQL.matches("pg_catalog.clock_timestamp()").count(),
+            1
+        );
         assert!(CLEANUP_SQL.contains("AS MATERIALIZED"));
         assert!(CLEANUP_SQL.contains("SELECT sampled_at\n        FROM authoritative_time"));
-        assert!(!CLEANUP_SQL.contains("window_expires_at <= clock_timestamp()"));
+        assert!(!CLEANUP_SQL.contains("window_expires_at <= pg_catalog.clock_timestamp()"));
         assert!(CLEANUP_SQL.contains("LIMIT $1"));
         assert!(CLEANUP_SQL.contains("FOR UPDATE SKIP LOCKED"));
+    }
+
+    #[test]
+    fn every_production_clock_call_is_catalog_qualified() {
+        for (name, sql) in [
+            ("batch preflight", BATCH_PREFLIGHT_SQL),
+            ("batch upsert", BATCH_UPSERT_SQL),
+            ("single check", SINGLE_CHECK_SQL),
+            ("cleanup", CLEANUP_SQL),
+        ] {
+            let without_qualified_calls = sql.replace("pg_catalog.clock_timestamp()", "");
+            assert!(
+                !without_qualified_calls.contains("clock_timestamp()"),
+                "{name} contains a search_path-resolved clock_timestamp() call"
+            );
+        }
     }
 }
