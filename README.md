@@ -1,17 +1,20 @@
 # Runlimit
 
-Runlimit is a framework-neutral Rust library for enforcing the same keyed,
-anchored fixed-window limits in one process or across PostgreSQL-backed
-replicas.
+Runlimit is a framework-neutral Rust library for keyed rate limiting. It
+provides anchored fixed windows in memory or across PostgreSQL-backed replicas,
+plus a hard-bounded process-local GCRA backend for continuously replenished
+quotas.
 
-The 0.1 API is intentionally pre-stable. The first production target is
-authentication throttling in Identitypro.
+The 0.x API is intentionally pre-stable. Its application boundary is exercised
+by Identitypro authentication throttling.
 
 ## Crates
 
 | Crate | Responsibility |
 | --- | --- |
+| `runlimit-axum` | Caller-controlled Axum/Tower admission middleware. |
 | `runlimit-core` | Validated policies, HMAC-derived subject keys, checks, and structured decisions. |
+| `runlimit-http` | Framework-neutral IETF draft RateLimit response-field encoding. |
 | `runlimit-memory` | Sharded, hard-bounded process-local storage with bounded cleanup work. |
 | `runlimit-postgres` | Replica-safe SQLx/PostgreSQL storage, migrations, and bounded maintenance. |
 
@@ -19,10 +22,14 @@ Choose the backend needed by the application:
 
 ```toml
 [dependencies]
-runlimit-core = "0.1.0"
-runlimit-memory = "0.1.0"
+runlimit-core = "0.2.0"
+runlimit-memory = "0.2.0"
+# Optional Axum/Tower admission middleware:
+# runlimit-axum = "0.2.0"
+# Optional typed HTTP response metadata:
+# runlimit-http = "0.2.0"
 # Or, for a shared cross-replica quota:
-# runlimit-postgres = "0.1.0"
+# runlimit-postgres = "0.2.0"
 ```
 
 During development from a source checkout, a sibling project can use path
@@ -114,7 +121,7 @@ use runlimit_core::{BatchDecision, Check, Limiter};
 
 async fn admit<L: Limiter>(
     limiter: &L,
-    checks: &[Check<'_>],
+    checks: &[Check<'_, L::Policy>],
 ) -> Result<BatchDecision, L::Error> {
     limiter.check_all(checks).await
 }
@@ -130,22 +137,51 @@ synchronous. In generic code the trait methods are selected automatically. To
 request the async trait method from a concrete memory store, use a fully
 qualified call such as `Limiter::check(&store, &check).await`.
 
+## Axum admission middleware
+
+`runlimit-axum` provides `RateLimitLayer` for checks that must run before an
+Axum handler or request-body extractor. The application supplies a synchronous
+key extractor and a rejection mapper. The key extractor receives the request
+and policy, while the mapper owns the status, body, and headers for missing
+trusted metadata, enforced denials, and backend failures.
+
+The adapter does not interpret `Forwarded`, `X-Forwarded-For`, `ConnectInfo`,
+cookies, or application identities. Establish trust and normalize identities
+at the application boundary, then return an opaque `SubjectKey`. Allowed and
+shadow-denied decisions are inserted into request extensions for downstream
+handlers. Enforced quota and capacity denials short-circuit before the inner
+service is called or the request body is consumed.
+
+## HTTP response metadata
+
+`runlimit-http` encodes caller-selected policy and decision metadata using the
+versioned `draft_11` module. The active Internet-Draft uses the Structured
+Field values `RateLimit-Policy: "name";q=N;w=S` and
+`RateLimit: "name";r=N;t=S`.
+
+The helpers return typed HTTP header names and values. They do not select a
+response status or body, emit `Retry-After`, expose partition keys, or decide
+which policies an application should disclose. Policy periods advertised in
+`RateLimit-Policy` must be exact whole seconds; dynamic service durations are
+rounded up. Encoding also rejects quota values outside RFC 9651's Structured
+Field integer range.
+
 ## Optional Serde support
 
-Each crate has an opt-in `serde` feature. Enabling it on a backend also enables
-it for `runlimit-core`:
+The core and storage backend crates have an opt-in `serde` feature. Enabling it
+on a backend also enables it for `runlimit-core`:
 
 ```toml
 [dependencies]
-runlimit-memory = { version = "0.1.0", features = ["serde"] }
+runlimit-memory = { version = "0.2.0", features = ["serde"] }
 ```
 
 The feature serializes validated policy and scope identifiers as strings;
-fixed-window policies without their derived fingerprint; tagged
-`Decision`/`Denial`/`BatchDecision` values; and backend configuration values.
-`MemoryStoreStats` is also serializable for telemetry. Durations retain their
-exact seconds and nanoseconds. Deserialization rejects unknown fields and
-values that violate Runlimit's constructors or decision invariants.
+fixed-window and GCRA policies without their derived fingerprints; quota mode;
+tagged `Decision`/`Denial`/`BatchDecision` values; and backend configuration
+values. `MemoryStoreStats` is also serializable for telemetry. Durations retain
+their exact seconds and nanoseconds. Deserialization rejects unknown fields
+and values that violate Runlimit's constructors or decision invariants.
 
 `SubjectKey`, `CounterKey`, `PolicyFingerprint`, `KeyHasher`, and live backend
 instances deliberately do not implement Serde traits. Keep opaque storage keys
@@ -166,8 +202,8 @@ as calendar minutes.
   reinterpreting existing state.
 - Core accepts limits through `runlimit_core::MAX_LIMIT` and exact
   whole-millisecond windows through `runlimit_core::MAX_WINDOW`. These shared
-  portable bounds ensure every core-valid policy is representable by both
-  storage backends.
+  portable bounds ensure every core-valid fixed-window policy is representable
+  by both fixed-window storage backends.
 - Decisions expose durations measured by the backend. Memory durations are
   exact at evaluation time. PostgreSQL measures elapsed evaluation time with
   its authoritative database clock and can conservatively overstate the
@@ -177,6 +213,74 @@ as calendar minutes.
 
 The memory and PostgreSQL backends intentionally implement these same
 semantics.
+
+## GCRA semantics
+
+`GcraPolicy` and `GcraStore` provide a continuously replenished quota without
+fixed-window boundary bursts:
+
+```rust
+use std::time::Duration;
+
+use runlimit_core::{Check, GcraPolicy, PolicyId, ScopeId, SubjectKey};
+use runlimit_memory::{GcraStore, MemoryStoreConfig};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let policy = GcraPolicy::new(
+    PolicyId::new("api.read")?,
+    ScopeId::new("client")?,
+    10,                       // units replenished
+    Duration::from_secs(1),   // during this period
+    20,                       // maximum immediate burst
+)?;
+let limiter = GcraStore::new(MemoryStoreConfig::new(50_000)?);
+let decision = limiter.check(&Check::new(
+    &policy,
+    SubjectKey::from_digest([7; 32]),
+))?;
+assert!(decision.permits_request());
+# Ok(())
+# }
+```
+
+The backend uses exact scaled-integer arithmetic rather than a floating-point
+token count. Policy periods must be exact whole milliseconds; reported retry
+and full-replenishment durations round up to the next whole millisecond.
+`quota`, `period`, and `burst_capacity` are all part of the policy fingerprint.
+Each key uses constant-size state, and it becomes eligible for bounded cleanup
+once its full burst capacity has replenished.
+
+`GcraStore` is process-local. `PostgresLimiter` supports fixed-window policies
+only.
+
+## Shadow mode
+
+Use `with_quota_mode(QuotaMode::Shadow)` to warm and observe a policy before
+enforcing it. Quota exhaustion then returns a shadow-denied decision for which
+`permits_request()` is true and `would_deny()` is also true. A shadow denial
+does not consume quota. Storage-capacity denials and backend errors always
+remain fail-closed.
+
+Quota mode is deliberately excluded from the policy fingerprint, so switching
+a warmed policy to enforcement keeps its counter state. Atomic batches reject
+mixed enforcement and shadow modes; a denied or shadow-denied batch consumes
+nothing.
+
+## Operational observations
+
+`MemoryStore`, `GcraStore`, and `PostgresLimiter` accept an optional
+`runlimit_core::Observer`. Admission observations classify outcome, quota
+consumption certainty, and elapsed time; cleanup observations report bounded
+work. The memory stores also report per-shard capacity headroom. Observations
+intentionally omit subject keys, policy fingerprints, backend error text, and
+other sensitive high-cardinality values.
+
+Callbacks run synchronously after memory locks are released or database
+transactions are finalized. Keep them fast and hand expensive export work to
+another thread. Runlimit catches observer panics so telemetry cannot change an
+admission result. PostgreSQL observations preserve the distinction between
+definite non-consumption and a commit result that may already have consumed
+quota.
 
 ## Subject keys and secret rotation
 
@@ -196,7 +300,7 @@ same time can each admit traffic against different counters.
 
 ## Memory backend behavior
 
-`MemoryStore` is process-local and hard bounded:
+`MemoryStore` and `GcraStore` are process-local and hard bounded:
 
 - The store defaults to one shard so all of `max_keys` is available regardless
   of key distribution.
@@ -206,8 +310,9 @@ same time can each admit traffic against different counters.
   capacity.
 - Active entries are never evicted to make room for new subjects.
 - Each check removes at most the configured number of expired entries from its
-  shard. An atomic batch receives that allowance once for each check, on the
-  shard targeted by that check.
+  shard. An atomic batch receives that allowance once for each check on the
+  shard targeted by that check. A fixed-window entry expires at its anchored
+  deadline; a GCRA entry expires when its full capacity has replenished.
 - An atomic batch targeting more distinct keys at one shard than that shard can
   ever hold returns
   `MemoryStoreError::BatchExceedsShardCapacity { shard_index, key_count,
@@ -222,7 +327,7 @@ poisoned. Every later operation touching it returns
 `MemoryStoreError::PoisonedShard` without resetting its counters. With the
 default one-shard configuration, this makes the entire store unavailable.
 Keep admissions failed closed and alert operators. As an explicit availability
-tradeoff, `MemoryStore::recover_poisoned()` atomically empties only poisoned
+tradeoff, `recover_poisoned()` on either store atomically empties only poisoned
 shards, clears their poison flags, preserves healthy-shard counters, and
 returns the number recovered. Resetting those counters can admit requests that
 their lost state would have denied; replacing the store is a broader reset
@@ -255,19 +360,22 @@ unrelated session holding the same numeric lock can delay an affected counter
 until its operation deadline. Use a trusted or dedicated database boundary, or
 ensure unrelated roles cannot execute the advisory-lock functions.
 
-**Version 0.1 is not hard-cardinality-bounded in PostgreSQL.** Arbitrary
-unique-key spray can grow the table until those windows expire and maintenance
-removes them. A production deployment must:
+Version 0.2 hard-bounds PostgreSQL cardinality with 256 persistent capacity
+shards. `PostgresConfig::maximum_rows_per_shard` defaults to 4,096 and can be
+lowered or raised through the database-enforced maximum of 65,536. Admission
+locks the affected ledger shards and reserves all missing batch keys in the
+same transaction as quota consumption. A full shard denies new keys with
+`Denial::StorageCapacity`; existing keys remain usable and active rows are
+never evicted. The migration's trigger-maintained ledger also caps inserts
+from older replicas at 65,536 rows per shard during a rolling deployment.
 
-- keep a hard-bounded `MemoryStore` client gate before body parsing and
-  PostgreSQL acquisition;
-- schedule `cleanup_expired(maximum_rows)` continuously; and
-- monitor table rows, index size, disk use, cleanup throughput, and denials at
-  the memory gate.
-
-Distributed database capacity enforcement is a tracked follow-up. Until it is
-implemented, do not expose PostgreSQL as the only defense against
-attacker-controlled key cardinality.
+The bound is per shard, so skew can deny a new key while other shards retain
+headroom. Expiry does not itself release a ledger slot:
+`cleanup_expired(maximum_rows)` must delete the row before its capacity becomes
+reusable. Keep scheduling bounded cleanup and monitor shard headroom, table and
+index size, cleanup throughput, and storage-capacity denials. A coarse
+hard-bounded memory gate is still recommended before body parsing and
+PostgreSQL acquisition to protect application and pool capacity.
 
 Before serving traffic, apply the bundled migrations with
 `PostgresLimiter::migrate()`. In a database where application and library
@@ -276,25 +384,31 @@ must enable `Migrator::set_ignore_missing(true)` so each one tolerates versions
 owned by the others. The exported raw `MIGRATOR` keeps SQLx's strict default
 and is suitable only when Runlimit exclusively owns that migration history and
 connection. An application that must retain a strict host migrator should
-vendor the bundled Runlimit SQL as an application-owned migration and not run
+vendor the bundled Runlimit SQL as application-owned migrations and not run
 either Runlimit migrator against the shared history. The exact bundled
-statements are available as `CREATE_RUNLIMIT_FIXED_WINDOWS_SQL` and
-`SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL` so hosts can vendor them without
+statements are available as `CREATE_RUNLIMIT_FIXED_WINDOWS_SQL`,
+`SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL`, and
+`BOUND_RUNLIMIT_FIXED_WINDOW_CARDINALITY_SQL` so hosts can vendor them without
 reaching into crate source files.
 
 Periodically call `cleanup_expired(maximum_rows)` to bound maintenance work;
-expired rows do not affect correctness before cleanup.
+expired rows do not affect correctness before cleanup. The cleanup query
+materializes one PostgreSQL clock sample so the expiry predicate remains an
+index range condition; when no rows are expired it does not filter a full scan
+of active windows.
 
 The counter table is update-heavy. Each admission after a counter row's initial
 insert updates that row and leaves a dead heap tuple. In-window increments of
 `used` can use PostgreSQL HOT updates, but starting a new anchored window also
 changes the indexed `window_expires_at` value, so window renewals cannot be HOT
 and also leave dead index entries. Deleting expired rows adds more dead tuples.
-The bundled additive migration sets the table `fillfactor` to 80, reserving
+One bundled additive migration sets the table `fillfactor` to 80, reserving
 page space for HOT counter updates at the cost of a larger live heap; it does
 not remove the need for autovacuum. It remains separate from 0.1.0's
 create-table migration so existing SQLx histories retain the published
-checksum.
+checksum. The following additive migration installs the capacity ledger,
+generated shard column, and statement-level maintenance triggers without
+changing that published migration.
 
 Tune autovacuum for churn rather than accepting its table-wide defaults
 unchanged. The following is a reasonable starting point, not a capacity
@@ -386,8 +500,8 @@ The minimum supported Rust version is 1.88. Before handing off changes, run:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 cargo check \
   --manifest-path smoke/external-consumer/Cargo.toml \
   --locked \
@@ -412,11 +526,12 @@ Review the release metadata and hand-written changelog entry, commit them, push
 ./scripts/publish-release.sh X.Y.Z
 ```
 
-The publish script requires local `master` to match `origin/master`. It
-publishes `runlimit-core`, waits for crates.io to index it, publishes
-`runlimit-memory`, waits again, and finally publishes `runlimit-postgres`.
-After every crate is indexed, it creates and pushes the matching `vX.Y.Z` tag.
-If a publish stops partway through, resume explicitly with
+The publish script requires local `master` to match `origin/master`. In
+dependency order it publishes `runlimit-core`, `runlimit-memory`,
+`runlimit-postgres`, `runlimit-http`, and `runlimit-axum`, waiting for crates.io
+to index each one before continuing. After every crate is indexed, it creates
+and pushes the matching `vX.Y.Z` tag. If a publish stops partway through,
+resume explicitly with
 `RESUME_RELEASE=1 ./scripts/publish-release.sh X.Y.Z`; already-published crate
 versions are verified before the script continues.
 

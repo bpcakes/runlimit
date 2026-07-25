@@ -2,7 +2,7 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use thiserror::Error;
 
-use crate::Check;
+use crate::{Check, QuotaMode, RateLimitPolicy};
 
 /// Validates backend-independent structural requirements for an atomic batch.
 ///
@@ -14,7 +14,10 @@ use crate::Check;
 /// Returns [`BatchError::BatchTooLarge`] before inspecting keys when the batch
 /// exceeds `maximum`. Otherwise returns [`BatchError::DuplicateKey`] for the
 /// first repeated logical counter.
-pub fn validate_batch(checks: &[Check<'_>], maximum: usize) -> Result<(), BatchError> {
+pub fn validate_batch<P: RateLimitPolicy>(
+    checks: &[Check<'_, P>],
+    maximum: usize,
+) -> Result<(), BatchError> {
     if checks.len() > maximum {
         return Err(BatchError::BatchTooLarge {
             actual: checks.len(),
@@ -22,8 +25,18 @@ pub fn validate_batch(checks: &[Check<'_>], maximum: usize) -> Result<(), BatchE
         });
     }
 
+    let first_mode = checks.first().map(|check| check.policy().quota_mode());
     let mut first_indices = HashMap::with_capacity(checks.len());
     for (duplicate_index, check) in checks.iter().enumerate() {
+        if let Some(first) = first_mode
+            && check.policy().quota_mode() != first
+        {
+            return Err(BatchError::MixedQuotaModes {
+                first,
+                index: duplicate_index,
+                actual: check.policy().quota_mode(),
+            });
+        }
         match first_indices.entry(check.counter_key()) {
             Entry::Vacant(entry) => {
                 entry.insert(duplicate_index);
@@ -59,6 +72,18 @@ pub enum BatchError {
         /// Configured maximum.
         maximum: usize,
     },
+    /// The batch mixed enforced and shadow quota policies.
+    #[error(
+        "batch policy at index {index} uses quota mode {actual:?}, which differs from the first policy's {first:?} mode"
+    )]
+    MixedQuotaModes {
+        /// Quota mode of the first input policy.
+        first: QuotaMode,
+        /// Index of the first input with a different mode.
+        index: usize,
+        /// Quota mode at `index`.
+        actual: QuotaMode,
+    },
 }
 
 #[cfg(test)]
@@ -66,7 +91,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{BatchError, validate_batch};
-    use crate::{Check, FixedWindowPolicy, PolicyId, ScopeId, SubjectKey};
+    use crate::{Check, FixedWindowPolicy, PolicyId, QuotaMode, ScopeId, SubjectKey};
 
     fn policy(id: &str) -> FixedWindowPolicy {
         FixedWindowPolicy::new(
@@ -92,7 +117,7 @@ mod tests {
             Check::new(&first_policy, subject(2)),
         ];
 
-        assert_eq!(validate_batch(&[], 0), Ok(()));
+        assert_eq!(validate_batch::<FixedWindowPolicy>(&[], 0), Ok(()));
         assert_eq!(validate_batch(&checks, checks.len()), Ok(()));
     }
 
@@ -129,6 +154,26 @@ mod tests {
             Err(BatchError::BatchTooLarge {
                 actual: 2,
                 maximum: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_enforcement_modes_before_duplicate_detection() {
+        let enforced = policy("auth.alpha");
+        let shadow = policy("auth.beta").with_quota_mode(QuotaMode::Shadow);
+        let checks = [
+            Check::new(&enforced, subject(1)),
+            Check::new(&shadow, subject(2)),
+            Check::new(&enforced, subject(1)),
+        ];
+
+        assert_eq!(
+            validate_batch(&checks, checks.len()),
+            Err(BatchError::MixedQuotaModes {
+                first: QuotaMode::Enforce,
+                index: 1,
+                actual: QuotaMode::Shadow,
             })
         );
     }

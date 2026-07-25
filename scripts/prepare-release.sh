@@ -7,14 +7,20 @@ PUBLISHABLE_CRATES=(
   "runlimit-core"
   "runlimit-memory"
   "runlimit-postgres"
+  "runlimit-http"
+  "runlimit-axum"
+)
+FIRST_PUBLISH_CRATES=(
+  "runlimit-http"
+  "runlimit-axum"
 )
 MSRV_TOOLCHAIN="${MSRV_TOOLCHAIN:-1.88.0}"
 STABLE_TOOLCHAIN="${STABLE_TOOLCHAIN:-stable}"
-CRATES_IO_USER_AGENT="runlimit-release-script/0.1 (https://github.com/bpcakes/runlimit)"
+CRATES_IO_USER_AGENT="runlimit-release-script/0.2 (https://github.com/bpcakes/runlimit)"
 
 usage() {
   echo "usage: $0 <version>" >&2
-  echo "example: $0 0.1.0" >&2
+  echo "example: $0 0.2.0" >&2
 }
 
 die() {
@@ -84,14 +90,14 @@ version_exists_on_crates_io() {
   esac
 }
 
-require_initial_crate_names_available() {
+require_first_publish_crate_names_available() {
   local crate
   local spelling
   local http_code
 
-  [[ "$VERSION" == "0.1.0" ]] || return 0
+  [[ "$VERSION" == "0.2.0" ]] || return 0
 
-  for crate in "${PUBLISHABLE_CRATES[@]}"; do
+  for crate in "${FIRST_PUBLISH_CRATES[@]}"; do
     for spelling in "$crate" "${crate//-/_}"; do
       http_code="$(curl \
         --silent \
@@ -103,7 +109,7 @@ require_initial_crate_names_available() {
         "https://crates.io/api/v1/crates/${spelling}")" \
         || die "failed to query crates.io for ${spelling}"
       [[ "$http_code" == "404" ]] \
-        || die "initial-release crate name ${spelling} is not available (HTTP ${http_code})"
+        || die "first-publish crate name ${spelling} is not available (HTTP ${http_code})"
     done
   done
 }
@@ -136,7 +142,7 @@ cargo "+${MSRV_TOOLCHAIN}" --version >/dev/null 2>&1 \
 
 cargo metadata --locked --no-deps --format-version 1 >/dev/null
 require_manifest_versions "$VERSION"
-require_initial_crate_names_available
+require_first_publish_crate_names_available
 [[ -n "${RUNLIMIT_POSTGRES_TEST_DATABASE_URL:-}" ]] \
   || die "RUNLIMIT_POSTGRES_TEST_DATABASE_URL must point to disposable PostgreSQL for the required database suite"
 

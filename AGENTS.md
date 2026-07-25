@@ -3,14 +3,17 @@
 Runlimit is a framework-neutral rate-limiting library. Keep application policy
 at the application boundary and keep backend behavior aligned.
 
-This is still a fresh project, not yet used anywhere yet. Keep that in mind and
-don't implement any backwards compatibility, just do a hard cut-over.
+Runlimit is pre-1.0, so public Rust and wire APIs may make deliberate
+semver-signaled hard cuts. Published migrations and persistent cross-replica
+protocols are immutable; preserve their compatibility through rolling
+deployments.
 
 ## Architecture
 
-- `runlimit-core` owns validated policy identifiers, fixed-window policy
-  configuration, opaque subject keys, key derivation, and structured decisions.
-  It must not depend on an async runtime, HTTP framework, or database driver.
+- `runlimit-core` owns validated policy identifiers, fixed-window and GCRA
+  policy configuration, opaque subject keys, key derivation, and structured
+  decisions. It must not depend on an async runtime, HTTP framework, or
+  database driver.
 - `runlimit-memory` owns process-local storage. Its cardinality must be hard
   bounded, cleanup work per check must be bounded, and capacity exhaustion must
   fail closed without evicting active entries.
@@ -23,11 +26,12 @@ don't implement any backwards compatibility, just do a hard cut-over.
 
 ## Semantic invariants
 
-- The memory and PostgreSQL backends implement the same anchored fixed-window
-  semantics.
-- A policy configuration fingerprint is part of every storage key. Changing a
-  limit or window never reinterprets an existing counter.
-- Denied checks do not consume quota.
+- The memory fixed-window and PostgreSQL backends implement the same anchored
+  fixed-window semantics. `GcraStore` implements only `GcraPolicy`.
+- A policy configuration fingerprint is part of every storage key. Changing
+  any storage-relevant configuration never reinterprets an existing counter.
+- Enforced and shadow-denied checks do not consume quota. Storage-capacity
+  denials are always enforced.
 - Multi-check operations are all-or-nothing and preserve the caller's input
   order in returned decisions.
 - Retry durations are measured from the backend's authoritative evaluation
@@ -38,6 +42,9 @@ don't implement any backwards compatibility, just do a hard cut-over.
   should derive subject keys with a secret of at least 32 bytes.
 - PostgreSQL 0.1 storage is not hard-cardinality-bounded. Deploy it behind a
   bounded local gate, schedule expired-row cleanup, and monitor table growth.
+- PostgreSQL 0.2 storage is hard-bounded per persistent capacity shard. Keep
+  the shard derivation and database ceiling stable, schedule expired-row
+  cleanup to reclaim slots, and monitor shard skew and table growth.
 
 ## Checks
 

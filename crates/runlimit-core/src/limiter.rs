@@ -1,6 +1,6 @@
 use std::{error::Error, future::Future};
 
-use crate::{BatchDecision, Check, Decision};
+use crate::{BatchDecision, Check, Decision, RateLimitPolicy};
 
 /// An asynchronous, backend-independent rate limiter.
 ///
@@ -16,13 +16,16 @@ use crate::{BatchDecision, Check, Decision};
 /// portability guarantee also requires limiter and error types to be [`Send`]
 /// and [`Sync`], excluding deliberately single-thread-only implementations.
 pub trait Limiter: Send + Sync {
+    /// Policy algorithm supported by this backend.
+    type Policy: RateLimitPolicy;
+
     /// Backend-specific operational failure.
     type Error: Error + Send + Sync + 'static;
 
     /// Evaluates and, when allowed, consumes one check.
     fn check(
         &self,
-        check: &Check<'_>,
+        check: &Check<'_, Self::Policy>,
     ) -> impl Future<Output = Result<Decision, Self::Error>> + Send;
 
     /// Evaluates a batch atomically.
@@ -31,6 +34,6 @@ pub trait Limiter: Send + Sync {
     /// preserve the caller's input order.
     fn check_all(
         &self,
-        checks: &[Check<'_>],
+        checks: &[Check<'_, Self::Policy>],
     ) -> impl Future<Output = Result<BatchDecision, Self::Error>> + Send;
 }

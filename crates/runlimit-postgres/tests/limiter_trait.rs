@@ -12,14 +12,14 @@ use sqlx::postgres::PgPoolOptions;
 
 async fn check_batch<L>(limiter: &L, checks: &[Check<'_>]) -> Result<BatchDecision, L::Error>
 where
-    L: Limiter,
+    L: Limiter<Policy = FixedWindowPolicy>,
 {
     limiter.check_all(checks).await
 }
 
 async fn check_one<L>(limiter: &L, check: &Check<'_>) -> Result<Decision, L::Error>
 where
-    L: Limiter,
+    L: Limiter<Policy = FixedWindowPolicy>,
 {
     limiter.check(check).await
 }
@@ -114,8 +114,8 @@ async fn generic_batch_preserves_caller_order() {
     let decisions = expect_allowed(check_batch(&memory, &checks).await);
 
     assert_eq!(decisions.len(), 2);
-    assert_eq!(decisions[0].limit(), Some(11));
-    assert_eq!(decisions[0].remaining(), Some(8));
-    assert_eq!(decisions[1].limit(), Some(7));
-    assert_eq!(decisions[1].remaining(), Some(5));
+    assert_eq!(decisions[0].capacity(), Some(11));
+    assert_eq!(decisions[0].available(), Some(8));
+    assert_eq!(decisions[1].capacity(), Some(7));
+    assert_eq!(decisions[1].available(), Some(5));
 }

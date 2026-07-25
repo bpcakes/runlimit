@@ -1,27 +1,21 @@
 [package]
-name = "runlimit-memory"
+name = "runlimit-http"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Hard-bounded in-memory fixed-window and GCRA rate limiting"
-documentation = "https://docs.rs/runlimit-memory"
+description = "Framework-neutral HTTP rate-limit response metadata"
+documentation = "https://docs.rs/runlimit-http"
 readme = "../../README.md"
 repository.workspace = true
-keywords = ["rate-limit", "throttling", "security"]
+keywords = ["rate-limit", "http", "headers", "throttling"]
 categories = ["web-programming"]
 
-[features]
-serde = ["dep:serde", "runlimit-core/serde"]
-
 [dependencies]
+http.workspace = true
 runlimit-core.workspace = true
-serde = { workspace = true, optional = true }
 thiserror.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

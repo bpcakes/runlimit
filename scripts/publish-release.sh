@@ -7,15 +7,21 @@ PUBLISHABLE_CRATES=(
   "runlimit-core"
   "runlimit-memory"
   "runlimit-postgres"
+  "runlimit-http"
+  "runlimit-axum"
 )
-CRATES_IO_USER_AGENT="runlimit-release-script/0.1 (https://github.com/bpcakes/runlimit)"
+FIRST_PUBLISH_CRATES=(
+  "runlimit-http"
+  "runlimit-axum"
+)
+CRATES_IO_USER_AGENT="runlimit-release-script/0.2 (https://github.com/bpcakes/runlimit)"
 CRATES_IO_TIMEOUT_SECONDS="${CRATES_IO_TIMEOUT_SECONDS:-600}"
 CRATES_IO_POLL_SECONDS="${CRATES_IO_POLL_SECONDS:-10}"
 RESUME_RELEASE="${RESUME_RELEASE:-0}"
 
 usage() {
   echo "usage: $0 <version>" >&2
-  echo "example: $0 0.1.0" >&2
+  echo "example: $0 0.2.0" >&2
   echo "set RESUME_RELEASE=1 only to resume a partially published release" >&2
 }
 
@@ -147,16 +153,16 @@ verify_local_package_provenance() {
     || die "${crate} package path ${vcs_path} is not ${expected_path}"
 }
 
-preflight_initial_crate_names() {
+preflight_first_publish_crate_names() {
   local crate
   local spelling
   local response_file
   local http_code
   local registry_name
 
-  [[ "$VERSION" == "0.1.0" ]] || return 0
+  [[ "$VERSION" == "0.2.0" ]] || return 0
 
-  for crate in "${PUBLISHABLE_CRATES[@]}"; do
+  for crate in "${FIRST_PUBLISH_CRATES[@]}"; do
     for spelling in "$crate" "${crate//-/_}"; do
       response_file="$WORK_DIR/${spelling}-name.json"
       http_code="$(curl \
@@ -172,7 +178,7 @@ preflight_initial_crate_names() {
         404) ;;
         200)
           [[ "$RESUME_RELEASE" == "1" ]] \
-            || die "initial-release crate name ${spelling} is not available"
+            || die "first-publish crate name ${spelling} is not available"
           registry_name="$(jq -er '.crate.id' "$response_file")" \
             || die "crates.io did not identify the crate returned for ${spelling}"
           [[ "$registry_name" == "$crate" ]] \
@@ -337,7 +343,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-preflight_initial_crate_names
+preflight_first_publish_crate_names
 
 # Preflight every crate before the first irreversible upload. Existing versions
 # are accepted only for an explicitly resumed release. A valid partial release

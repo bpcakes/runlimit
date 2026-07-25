@@ -1,13 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/runlimit-axum",
     "crates/runlimit-core",
+    "crates/runlimit-http",
     "crates/runlimit-memory",
     "crates/runlimit-postgres",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -16,16 +18,22 @@ repository = "https://github.com/bpcakes/runlimit"
 publish = ["crates-io"]
 
 [workspace.dependencies]
-runlimit-core = { version = "0.1.0", path = "crates/runlimit-core" }
-runlimit-memory = { version = "0.1.0", path = "crates/runlimit-memory" }
-runlimit-postgres = { version = "0.1.0", path = "crates/runlimit-postgres" }
+axum = { version = "0.8.4", default-features = false }
+http-body = "1.0.1"
+runlimit-core = { version = "0.2.0", path = "crates/runlimit-core" }
+runlimit-axum = { version = "0.2.0", path = "crates/runlimit-axum" }
+runlimit-http = { version = "0.2.0", path = "crates/runlimit-http" }
+runlimit-memory = { version = "0.2.0", path = "crates/runlimit-memory" }
+runlimit-postgres = { version = "0.2.0", path = "crates/runlimit-postgres" }
 hmac = { version = "0.13.0", features = ["zeroize"] }
+http = "1.4.2"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = { version = "0.11.0", features = ["zeroize"] }
 sqlx = { version = "0.8.6", default-features = false }
 thiserror = "2.0.12"
 tokio = { version = "1.47.1", default-features = false }
+tower = "0.5.2"
 
 [workspace.lints.rust]
 missing_docs = "warn"

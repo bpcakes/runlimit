@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "runlimit-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hmac",
  "sha2",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "runlimit-memory"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "runlimit-core",
  "thiserror",

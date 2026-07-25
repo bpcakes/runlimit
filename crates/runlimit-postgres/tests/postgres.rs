@@ -3,20 +3,22 @@
 use std::{
     process,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use runlimit_core::{
-    BatchDecision, Check, Decision, Denial, FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW,
-    MAX_WINDOW_MILLIS, PolicyId, ScopeId, SubjectKey,
+    AdmissionOutcome, BatchDecision, Check, ConsumptionStatus, Decision, Denial, FixedWindowPolicy,
+    MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, Observation, Observer, PolicyId, QuotaMode, ScopeId,
+    SubjectKey,
 };
 use runlimit_memory::{Clock, MemoryStore, MemoryStoreConfig};
 use runlimit_postgres::{
-    CREATE_RUNLIMIT_FIXED_WINDOWS_SQL, CheckError, MIGRATOR, MaintenanceError, PostgresConfig,
-    PostgresLimiter, SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL,
+    BOUND_RUNLIMIT_FIXED_WINDOW_CARDINALITY_SQL, CREATE_RUNLIMIT_FIXED_WINDOWS_SQL, CheckError,
+    HARD_MAX_ROWS_PER_SHARD, MIGRATOR, MaintenanceError, PostgresConfig, PostgresLimiter,
+    SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, migrate::Migrate, postgres::PgPoolOptions};
@@ -27,6 +29,7 @@ const CLEANUP_SQL: &str = include_str!("../src/cleanup_expired.sql");
 const TEST_HOST_MIGRATION_VERSION: i64 = 20_260_722_000_000;
 const PUBLISHED_CREATE_MIGRATION_VERSION: i64 = 20_260_723_000_000;
 const FILLFACTOR_MIGRATION_VERSION: i64 = 20_260_725_000_000;
+const CARDINALITY_MIGRATION_VERSION: i64 = 20_260_726_000_000;
 const ADVISORY_LOCK_DOMAIN: &[u8] = b"runlimit/postgres-advisory-lock/v1\0";
 const PUBLISHED_CREATE_MIGRATION_SHA384: [u8; 48] = [
     0x31, 0xd9, 0x3f, 0xde, 0x98, 0xc2, 0x36, 0x4a, 0x33, 0x06, 0x2e, 0x37, 0x35, 0x08, 0xf5, 0x63,
@@ -35,13 +38,38 @@ const PUBLISHED_CREATE_MIGRATION_SHA384: [u8; 48] = [
 ];
 static NEXT_POLICY: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Default)]
+struct RecordingObserver {
+    admissions: Mutex<Vec<(AdmissionOutcome, ConsumptionStatus)>>,
+    cleanups: Mutex<Vec<(usize, Option<u64>, ConsumptionStatus)>>,
+}
+
+impl Observer for RecordingObserver {
+    fn observe(&self, observation: &Observation<'_>) {
+        match observation {
+            Observation::Admission(admission) => self
+                .admissions
+                .lock()
+                .unwrap()
+                .push((admission.outcome(), admission.consumption())),
+            Observation::Cleanup(cleanup) => self.cleanups.lock().unwrap().push((
+                cleanup.requested(),
+                cleanup.removed(),
+                cleanup.consumption(),
+            )),
+            _ => {}
+        }
+    }
+}
+
 #[test]
-fn published_create_migration_is_immutable_and_fillfactor_is_additive() {
+fn published_create_migration_is_immutable_and_later_migrations_are_additive() {
     let migrations = MIGRATOR.iter().collect::<Vec<_>>();
 
-    assert!(migrations.len() >= 2);
+    assert!(migrations.len() >= 3);
     assert_eq!(migrations[0].version, PUBLISHED_CREATE_MIGRATION_VERSION);
     assert_eq!(migrations[1].version, FILLFACTOR_MIGRATION_VERSION);
+    assert_eq!(migrations[2].version, CARDINALITY_MIGRATION_VERSION);
     assert_eq!(
         migrations[0].checksum.as_ref(),
         PUBLISHED_CREATE_MIGRATION_SHA384
@@ -54,8 +82,18 @@ fn published_create_migration_is_immutable_and_fillfactor_is_additive() {
         migrations[1].sql.as_ref(),
         SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL
     );
+    assert_eq!(
+        migrations[2].sql.as_ref(),
+        BOUND_RUNLIMIT_FIXED_WINDOW_CARDINALITY_SQL
+    );
     assert!(!CREATE_RUNLIMIT_FIXED_WINDOWS_SQL.contains("fillfactor"));
     assert!(SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL.contains("SET (fillfactor = 80)"));
+    assert!(BOUND_RUNLIMIT_FIXED_WINDOW_CARDINALITY_SQL.contains("GENERATED ALWAYS"));
+    assert!(BOUND_RUNLIMIT_FIXED_WINDOW_CARDINALITY_SQL.contains("65536"));
+    assert!(
+        BOUND_RUNLIMIT_FIXED_WINDOW_CARDINALITY_SQL
+            .contains("runlimit_fixed_windows_immutable_storage_key")
+    );
 }
 
 async fn test_pool(maximum_connections: u32) -> PgPool {
@@ -164,6 +202,34 @@ fn key(value: u8) -> SubjectKey {
     SubjectKey::from_digest([value; 32])
 }
 
+fn key_in_capacity_shard(
+    policy: &FixedWindowPolicy,
+    capacity_shard: u8,
+    discriminator: u8,
+) -> SubjectKey {
+    let mut digest = [discriminator; 32];
+    digest[0] = policy.fingerprint().as_bytes()[0] ^ capacity_shard;
+    SubjectKey::from_digest(digest)
+}
+
+fn capacity_shard_for(policy: &FixedWindowPolicy, subject: SubjectKey) -> i16 {
+    i16::from(policy.fingerprint().as_bytes()[0] ^ subject.as_bytes()[0])
+}
+
+async fn capacity_row_count(pool: &PgPool, capacity_shard: i16) -> i64 {
+    sqlx::query_scalar(
+        r"
+SELECT row_count
+FROM runlimit_capacity_shards
+WHERE capacity_shard = $1
+",
+    )
+    .bind(capacity_shard)
+    .fetch_one(pool)
+    .await
+    .expect("read capacity ledger row")
+}
+
 fn advisory_lock_id(check: &Check<'_>) -> i64 {
     let mut digest = Sha256::new();
     digest.update(ADVISORY_LOCK_DOMAIN);
@@ -223,7 +289,7 @@ const FIXED_WINDOW_TRANSITIONS: [TransitionStep; 6] = [
         at_millis: 3_000,
         cost: 2,
         expected: Decision::denied(Denial::QuotaExceeded {
-            limit: 5,
+            capacity: 5,
             retry_after: Duration::from_secs(7),
         }),
     },
@@ -238,7 +304,7 @@ const FIXED_WINDOW_TRANSITIONS: [TransitionStep; 6] = [
         at_millis: 9_000,
         cost: 1,
         expected: Decision::denied(Denial::QuotaExceeded {
-            limit: 5,
+            capacity: 5,
             retry_after: Duration::from_secs(1),
         }),
     },
@@ -406,8 +472,30 @@ async fn isolated_cleanup_test_pools(maximum_connections: u32) -> (PgPool, PgPoo
     .execute(&pool)
     .await
     .expect("create isolated cleanup-test table");
+    sqlx::raw_sql(BOUND_RUNLIMIT_FIXED_WINDOW_CARDINALITY_SQL)
+        .execute(&pool)
+        .await
+        .expect("install isolated cardinality ledger");
 
     (setup_pool, pool, schema)
+}
+
+async fn pool_for_schema(schema: &str, maximum_connections: u32) -> PgPool {
+    let database_url =
+        std::env::var(TEST_DATABASE_URL).expect("test URL remains available during test");
+    let connection_schema = schema.to_owned();
+    PgPoolOptions::new()
+        .max_connections(maximum_connections)
+        .after_connect(move |connection, _metadata| {
+            let search_path_sql = format!("SET search_path = {connection_schema}, pg_catalog");
+            Box::pin(async move {
+                sqlx::query(&search_path_sql).execute(connection).await?;
+                Ok(())
+            })
+        })
+        .connect(&database_url)
+        .await
+        .expect("connect additional isolated-schema pool")
 }
 
 async fn create_pool_budget_delay_triggers(setup_pool: &PgPool, schema: &str) {
@@ -692,7 +780,7 @@ async fn pool_wait_does_not_spend_admission_or_cleanup_operation_budget() {
         .expect("admission task does not panic")
         .expect("admission receives a fresh operation budget after pool wait");
     assert!(decision.is_allowed());
-    assert_eq!(decision.remaining(), Some(0));
+    assert_eq!(decision.available(), Some(0));
 
     sqlx::query(
         r"
@@ -830,6 +918,8 @@ SELECT
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn migration_upgrades_the_published_0_1_table_additively() {
     let (setup_pool, pool, schema) = isolated_migration_test_pools(1).await;
+    let existing_policy = unique_policy("migration-capacity-backfill", 2, Duration::from_secs(60));
+    let existing_subject = key(154);
     let published_create_migration = MIGRATOR
         .iter()
         .find(|migration| migration.version == PUBLISHED_CREATE_MIGRATION_VERSION)
@@ -848,6 +938,7 @@ async fn migration_upgrades_the_published_0_1_table_additively() {
         .await
         .expect("apply published create migration");
     drop(connection);
+    insert_counter_window(&pool, &existing_policy, existing_subject, -1, 60).await;
 
     assert!(
         !counter_table_options(&pool)
@@ -878,6 +969,26 @@ async fn migration_upgrades_the_published_0_1_table_additively() {
         table_options.iter().any(|option| option == "fillfactor=80"),
         "upgraded table options do not reserve space for HOT updates: {table_options:?}"
     );
+    let expected_shard = capacity_shard_for(&existing_policy, existing_subject);
+    let stored_shard: i16 = sqlx::query_scalar(
+        r"
+SELECT capacity_shard
+FROM runlimit_fixed_windows
+WHERE config_fingerprint = $1 AND subject_key = $2
+",
+    )
+    .bind(existing_policy.fingerprint().as_bytes().as_slice())
+    .bind(existing_subject.as_bytes().as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("read generated shard for pre-migration row");
+    assert_eq!(stored_shard, expected_shard);
+    assert_eq!(capacity_row_count(&pool, expected_shard).await, 1);
+    assert_eq!(
+        delete_counter(&pool, &existing_policy, existing_subject).await,
+        1
+    );
+    assert_eq!(capacity_row_count(&pool, expected_shard).await, 0);
 
     drop(limiter);
     drop_migration_test_schema(setup_pool, pool, &schema).await;
@@ -1040,6 +1151,510 @@ WHERE
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn configured_capacity_denies_only_new_keys_in_the_full_shard() {
+    let (setup_pool, pool, schema) = isolated_cleanup_test_pools(4).await;
+    let policy = unique_policy("configured-capacity", 10, Duration::from_secs(60));
+    let shard = 17;
+    let first_subject = key_in_capacity_shard(&policy, shard, 1);
+    let second_subject = key_in_capacity_shard(&policy, shard, 2);
+    let denied_subject = key_in_capacity_shard(&policy, shard, 3);
+    let other_subject = key_in_capacity_shard(&policy, shard + 1, 4);
+    let config = test_config()
+        .with_maximum_rows_per_shard(2)
+        .expect("two rows per shard is valid");
+    let observer = Arc::new(RecordingObserver::default());
+    let limiter =
+        PostgresLimiter::with_config(pool.clone(), config).with_observer(observer.clone());
+
+    let first = limiter
+        .check(&Check::new(&policy, first_subject))
+        .await
+        .expect("first key is admitted");
+    let second = limiter
+        .check(&Check::new(&policy, second_subject))
+        .await
+        .expect("second key is admitted");
+    let denied = limiter
+        .check(&Check::new(&policy, denied_subject))
+        .await
+        .expect("capacity exhaustion is a decision");
+    let existing = limiter
+        .check(&Check::new(&policy, first_subject))
+        .await
+        .expect("an existing key remains usable");
+    let other = limiter
+        .check(&Check::new(&policy, other_subject))
+        .await
+        .expect("another shard retains capacity");
+
+    assert!(first.is_allowed());
+    assert!(second.is_allowed());
+    assert_eq!(
+        denied.denial(),
+        Some(&Denial::StorageCapacity { retry_after: None })
+    );
+    assert!(existing.is_allowed());
+    assert!(other.is_allowed());
+    assert_eq!(
+        observer.admissions.lock().unwrap().as_slice(),
+        [
+            (AdmissionOutcome::Allowed, ConsumptionStatus::Consumed),
+            (AdmissionOutcome::Allowed, ConsumptionStatus::Consumed),
+            (
+                AdmissionOutcome::CapacityDenied,
+                ConsumptionStatus::NotConsumed,
+            ),
+            (AdmissionOutcome::Allowed, ConsumptionStatus::Consumed),
+            (AdmissionOutcome::Allowed, ConsumptionStatus::Consumed),
+        ]
+    );
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 2);
+    assert_eq!(capacity_row_count(&pool, i16::from(shard + 1)).await, 1);
+
+    assert_eq!(delete_counter(&pool, &policy, first_subject).await, 1);
+    assert_eq!(delete_counter(&pool, &policy, second_subject).await, 1);
+    assert_eq!(delete_counter(&pool, &policy, denied_subject).await, 0);
+    assert_eq!(delete_counter(&pool, &policy, other_subject).await, 1);
+    drop(limiter);
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&setup_pool)
+        .await
+        .expect("drop configured-capacity schema");
+    setup_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn expired_rows_hold_capacity_until_cleanup_commits() {
+    let (setup_pool, pool, schema) = isolated_cleanup_test_pools(3).await;
+    let policy = unique_policy("expired-capacity", 10, Duration::from_secs(60));
+    let shard = 23;
+    let expired_subject = key_in_capacity_shard(&policy, shard, 1);
+    let replacement_subject = key_in_capacity_shard(&policy, shard, 2);
+    insert_counter_window(&pool, &policy, expired_subject, -120, -60).await;
+    let config = test_config()
+        .with_maximum_rows_per_shard(1)
+        .expect("one row per shard is valid");
+    let observer = Arc::new(RecordingObserver::default());
+    let limiter =
+        PostgresLimiter::with_config(pool.clone(), config).with_observer(observer.clone());
+
+    let full = limiter
+        .check(&Check::new(&policy, replacement_subject))
+        .await
+        .expect("an expired stored row still occupies capacity");
+    assert_eq!(
+        full.denial(),
+        Some(&Denial::StorageCapacity { retry_after: None })
+    );
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 1);
+
+    assert_eq!(
+        limiter.cleanup_expired(1).await.expect("cleanup succeeds"),
+        1
+    );
+    assert_eq!(
+        observer.cleanups.lock().unwrap().as_slice(),
+        [(1, Some(1), ConsumptionStatus::Consumed)]
+    );
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
+
+    let replacement = limiter
+        .check(&Check::new(&policy, replacement_subject))
+        .await
+        .expect("cleanup releases the shard slot");
+    assert!(replacement.is_allowed());
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 1);
+    assert_eq!(delete_counter(&pool, &policy, replacement_subject).await, 1);
+
+    drop(limiter);
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&setup_pool)
+        .await
+        .expect("drop expired-capacity schema");
+    setup_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn capacity_denied_batch_rolls_back_and_remains_enforced_in_shadow_mode() {
+    let (setup_pool, pool, schema) = isolated_cleanup_test_pools(3).await;
+    let policy = unique_policy("batch-capacity", 10, Duration::from_secs(60))
+        .with_quota_mode(QuotaMode::Shadow);
+    let shard = 29;
+    let first_subject = key_in_capacity_shard(&policy, shard, 1);
+    let second_subject = key_in_capacity_shard(&policy, shard, 2);
+    let config = test_config()
+        .with_maximum_rows_per_shard(1)
+        .expect("one row per shard is valid");
+    let limiter = PostgresLimiter::with_config(pool.clone(), config);
+
+    let result = limiter
+        .check_all(&[
+            Check::new(&policy, first_subject),
+            Check::new(&policy, second_subject),
+        ])
+        .await
+        .expect("capacity exhaustion is a batch decision");
+    assert_eq!(
+        result,
+        BatchDecision::Denied {
+            index: 1,
+            denial: Denial::StorageCapacity { retry_after: None },
+        }
+    );
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
+    assert!(!counter_exists(&pool, &policy, first_subject).await);
+    assert!(!counter_exists(&pool, &policy, second_subject).await);
+
+    let admitted = limiter
+        .check(&Check::new(&policy, first_subject))
+        .await
+        .expect("rolled-back capacity remains available");
+    assert!(admitted.is_allowed());
+    assert_eq!(delete_counter(&pool, &policy, first_subject).await, 1);
+
+    drop(limiter);
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&setup_pool)
+        .await
+        .expect("drop batch-capacity schema");
+    setup_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn shadow_quota_denial_is_reported_without_consuming_more_quota() {
+    let (setup_pool, pool, schema) = isolated_cleanup_test_pools(2).await;
+    let policy = unique_policy("shadow-quota", 1, Duration::from_secs(60))
+        .with_quota_mode(QuotaMode::Shadow);
+    let subject = key_in_capacity_shard(&policy, 30, 1);
+    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+
+    let allowed = limiter
+        .check(&Check::new(&policy, subject))
+        .await
+        .expect("first shadow-policy check is consumed");
+    let shadow_denial = limiter
+        .check(&Check::new(&policy, subject))
+        .await
+        .expect("shadow quota exhaustion is a decision");
+    assert!(allowed.is_allowed());
+    assert!(shadow_denial.is_shadow_denied());
+    assert!(shadow_denial.permits_request());
+    assert_eq!(stored_counter_usage(&pool, &policy, subject).await, 1);
+    assert_eq!(delete_counter(&pool, &policy, subject).await, 1);
+
+    drop(limiter);
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&setup_pool)
+        .await
+        .expect("drop shadow-quota schema");
+    setup_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn database_trigger_hard_cap_blocks_old_writer_insertions() {
+    let (setup_pool, pool, schema) = isolated_cleanup_test_pools(2).await;
+    let policy = unique_policy("trigger-hard-cap", 10, Duration::from_secs(60));
+    let shard = 31;
+    let subject = key_in_capacity_shard(&policy, shard, 1);
+    let mut transaction = pool.begin().await.expect("begin old-writer transaction");
+    sqlx::query(
+        r"
+UPDATE runlimit_capacity_shards
+SET row_count = $2
+WHERE capacity_shard = $1
+",
+    )
+    .bind(i16::from(shard))
+    .bind(i64::from(HARD_MAX_ROWS_PER_SHARD))
+    .execute(&mut *transaction)
+    .await
+    .expect("simulate a shard at the database hard maximum");
+
+    let error = sqlx::query(
+        r"
+INSERT INTO runlimit_fixed_windows (
+    policy_id,
+    scope_id,
+    config_fingerprint,
+    subject_key,
+    window_started_at,
+    window_expires_at,
+    used
+)
+VALUES ($1, $2, $3, $4, pg_catalog.clock_timestamp(),
+        pg_catalog.clock_timestamp() + INTERVAL '1 minute', 1)
+",
+    )
+    .bind(policy.id().as_str())
+    .bind(policy.scope().as_str())
+    .bind(policy.fingerprint().as_bytes().as_slice())
+    .bind(subject.as_bytes().as_slice())
+    .execute(&mut *transaction)
+    .await
+    .expect_err("the migration trigger rejects an old writer above the hard cap");
+    let sqlx::Error::Database(database_error) = error else {
+        panic!("hard-cap violation returned a non-database error");
+    };
+    assert_eq!(database_error.code().as_deref(), Some("23514"));
+    assert_eq!(
+        database_error.constraint(),
+        Some("runlimit_capacity_shards_hard_max")
+    );
+    transaction
+        .rollback()
+        .await
+        .expect("roll back simulated ledger state");
+
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
+    assert!(!counter_exists(&pool, &policy, subject).await);
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&setup_pool)
+        .await
+        .expect("drop trigger-hard-cap schema");
+    setup_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn database_trigger_rejects_storage_key_updates_without_ledger_drift() {
+    let (setup_pool, pool, schema) = isolated_cleanup_test_pools(2).await;
+    let policy = unique_policy("immutable-storage-key", 10, Duration::from_secs(60));
+    let original_shard = 33;
+    let replacement_shard = 34;
+    let original_subject = key_in_capacity_shard(&policy, original_shard, 1);
+    let replacement_subject = key_in_capacity_shard(&policy, replacement_shard, 2);
+    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+
+    let admitted = limiter
+        .check(&Check::new(&policy, original_subject))
+        .await
+        .expect("create the original counter");
+    assert!(admitted.is_allowed());
+    assert_eq!(
+        capacity_row_count(&pool, i16::from(original_shard)).await,
+        1
+    );
+    assert_eq!(
+        capacity_row_count(&pool, i16::from(replacement_shard)).await,
+        0
+    );
+
+    let error = sqlx::query(
+        r"
+UPDATE runlimit_fixed_windows
+SET subject_key = $3
+WHERE config_fingerprint = $1 AND subject_key = $2
+",
+    )
+    .bind(policy.fingerprint().as_bytes().as_slice())
+    .bind(original_subject.as_bytes().as_slice())
+    .bind(replacement_subject.as_bytes().as_slice())
+    .execute(&pool)
+    .await
+    .expect_err("raw storage-key mutation must be rejected");
+    let sqlx::Error::Database(database_error) = error else {
+        panic!("storage-key mutation returned a non-database error");
+    };
+    assert_eq!(database_error.code().as_deref(), Some("23514"));
+    assert_eq!(
+        database_error.constraint(),
+        Some("runlimit_fixed_windows_immutable_storage_key")
+    );
+
+    assert!(counter_exists(&pool, &policy, original_subject).await);
+    assert!(!counter_exists(&pool, &policy, replacement_subject).await);
+    assert_eq!(
+        capacity_row_count(&pool, i16::from(original_shard)).await,
+        1
+    );
+    assert_eq!(
+        capacity_row_count(&pool, i16::from(replacement_shard)).await,
+        0
+    );
+    assert_eq!(delete_counter(&pool, &policy, original_subject).await, 1);
+    assert_eq!(
+        capacity_row_count(&pool, i16::from(original_shard)).await,
+        0
+    );
+
+    drop(limiter);
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&setup_pool)
+        .await
+        .expect("drop immutable-storage-key schema");
+    setup_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn failed_insert_rolls_back_capacity_trigger_accounting() {
+    let (setup_pool, pool, schema) = isolated_cleanup_test_pools(2).await;
+    let policy = unique_policy("capacity-rollback", 10, Duration::from_secs(60));
+    let shard = 37;
+    let subject = key_in_capacity_shard(&policy, shard, 1);
+    let failure_sql = format!(
+        r"
+CREATE FUNCTION {schema}.fail_after_capacity_accounting()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    RAISE EXCEPTION 'injected failure after capacity accounting';
+END
+$function$;
+
+CREATE TRIGGER zz_fail_after_capacity_accounting
+AFTER INSERT ON {schema}.runlimit_fixed_windows
+FOR EACH STATEMENT
+EXECUTE FUNCTION {schema}.fail_after_capacity_accounting();
+"
+    );
+    sqlx::raw_sql(&failure_sql)
+        .execute(&setup_pool)
+        .await
+        .expect("install post-accounting failure trigger");
+    let config = test_config()
+        .with_maximum_rows_per_shard(1)
+        .expect("one row per shard is valid");
+    let limiter = PostgresLimiter::with_config(pool.clone(), config);
+
+    let failed = limiter.check(&Check::new(&policy, subject)).await;
+    assert!(matches!(failed, Err(CheckError::DefinitelyNotConsumed(_))));
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
+    assert!(!counter_exists(&pool, &policy, subject).await);
+
+    sqlx::query(&format!(
+        "DROP TRIGGER zz_fail_after_capacity_accounting ON {schema}.runlimit_fixed_windows"
+    ))
+    .execute(&setup_pool)
+    .await
+    .expect("drop post-accounting failure trigger");
+    sqlx::query(&format!(
+        "DROP FUNCTION {schema}.fail_after_capacity_accounting()"
+    ))
+    .execute(&setup_pool)
+    .await
+    .expect("drop post-accounting failure function");
+
+    let admitted = limiter
+        .check(&Check::new(&policy, subject))
+        .await
+        .expect("rolled-back trigger accounting releases the slot");
+    assert!(admitted.is_allowed());
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 1);
+    assert_eq!(delete_counter(&pool, &policy, subject).await, 1);
+
+    drop(limiter);
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&setup_pool)
+        .await
+        .expect("drop capacity-rollback schema");
+    setup_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn concurrent_replicas_never_exceed_configured_shard_capacity() {
+    const CAPACITY: u32 = 4;
+    const ATTEMPTS: u8 = 24;
+
+    let (setup_pool, first_pool, schema) = isolated_cleanup_test_pools(12).await;
+    let second_pool = pool_for_schema(&schema, 12).await;
+    let policy = Arc::new(unique_policy(
+        "concurrent-capacity",
+        10,
+        Duration::from_secs(60),
+    ));
+    let shard = 41;
+    let config = test_config()
+        .with_maximum_rows_per_shard(CAPACITY)
+        .expect("test shard capacity is valid");
+    let first = PostgresLimiter::with_config(first_pool.clone(), config);
+    let second = PostgresLimiter::with_config(second_pool.clone(), config);
+    let barrier = Arc::new(Barrier::new(usize::from(ATTEMPTS) + 1));
+    let mut tasks = Vec::with_capacity(usize::from(ATTEMPTS));
+
+    for discriminator in 1..=ATTEMPTS {
+        let limiter = if discriminator.is_multiple_of(2) {
+            first.clone()
+        } else {
+            second.clone()
+        };
+        let policy = Arc::clone(&policy);
+        let barrier = Arc::clone(&barrier);
+        let subject = key_in_capacity_shard(&policy, shard, discriminator);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            (
+                subject,
+                limiter.check(&Check::new(policy.as_ref(), subject)).await,
+            )
+        }));
+    }
+    barrier.wait().await;
+
+    let mut allowed = 0_u32;
+    let mut capacity_denied = 0_u32;
+    for task in tasks {
+        let (_subject, result) = task.await.expect("capacity task does not panic");
+        let decision = result.expect("capacity contention returns a decision");
+        if decision.is_allowed() {
+            allowed += 1;
+        } else {
+            assert_eq!(
+                decision.denial(),
+                Some(&Denial::StorageCapacity { retry_after: None })
+            );
+            capacity_denied += 1;
+        }
+    }
+
+    let stored_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM runlimit_fixed_windows")
+        .fetch_one(&first_pool)
+        .await
+        .expect("count concurrent capacity rows");
+    assert_eq!(allowed, CAPACITY);
+    assert_eq!(capacity_denied, u32::from(ATTEMPTS) - CAPACITY);
+    assert_eq!(stored_rows, i64::from(CAPACITY));
+    assert_eq!(
+        capacity_row_count(&first_pool, i16::from(shard)).await,
+        i64::from(CAPACITY)
+    );
+
+    assert_eq!(
+        sqlx::query("DELETE FROM runlimit_fixed_windows")
+            .execute(&first_pool)
+            .await
+            .expect("delete concurrent capacity rows")
+            .rows_affected(),
+        u64::from(CAPACITY)
+    );
+    assert_eq!(capacity_row_count(&first_pool, i16::from(shard)).await, 0);
+
+    drop(first);
+    drop(second);
+    second_pool.close().await;
+    first_pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&setup_pool)
+        .await
+        .expect("drop concurrent-capacity schema");
+    setup_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn single_quota_denial_and_anchored_reset() {
     let pool = test_pool(4).await;
     let limiter = PostgresLimiter::with_config(pool, test_config());
@@ -1048,12 +1663,16 @@ async fn single_quota_denial_and_anchored_reset() {
 
     let first = limiter.check(&check).await.expect("first check succeeds");
     assert!(first.is_allowed());
-    assert_eq!(first.remaining(), Some(1));
-    assert!(first.reset_after().is_some_and(|reset| !reset.is_zero()));
+    assert_eq!(first.available(), Some(1));
+    assert!(
+        first
+            .replenishes_after()
+            .is_some_and(|reset| !reset.is_zero())
+    );
 
     let second = limiter.check(&check).await.expect("second check succeeds");
     assert!(second.is_allowed());
-    assert_eq!(second.remaining(), Some(0));
+    assert_eq!(second.available(), Some(0));
 
     let denied = limiter.check(&check).await.expect("denial is a decision");
     assert!(denied.is_denied());
@@ -1071,7 +1690,7 @@ async fn single_quota_denial_and_anchored_reset() {
         .await
         .expect("check after expiry succeeds");
     assert!(reset.is_allowed());
-    assert_eq!(reset.remaining(), Some(1));
+    assert_eq!(reset.available(), Some(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1112,15 +1731,15 @@ WHERE
     pool.close().await;
 
     assert!(allowed.is_allowed());
-    assert_eq!(allowed.limit(), Some(MAX_LIMIT));
-    assert_eq!(allowed.remaining(), Some(0));
+    assert_eq!(allowed.capacity(), Some(MAX_LIMIT));
+    assert_eq!(allowed.available(), Some(0));
     assert_eq!(stored_used, i64::MAX);
     assert_eq!(
         u64::try_from(stored_window_millis).unwrap(),
         MAX_WINDOW_MILLIS
     );
     assert!(denied.is_denied());
-    assert_eq!(denied.limit(), Some(MAX_LIMIT));
+    assert_eq!(denied.capacity(), Some(MAX_LIMIT));
     assert_eq!(deleted_rows, 1);
 }
 
@@ -1158,7 +1777,7 @@ async fn denied_batch_rolls_back_every_counter() {
         .check(&first_check)
         .await
         .expect("counter remains usable");
-    assert_eq!(after_rollback.remaining(), Some(1));
+    assert_eq!(after_rollback.available(), Some(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1384,14 +2003,14 @@ WHERE
             step.name
         );
         assert_eq!(
-            memory_decision.limit(),
-            postgres_decision.limit(),
+            memory_decision.capacity(),
+            postgres_decision.capacity(),
             "backends disagreed on the limit at the '{}' transition",
             step.name
         );
         assert_eq!(
-            memory_decision.remaining(),
-            postgres_decision.remaining(),
+            memory_decision.available(),
+            postgres_decision.available(),
             "backends disagreed on remaining quota at the '{}' transition",
             step.name
         );
@@ -1401,7 +2020,7 @@ WHERE
             step.name
         );
         let postgres_duration = postgres_decision
-            .reset_after()
+            .replenishes_after()
             .or_else(|| postgres_decision.retry_after())
             .expect("fixed-window decision contains a duration");
         assert!(
@@ -1488,9 +2107,9 @@ ORDER BY input.input_position
     assert_eq!(decisions.len(), checks.len());
     for (decision, check) in decisions.iter().zip(&checks) {
         assert!(decision.is_allowed());
-        assert_eq!(decision.limit(), Some(check.policy().limit()));
+        assert_eq!(decision.capacity(), Some(check.policy().limit()));
         assert_eq!(
-            decision.remaining(),
+            decision.available(),
             Some(check.policy().limit() - check.cost())
         );
     }
@@ -1547,8 +2166,8 @@ async fn opposite_order_batches_across_pools_do_not_deadlock_or_over_admit() {
         let first_task_b = Arc::clone(&policy_b);
         let first_task = tokio::spawn(async move {
             let checks = [
-                Check::new(&first_task_a, subject_a),
-                Check::new(&first_task_b, subject_b),
+                Check::new(first_task_a.as_ref(), subject_a),
+                Check::new(first_task_b.as_ref(), subject_b),
             ];
             first_task_barrier.wait().await;
             first_task_limiter.check_all(&checks).await
@@ -1560,8 +2179,8 @@ async fn opposite_order_batches_across_pools_do_not_deadlock_or_over_admit() {
         let second_task_b = Arc::clone(&policy_b);
         let second_task = tokio::spawn(async move {
             let checks = [
-                Check::new(&second_task_b, subject_b),
-                Check::new(&second_task_a, subject_a),
+                Check::new(second_task_b.as_ref(), subject_b),
+                Check::new(second_task_a.as_ref(), subject_a),
             ];
             second_task_barrier.wait().await;
             second_task_limiter.check_all(&checks).await
@@ -1663,7 +2282,7 @@ async fn concurrent_fresh_single_checks_advance_the_waiters_snapshot() {
         Duration::from_secs(10),
     ));
     let subject = key(156);
-    let check = Check::new(&policy, subject);
+    let check = Check::new(policy.as_ref(), subject);
     let logical_lock_id = advisory_lock_id(&check);
 
     let mut blocker = pool.begin().await.expect("begin logical-lock blocker");
@@ -1681,12 +2300,14 @@ async fn concurrent_fresh_single_checks_advance_the_waiters_snapshot() {
         let task_barrier = Arc::clone(&barrier);
         tasks.push(tokio::spawn(async move {
             task_barrier.wait().await;
-            task_limiter.check(&Check::new(&task_policy, subject)).await
+            task_limiter
+                .check(&Check::new(task_policy.as_ref(), subject))
+                .await
         }));
     }
     barrier.wait().await;
 
-    wait_for_advisory_waiters(&pool, "WITH advisory_lock AS MATERIALIZED", 2).await;
+    wait_for_advisory_waiters(&pool, "WITH RECURSIVE acquired(position, locked)", 2).await;
 
     blocker.commit().await.expect("release fresh-key lock");
 
@@ -1726,7 +2347,7 @@ async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
     ));
     let target_subject = key(157);
     let companion_subject = key(158);
-    let target_check = Check::new(&target_policy, target_subject);
+    let target_check = Check::new(target_policy.as_ref(), target_subject);
     let logical_lock_id = advisory_lock_id(&target_check);
 
     let mut blocker = pool.begin().await.expect("begin mixed-path lock blocker");
@@ -1742,8 +2363,8 @@ async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
     let batch = tokio::spawn(async move {
         batch_limiter
             .check_all(&[
-                Check::new(&batch_target_policy, target_subject),
-                Check::new(&batch_companion_policy, companion_subject),
+                Check::new(batch_target_policy.as_ref(), target_subject),
+                Check::new(batch_companion_policy.as_ref(), companion_subject),
             ])
             .await
     });
@@ -1753,10 +2374,10 @@ async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
     let single_policy = Arc::clone(&target_policy);
     let single = tokio::spawn(async move {
         single_limiter
-            .check(&Check::new(&single_policy, target_subject))
+            .check(&Check::new(single_policy.as_ref(), target_subject))
             .await
     });
-    wait_for_advisory_waiters(&pool, "WITH advisory_lock AS MATERIALIZED", 1).await;
+    wait_for_advisory_waiters(&pool, "WITH RECURSIVE acquired(position, locked)", 2).await;
 
     blocker.commit().await.expect("release mixed-path lock");
 
@@ -1821,7 +2442,7 @@ FOR UPDATE
     let waiting_policy = Arc::clone(&policy);
     let waiting = tokio::spawn(async move {
         waiting_limiter
-            .check(&Check::new(&waiting_policy, subject))
+            .check(&Check::new(waiting_policy.as_ref(), subject))
             .await
     });
 
@@ -1838,7 +2459,7 @@ FOR UPDATE
         decision.is_allowed(),
         "a clock sampled before the row-lock wait would deny against the expired window"
     );
-    assert_eq!(decision.remaining(), Some(0));
+    assert_eq!(decision.available(), Some(0));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1855,7 +2476,7 @@ async fn row_lock_timeout_releases_single_connection_pool_slot_without_consuming
         .check(&check)
         .await
         .expect("first check succeeds");
-    assert_eq!(first.remaining(), Some(1));
+    assert_eq!(first.available(), Some(1));
 
     let mut blocker = blocker_pool
         .begin()
@@ -1920,7 +2541,7 @@ FOR UPDATE
         .await
         .expect("counter remains usable");
     assert!(after_timeout.is_allowed());
-    assert_eq!(after_timeout.remaining(), Some(0));
+    assert_eq!(after_timeout.available(), Some(0));
 
     let deleted_rows = delete_counter(&blocker_pool, &policy, subject).await;
     drop(short_limiter);

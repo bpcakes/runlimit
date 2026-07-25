@@ -9,11 +9,15 @@ CRATES=(
   "runlimit-core"
   "runlimit-memory"
   "runlimit-postgres"
+  "runlimit-http"
+  "runlimit-axum"
 )
 PACKAGE_PATCH_ARGS=(
   --config "patch.crates-io.runlimit-core.path=\"$ROOT_DIR/crates/runlimit-core\""
   --config "patch.crates-io.runlimit-memory.path=\"$ROOT_DIR/crates/runlimit-memory\""
   --config "patch.crates-io.runlimit-postgres.path=\"$ROOT_DIR/crates/runlimit-postgres\""
+  --config "patch.crates-io.runlimit-http.path=\"$ROOT_DIR/crates/runlimit-http\""
+  --config "patch.crates-io.runlimit-axum.path=\"$ROOT_DIR/crates/runlimit-axum\""
 )
 
 die() {
@@ -62,6 +66,8 @@ cp -R "$SMOKE_SOURCE_DIR" "$CONSUMER_DIR"
 CORE_VERSION="$(crate_version runlimit-core)"
 MEMORY_VERSION="$(crate_version runlimit-memory)"
 POSTGRES_VERSION="$(crate_version runlimit-postgres)"
+HTTP_VERSION="$(crate_version runlimit-http)"
+AXUM_VERSION="$(crate_version runlimit-axum)"
 
 for crate in "${CRATES[@]}"; do
   CARGO_TARGET_DIR="$PACKAGE_TARGET_DIR" \
@@ -77,6 +83,8 @@ for crate in "${CRATES[@]}"; do
     runlimit-core) version="$CORE_VERSION" ;;
     runlimit-memory) version="$MEMORY_VERSION" ;;
     runlimit-postgres) version="$POSTGRES_VERSION" ;;
+    runlimit-http) version="$HTTP_VERSION" ;;
+    runlimit-axum) version="$AXUM_VERSION" ;;
     *) die "unsupported crate $crate" ;;
   esac
 
@@ -88,6 +96,8 @@ done
 RELEASE_CORE_VERSION="$CORE_VERSION" \
 RELEASE_MEMORY_VERSION="$MEMORY_VERSION" \
 RELEASE_POSTGRES_VERSION="$POSTGRES_VERSION" \
+RELEASE_HTTP_VERSION="$HTTP_VERSION" \
+RELEASE_AXUM_VERSION="$AXUM_VERSION" \
 perl -0pi -e '
   s/^runlimit-core\s*=.*$/runlimit-core = { version = "=$ENV{RELEASE_CORE_VERSION}" }/m
     or die "failed to pin runlimit-core in $ARGV\n";
@@ -100,9 +110,23 @@ perl -0pi -e '
     s/^(runlimit-memory\s*=.*\n)/$1runlimit-postgres = { version = "=$ENV{RELEASE_POSTGRES_VERSION}" }\n/m
       or die "failed to add runlimit-postgres to $ARGV\n";
   }
+  if (/^runlimit-http\s*=/m) {
+    s/^runlimit-http\s*=.*$/runlimit-http = { version = "=$ENV{RELEASE_HTTP_VERSION}" }/m
+      or die "failed to pin runlimit-http in $ARGV\n";
+  } else {
+    s/^(runlimit-postgres\s*=.*\n)/$1runlimit-http = { version = "=$ENV{RELEASE_HTTP_VERSION}" }\n/m
+      or die "failed to add runlimit-http to $ARGV\n";
+  }
+  if (/^runlimit-axum\s*=/m) {
+    s/^runlimit-axum\s*=.*$/runlimit-axum = { version = "=$ENV{RELEASE_AXUM_VERSION}" }/m
+      or die "failed to pin runlimit-axum in $ARGV\n";
+  } else {
+    s/^(runlimit-http\s*=.*\n)/$1runlimit-axum = { version = "=$ENV{RELEASE_AXUM_VERSION}" }\n/m
+      or die "failed to add runlimit-axum to $ARGV\n";
+  }
 ' "$CONSUMER_DIR/Cargo.toml"
 
-if grep -Eq '^runlimit-(core|memory|postgres)[[:space:]]*=.*path[[:space:]]*=' \
+if grep -Eq '^runlimit-(core|memory|postgres|http|axum)[[:space:]]*=.*path[[:space:]]*=' \
   "$CONSUMER_DIR/Cargo.toml"; then
   die "copied consumer manifest still contains a Runlimit path dependency"
 fi
@@ -115,6 +139,12 @@ grep -Eq "^runlimit-memory[[:space:]]*=.*version[[:space:]]*=[[:space:]]*\"=${ME
 grep -Eq "^runlimit-postgres[[:space:]]*=.*version[[:space:]]*=[[:space:]]*\"=${POSTGRES_VERSION}\"" \
   "$CONSUMER_DIR/Cargo.toml" \
   || die "copied consumer does not require exactly runlimit-postgres ${POSTGRES_VERSION}"
+grep -Eq "^runlimit-http[[:space:]]*=.*version[[:space:]]*=[[:space:]]*\"=${HTTP_VERSION}\"" \
+  "$CONSUMER_DIR/Cargo.toml" \
+  || die "copied consumer does not require exactly runlimit-http ${HTTP_VERSION}"
+grep -Eq "^runlimit-axum[[:space:]]*=.*version[[:space:]]*=[[:space:]]*\"=${AXUM_VERSION}\"" \
+  "$CONSUMER_DIR/Cargo.toml" \
+  || die "copied consumer does not require exactly runlimit-axum ${AXUM_VERSION}"
 
 {
   printf '[patch.crates-io]\n'
@@ -124,6 +154,10 @@ grep -Eq "^runlimit-postgres[[:space:]]*=.*version[[:space:]]*=[[:space:]]*\"=${
     "$VENDOR_DIR" "$MEMORY_VERSION"
   printf 'runlimit-postgres = { path = "%s/runlimit-postgres-%s" }\n' \
     "$VENDOR_DIR" "$POSTGRES_VERSION"
+  printf 'runlimit-http = { path = "%s/runlimit-http-%s" }\n' \
+    "$VENDOR_DIR" "$HTTP_VERSION"
+  printf 'runlimit-axum = { path = "%s/runlimit-axum-%s" }\n' \
+    "$VENDOR_DIR" "$AXUM_VERSION"
 } >"$PATCH_CONFIG"
 
 sql_file_count=0
@@ -140,6 +174,8 @@ for crate in "${CRATES[@]}"; do
     runlimit-core) version="$CORE_VERSION" ;;
     runlimit-memory) version="$MEMORY_VERSION" ;;
     runlimit-postgres) version="$POSTGRES_VERSION" ;;
+    runlimit-http) version="$HTTP_VERSION" ;;
+    runlimit-axum) version="$AXUM_VERSION" ;;
     *) die "unsupported crate $crate" ;;
   esac
 

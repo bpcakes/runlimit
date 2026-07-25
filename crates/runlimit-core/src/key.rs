@@ -4,7 +4,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use thiserror::Error;
 
-use crate::{FixedWindowPolicy, PolicyId, ScopeId};
+use crate::{PolicyId, RateLimitPolicy, ScopeId};
 
 const KEY_DOMAIN: &[u8] = b"runlimit/subject-key/v1\0";
 
@@ -121,8 +121,12 @@ impl KeyHasher {
         SubjectKey::from_digest(mac.finalize().into_bytes().into())
     }
 
-    /// Hashes a normalized subject in a fixed-window policy's namespace.
-    pub fn hash_for(&self, policy: &FixedWindowPolicy, subject: impl AsRef<[u8]>) -> SubjectKey {
+    /// Hashes a normalized subject in a rate-limit policy's namespace.
+    pub fn hash_for<P: RateLimitPolicy + ?Sized>(
+        &self,
+        policy: &P,
+        subject: impl AsRef<[u8]>,
+    ) -> SubjectKey {
         self.hash(policy.id(), policy.scope(), subject)
     }
 }
