@@ -7,6 +7,24 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-08
+
+### Added
+
+- Add `AdmissionObservation::from_check` and
+  `AdmissionObservation::from_batch` constructors for consistently deriving
+  backend-neutral outcome, consumption, and relevant-policy metadata from
+  completed admission decisions.
+
+### Changed
+
+- Share the bounded shard, expiration, capacity, locking, and recovery
+  machinery used by the in-memory fixed-window and GCRA stores while retaining
+  their separate policy algorithms and existing behavior.
+- Reorganize the PostgreSQL backend into focused configuration, error,
+  protocol, admission, and maintenance modules without changing its public
+  paths, SQL protocol, or published migrations.
+
 ## [0.2.0] - 2026-07-25
 
 ### Added
@@ -83,6 +101,7 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/bpcakes/runlimit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bpcakes/runlimit/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/bpcakes/runlimit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bpcakes/runlimit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bpcakes/runlimit/releases/tag/v0.1.0

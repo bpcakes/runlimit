@@ -22,14 +22,14 @@ Choose the backend needed by the application:
 
 ```toml
 [dependencies]
-runlimit-core = "0.2.0"
-runlimit-memory = "0.2.0"
+runlimit-core = "0.2.1"
+runlimit-memory = "0.2.1"
 # Optional Axum/Tower admission middleware:
-# runlimit-axum = "0.2.0"
+# runlimit-axum = "0.2.1"
 # Optional typed HTTP response metadata:
-# runlimit-http = "0.2.0"
+# runlimit-http = "0.2.1"
 # Or, for a shared cross-replica quota:
-# runlimit-postgres = "0.2.0"
+# runlimit-postgres = "0.2.1"
 ```
 
 During development from a source checkout, a sibling project can use path
@@ -173,7 +173,7 @@ on a backend also enables it for `runlimit-core`:
 
 ```toml
 [dependencies]
-runlimit-memory = { version = "0.2.0", features = ["serde"] }
+runlimit-memory = { version = "0.2.1", features = ["serde"] }
 ```
 
 The feature serializes validated policy and scope identifiers as strings;

@@ -21,7 +21,7 @@ RESUME_RELEASE="${RESUME_RELEASE:-0}"
 
 usage() {
   echo "usage: $0 <version>" >&2
-  echo "example: $0 0.2.0" >&2
+  echo "example: $0 0.2.1" >&2
   echo "set RESUME_RELEASE=1 only to resume a partially published release" >&2
 }
 
