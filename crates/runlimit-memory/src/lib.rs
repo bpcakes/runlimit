@@ -17,6 +17,7 @@
 mod clock;
 mod config;
 mod gcra;
+mod shards;
 mod store;
 
 pub use clock::{Clock, SystemClock};

@@ -1,0 +1,382 @@
+use std::{
+    collections::{BTreeSet, HashMap},
+    hash::{BuildHasherDefault, Hash, Hasher},
+    sync::{Mutex, MutexGuard},
+    time::Duration,
+};
+
+use runlimit_core::CounterKey;
+
+use crate::{
+    MemoryStoreConfig,
+    store::{MemoryStoreError, MemoryStoreStats},
+};
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct Expiration {
+    pub(crate) expires_at_millis: u128,
+    pub(crate) key: CounterKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PrehashedCounterKey(pub(crate) CounterKey);
+
+impl Hash for PrehashedCounterKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(counter_key_hash(self.0));
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PassThroughHasher(u64);
+
+impl Hasher for PassThroughHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // `PrehashedCounterKey` always uses `write_u64`. Keep the required
+        // byte-oriented fallback well-defined in case that implementation is
+        // changed later.
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+pub(crate) type EntryMap<E> =
+    HashMap<PrehashedCounterKey, E, BuildHasherDefault<PassThroughHasher>>;
+
+pub(crate) trait ExpiringEntry {
+    fn expires_at_millis(&self) -> u128;
+}
+
+#[derive(Debug)]
+pub(crate) struct Shard<E> {
+    pub(crate) capacity: usize,
+    pub(crate) latest_observed_millis: u128,
+    pub(crate) entries: EntryMap<E>,
+    pub(crate) expirations: BTreeSet<Expiration>,
+}
+
+impl<E> Shard<E> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            latest_observed_millis: 0,
+            entries: HashMap::with_hasher(BuildHasherDefault::default()),
+            expirations: BTreeSet::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.expirations.clear();
+    }
+}
+
+impl<E: ExpiringEntry> Shard<E> {
+    pub(crate) fn prune_expired(&mut self, now_millis: u128, maximum: usize) -> usize {
+        let mut removed_count = 0;
+        for _ in 0..maximum {
+            let Some(expiration) = self.expirations.first() else {
+                break;
+            };
+            if expiration.expires_at_millis > now_millis {
+                break;
+            }
+
+            let expiration = self
+                .expirations
+                .pop_first()
+                .expect("the first expiration was present");
+            let removed = self.entries.remove(&PrehashedCounterKey(expiration.key));
+            debug_assert_eq!(
+                removed.as_ref().map(ExpiringEntry::expires_at_millis),
+                Some(expiration.expires_at_millis),
+                "the entry and expiration indexes diverged"
+            );
+            removed_count += usize::from(removed.is_some());
+        }
+        removed_count
+    }
+
+    pub(crate) fn capacity_retry_after_millis(&self, now_millis: u128) -> Option<u128> {
+        self.expirations.first().map(|expiration| {
+            expiration
+                .expires_at_millis
+                .saturating_sub(now_millis)
+                .max(1)
+        })
+    }
+}
+
+pub(crate) struct BoundedShards<E> {
+    shards: Box<[Mutex<Shard<E>>]>,
+}
+
+pub(crate) type LockedShards<'a, E> = Vec<(usize, MutexGuard<'a, Shard<E>>)>;
+
+impl<E> BoundedShards<E> {
+    pub(crate) fn new(config: &MemoryStoreConfig) -> Self {
+        let shards = (0..config.shard_count())
+            .map(|index| Mutex::new(Shard::new(config.shard_capacity(index))))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { shards }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.shards.len()
+    }
+
+    pub(crate) fn poisoned_count(&self) -> usize {
+        self.shards
+            .iter()
+            .filter(|shard| shard.is_poisoned())
+            .count()
+    }
+
+    pub(crate) fn shard_index(&self, key: &CounterKey) -> usize {
+        #[allow(clippy::cast_possible_truncation)]
+        let hash = counter_key_hash(*key) as usize;
+        hash % self.shards.len()
+    }
+
+    pub(crate) fn lock_shard(
+        &self,
+        index: usize,
+    ) -> Result<MutexGuard<'_, Shard<E>>, MemoryStoreError> {
+        self.shards[index]
+            .lock()
+            .map_err(|_| MemoryStoreError::PoisonedShard { shard_index: index })
+    }
+
+    pub(crate) fn lock_shards<'a>(
+        &'a self,
+        indexes: &[usize],
+    ) -> Result<LockedShards<'a, E>, MemoryStoreError> {
+        let mut locked = Vec::with_capacity(indexes.len());
+        for &index in indexes {
+            locked.push((index, self.lock_shard(index)?));
+        }
+        Ok(locked)
+    }
+
+    pub(crate) fn stats(
+        &self,
+        config: &MemoryStoreConfig,
+    ) -> Result<MemoryStoreStats, MemoryStoreError> {
+        let indexes = (0..self.shards.len()).collect::<Vec<_>>();
+        let locked = self.lock_shards(&indexes)?;
+        Ok(MemoryStoreStats::from_parts(
+            locked.iter().map(|(_, shard)| shard.entries.len()).sum(),
+            config.max_keys(),
+            config.shard_count(),
+        ))
+    }
+
+    pub(crate) fn clear(&self) -> Result<(), MemoryStoreError> {
+        let indexes = (0..self.shards.len()).collect::<Vec<_>>();
+        let mut locked = self.lock_shards(&indexes)?;
+        for (_, shard) in &mut locked {
+            shard.clear();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recover_poisoned(&self, config: &MemoryStoreConfig) -> usize {
+        let mut locked_shards = Vec::with_capacity(self.shards.len());
+
+        for (shard_index, shard_mutex) in self.shards.iter().enumerate() {
+            match shard_mutex.lock() {
+                Ok(shard) => locked_shards.push((shard_index, shard_mutex, shard, false)),
+                Err(poisoned) => {
+                    locked_shards.push((shard_index, shard_mutex, poisoned.into_inner(), true));
+                }
+            }
+        }
+
+        let mut recovered = 0;
+        for (shard_index, shard_mutex, shard, was_poisoned) in &mut locked_shards {
+            if !*was_poisoned {
+                continue;
+            }
+
+            **shard = Shard::new(config.shard_capacity(*shard_index));
+            shard_mutex.clear_poison();
+            recovered += 1;
+        }
+
+        recovered
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shard(&self, index: usize) -> &Mutex<Shard<E>> {
+        &self.shards[index]
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CleanupEffect {
+    pub(crate) requested: usize,
+    pub(crate) removed: usize,
+    pub(crate) elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShardEffect {
+    pub(crate) shard_index: usize,
+    pub(crate) cleanup: CleanupEffect,
+    pub(crate) used: usize,
+    pub(crate) capacity: usize,
+}
+
+pub(crate) fn collect_shard_effects<E>(
+    locked_shards: &LockedShards<'_, E>,
+    cleanup_effects: &[CleanupEffect],
+) -> Vec<ShardEffect> {
+    debug_assert_eq!(locked_shards.len(), cleanup_effects.len());
+    locked_shards
+        .iter()
+        .zip(cleanup_effects)
+        .map(|((shard_index, shard), cleanup)| ShardEffect {
+            shard_index: *shard_index,
+            cleanup: *cleanup,
+            used: shard.entries.len(),
+            capacity: shard.capacity,
+        })
+        .collect()
+}
+
+pub(crate) fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Hashes a logical counter key for a local shard and map bucket.
+///
+/// Subject keys are opaque HMAC-SHA-256 output (or caller-supplied
+/// cryptographically opaque digests), so their bits are already uniform and
+/// attacker-resistant. Mix in the policy fingerprint so successive
+/// configurations of one subject do not all collide, without paying for a
+/// second keyed hash.
+pub(crate) fn counter_key_hash(key: CounterKey) -> u64 {
+    leading_u64(key.subject().as_bytes())
+        ^ leading_u64(key.fingerprint().as_bytes()).rotate_left(32)
+}
+
+const fn leading_u64(bytes: &[u8; 32]) -> u64 {
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        time::Duration,
+    };
+
+    use runlimit_core::{Check, CounterKey, FixedWindowPolicy, PolicyId, ScopeId, SubjectKey};
+
+    use super::{BoundedShards, Expiration, ExpiringEntry, PrehashedCounterKey};
+    use crate::{MemoryStoreConfig, MemoryStoreError};
+
+    #[derive(Clone, Copy)]
+    struct TestEntry {
+        expires_at_millis: u128,
+    }
+
+    impl ExpiringEntry for TestEntry {
+        fn expires_at_millis(&self) -> u128 {
+            self.expires_at_millis
+        }
+    }
+
+    fn counter_key(subject_byte: u8) -> CounterKey {
+        let policy = FixedWindowPolicy::new(
+            PolicyId::new("memory.kernel").unwrap(),
+            ScopeId::new("test").unwrap(),
+            1,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        Check::new(&policy, SubjectKey::from_digest([subject_byte; 32])).counter_key()
+    }
+
+    fn insert(shard: &mut super::Shard<TestEntry>, key: CounterKey, expires_at_millis: u128) {
+        assert!(
+            shard
+                .entries
+                .insert(PrehashedCounterKey(key), TestEntry { expires_at_millis },)
+                .is_none()
+        );
+        assert!(shard.expirations.insert(Expiration {
+            expires_at_millis,
+            key,
+        }));
+    }
+
+    #[test]
+    fn expiry_cleanup_stays_bounded_and_reports_the_next_capacity_retry() {
+        let config = MemoryStoreConfig::new(2).unwrap();
+        let shards = BoundedShards::<TestEntry>::new(&config);
+        let first = counter_key(1);
+        let second = counter_key(2);
+        let mut shard = shards.shard(0).lock().unwrap();
+
+        insert(&mut shard, first, 10);
+        insert(&mut shard, second, 20);
+
+        assert_eq!(shard.prune_expired(10, 1), 1);
+        assert_eq!(shard.entries.len(), 1);
+        assert_eq!(shard.capacity_retry_after_millis(10), Some(10));
+
+        assert_eq!(shard.prune_expired(20, 0), 0);
+        assert_eq!(shard.capacity_retry_after_millis(20), Some(1));
+        assert_eq!(shard.prune_expired(20, 1), 1);
+        assert!(shard.entries.is_empty());
+        assert_eq!(shard.capacity_retry_after_millis(20), None);
+    }
+
+    #[test]
+    fn poison_recovery_rebuilds_only_the_untrusted_shard() {
+        let config = MemoryStoreConfig::new(2)
+            .unwrap()
+            .with_shard_count(2)
+            .unwrap();
+        let shards = BoundedShards::<TestEntry>::new(&config);
+        let healthy_key = counter_key(7);
+        {
+            let mut healthy = shards.shard(1).lock().unwrap();
+            insert(&mut healthy, healthy_key, 60);
+        }
+
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _poisoned = shards.shard(0).lock().unwrap();
+            panic!("poison the test shard");
+        }));
+        assert!(panic_result.is_err());
+        assert!(matches!(
+            shards.lock_shard(0),
+            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+        ));
+
+        assert_eq!(shards.recover_poisoned(&config), 1);
+        assert!(shards.lock_shard(0).is_ok());
+        let healthy = shards.lock_shard(1).unwrap();
+        assert_eq!(healthy.entries.len(), 1);
+        assert!(
+            healthy
+                .entries
+                .contains_key(&PrehashedCounterKey(healthy_key))
+        );
+    }
+}

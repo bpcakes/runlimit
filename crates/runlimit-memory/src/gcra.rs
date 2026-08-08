@@ -1,8 +1,6 @@
 use std::{
-    collections::{BTreeSet, HashMap},
     fmt,
-    hash::{BuildHasherDefault, Hash, Hasher},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -12,7 +10,13 @@ use runlimit_core::{
     Limiter, Observation, Observer, QuotaMode, observe_safely, validate_batch,
 };
 
-use crate::{Clock, MemoryStoreConfig, MemoryStoreError, MemoryStoreStats, SystemClock};
+use crate::{
+    Clock, MemoryStoreConfig, MemoryStoreError, MemoryStoreStats, SystemClock,
+    shards::{
+        BoundedShards, CleanupEffect, Expiration, ExpiringEntry, PrehashedCounterKey, Shard,
+        ShardEffect, collect_shard_effects, usize_to_u64,
+    },
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Entry {
@@ -20,101 +24,13 @@ struct Entry {
     expires_at_millis: u128,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct Expiration {
-    expires_at_millis: u128,
-    key: CounterKey,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PrehashedCounterKey(CounterKey);
-
-impl Hash for PrehashedCounterKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(counter_key_hash(self.0));
+impl ExpiringEntry for Entry {
+    fn expires_at_millis(&self) -> u128 {
+        self.expires_at_millis
     }
 }
 
-#[derive(Default)]
-struct PassThroughHasher(u64);
-
-impl Hasher for PassThroughHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
-        }
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.0 = value;
-    }
-}
-
-type EntryMap = HashMap<PrehashedCounterKey, Entry, BuildHasherDefault<PassThroughHasher>>;
-
-#[derive(Debug)]
-struct Shard {
-    capacity: usize,
-    latest_observed_millis: u128,
-    entries: EntryMap,
-    expirations: BTreeSet<Expiration>,
-}
-
-impl Shard {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            latest_observed_millis: 0,
-            entries: HashMap::with_hasher(BuildHasherDefault::default()),
-            expirations: BTreeSet::new(),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.expirations.clear();
-    }
-
-    fn prune_expired(&mut self, now_millis: u128, maximum: usize) -> usize {
-        let mut removed_count = 0;
-        for _ in 0..maximum {
-            let Some(expiration) = self.expirations.first() else {
-                break;
-            };
-            if expiration.expires_at_millis > now_millis {
-                break;
-            }
-
-            let expiration = self
-                .expirations
-                .pop_first()
-                .expect("the first expiration was present");
-            let removed = self.entries.remove(&PrehashedCounterKey(expiration.key));
-            debug_assert_eq!(
-                removed.map(|entry| entry.expires_at_millis),
-                Some(expiration.expires_at_millis),
-                "the entry and expiration indexes diverged"
-            );
-            removed_count += usize::from(removed.is_some());
-        }
-        removed_count
-    }
-
-    fn capacity_retry_after(&self, now_millis: u128) -> Option<Duration> {
-        self.expirations.first().map(|expiration| {
-            duration_from_millis(
-                expiration
-                    .expires_at_millis
-                    .saturating_sub(now_millis)
-                    .max(1),
-            )
-        })
-    }
-
+impl Shard<Entry> {
     fn evaluate(
         &self,
         check: &PreparedCheck,
@@ -236,21 +152,6 @@ impl PreparedCheck {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct CleanupEffect {
-    requested: usize,
-    removed: usize,
-    elapsed: Duration,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ShardEffect {
-    shard_index: usize,
-    cleanup: CleanupEffect,
-    used: usize,
-    capacity: usize,
-}
-
 #[derive(Debug)]
 struct Evaluation<T> {
     value: T,
@@ -265,17 +166,13 @@ struct Evaluation<T> {
 pub struct GcraStore<C = SystemClock> {
     config: MemoryStoreConfig,
     clock: C,
-    shards: Box<[Mutex<Shard>]>,
+    shards: BoundedShards<Entry>,
     observer: Option<Arc<dyn Observer>>,
 }
 
 impl<C> fmt::Debug for GcraStore<C> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let poisoned_shards = self
-            .shards
-            .iter()
-            .filter(|shard| shard.is_poisoned())
-            .count();
+        let poisoned_shards = self.shards.poisoned_count();
         formatter
             .debug_struct("GcraStore")
             .field("config", &self.config)
@@ -296,10 +193,7 @@ impl GcraStore<SystemClock> {
 impl<C: Clock> GcraStore<C> {
     /// Creates a store using a caller-supplied monotonic clock.
     pub fn with_clock(config: MemoryStoreConfig, clock: C) -> Self {
-        let shards = (0..config.shard_count())
-            .map(|index| Mutex::new(Shard::new(config.shard_capacity(index))))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let shards = BoundedShards::new(&config);
         Self {
             config,
             clock,
@@ -352,9 +246,9 @@ impl<C: Clock> GcraStore<C> {
         check: &Check<'_, GcraPolicy>,
     ) -> Result<Evaluation<Decision>, MemoryStoreError> {
         let counter_key = check.counter_key();
-        let shard_index = self.shard_index(&counter_key);
+        let shard_index = self.shards.shard_index(&counter_key);
         let prepared = PreparedCheck::new(0, check, shard_index);
-        let mut shard = self.lock_shard(shard_index)?;
+        let mut shard = self.shards.lock_shard(shard_index)?;
         let observed_millis = self.clock.now().as_millis();
         let now_millis = observed_millis.max(shard.latest_observed_millis);
         let evaluated = match shard.evaluate(&prepared, now_millis) {
@@ -377,7 +271,9 @@ impl<C: Clock> GcraStore<C> {
                     && shard.entries.len() >= shard.capacity
                 {
                     Decision::denied(Denial::StorageCapacity {
-                        retry_after: shard.capacity_retry_after(now_millis),
+                        retry_after: shard
+                            .capacity_retry_after_millis(now_millis)
+                            .map(duration_from_millis),
                     })
                 } else {
                     shard.consume(&prepared, allowance)
@@ -466,7 +362,7 @@ impl<C: Clock> GcraStore<C> {
             prepared.push(PreparedCheck::new(
                 input_index,
                 check,
-                self.shard_index(&counter_key),
+                self.shards.shard_index(&counter_key),
             ));
         }
         let mut shard_indexes = prepared
@@ -495,7 +391,7 @@ impl<C: Clock> GcraStore<C> {
             }
         }
 
-        let mut locked_shards = self.lock_shards(&shard_indexes)?;
+        let mut locked_shards = self.shards.lock_shards(&shard_indexes)?;
         let observed_millis = self.clock.now().as_millis();
         let now_millis = locked_shards
             .iter()
@@ -565,7 +461,9 @@ impl<C: Clock> GcraStore<C> {
                         value: BatchDecision::Denied {
                             index: check.input_index,
                             denial: Denial::StorageCapacity {
-                                retry_after: shard.capacity_retry_after(now_millis),
+                                retry_after: shard
+                                    .capacity_retry_after_millis(now_millis)
+                                    .map(duration_from_millis),
                             },
                         },
                         shard_effects: collect_shard_effects(&locked_shards, &cleanup_effects),
@@ -596,13 +494,7 @@ impl<C: Clock> GcraStore<C> {
     ///
     /// Returns an error if any shard is poisoned.
     pub fn stats(&self) -> Result<MemoryStoreStats, MemoryStoreError> {
-        let indexes = (0..self.shards.len()).collect::<Vec<_>>();
-        let locked = self.lock_shards(&indexes)?;
-        Ok(MemoryStoreStats::from_parts(
-            locked.iter().map(|(_, shard)| shard.entries.len()).sum(),
-            self.config.max_keys(),
-            self.config.shard_count(),
-        ))
+        self.shards.stats(&self.config)
     }
 
     /// Removes every stored counter.
@@ -611,32 +503,12 @@ impl<C: Clock> GcraStore<C> {
     ///
     /// Returns an error if any shard is poisoned.
     pub fn clear(&self) -> Result<(), MemoryStoreError> {
-        let indexes = (0..self.shards.len()).collect::<Vec<_>>();
-        let mut locked = self.lock_shards(&indexes)?;
-        for (_, shard) in &mut locked {
-            shard.clear();
-        }
-        Ok(())
+        self.shards.clear()
     }
 
     /// Rebuilds poisoned shards by discarding their untrusted counter state.
     pub fn recover_poisoned(&self) -> usize {
-        let mut locked = Vec::with_capacity(self.shards.len());
-        for (index, mutex) in self.shards.iter().enumerate() {
-            match mutex.lock() {
-                Ok(shard) => locked.push((index, mutex, shard, false)),
-                Err(poisoned) => locked.push((index, mutex, poisoned.into_inner(), true)),
-            }
-        }
-        let mut recovered = 0;
-        for (index, mutex, shard, poisoned) in &mut locked {
-            if *poisoned {
-                **shard = Shard::new(self.config.shard_capacity(*index));
-                mutex.clear_poison();
-                recovered += 1;
-            }
-        }
-        recovered
+        self.shards.recover_poisoned(&self.config)
     }
 
     fn observe_shard_effects(&self, effects: &[ShardEffect]) {
@@ -671,57 +543,6 @@ impl<C: Clock> GcraStore<C> {
         let admission = build_observation();
         observe_safely(observer.as_ref(), &Observation::Admission(admission));
     }
-
-    fn shard_index(&self, key: &CounterKey) -> usize {
-        #[allow(clippy::cast_possible_truncation)]
-        let hash = counter_key_hash(*key) as usize;
-        hash % self.shards.len()
-    }
-
-    fn lock_shard(&self, index: usize) -> Result<MutexGuard<'_, Shard>, MemoryStoreError> {
-        self.shards[index]
-            .lock()
-            .map_err(|_| MemoryStoreError::PoisonedShard { shard_index: index })
-    }
-
-    fn lock_shards<'a>(
-        &'a self,
-        indexes: &[usize],
-    ) -> Result<Vec<(usize, MutexGuard<'a, Shard>)>, MemoryStoreError> {
-        let mut locked = Vec::with_capacity(indexes.len());
-        for &index in indexes {
-            locked.push((index, self.lock_shard(index)?));
-        }
-        Ok(locked)
-    }
-}
-
-fn collect_shard_effects(
-    locked_shards: &[(usize, MutexGuard<'_, Shard>)],
-    cleanup_effects: &[CleanupEffect],
-) -> Vec<ShardEffect> {
-    debug_assert_eq!(locked_shards.len(), cleanup_effects.len());
-    locked_shards
-        .iter()
-        .zip(cleanup_effects)
-        .map(|((shard_index, shard), cleanup)| ShardEffect {
-            shard_index: *shard_index,
-            cleanup: *cleanup,
-            used: shard.entries.len(),
-            capacity: shard.capacity,
-        })
-        .collect()
-}
-
-fn counter_key_hash(key: CounterKey) -> u64 {
-    leading_u64(key.subject().as_bytes())
-        ^ leading_u64(key.fingerprint().as_bytes()).rotate_left(32)
-}
-
-const fn leading_u64(bytes: &[u8; 32]) -> u64 {
-    u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ])
 }
 
 const fn div_ceil(numerator: u128, denominator: u128) -> u128 {
@@ -738,10 +559,6 @@ fn duration_from_millis(millis: u128) -> Duration {
         u64::try_from(millis)
             .expect("GCRA policy validation bounds every reported duration to u64"),
     )
-}
-
-fn usize_to_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 impl<C: Clock> Limiter for GcraStore<C> {
