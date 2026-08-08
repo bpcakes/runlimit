@@ -939,21 +939,21 @@ impl PostgresLimiter {
         result: &Result<Decision, CheckError>,
         elapsed: Duration,
     ) {
-        let (outcome, consumption) = match result {
-            Ok(decision) => (
-                decision_admission_outcome(decision),
-                decision_consumption(decision),
-            ),
-            Err(error) => (AdmissionOutcome::Failed, check_error_consumption(error)),
-        };
-        self.observe_admission(
-            AdmissionOperation::Check,
-            1,
-            Some(check),
-            outcome,
-            consumption,
-            elapsed,
-        );
+        match result {
+            Ok(decision) => self
+                .observe_admission(|| AdmissionObservation::from_check(check, decision, elapsed)),
+            Err(error) => self.observe_admission(|| {
+                AdmissionObservation::new(
+                    AdmissionOperation::Check,
+                    1,
+                    Some(check.policy().id()),
+                    Some(check.policy().scope()),
+                    AdmissionOutcome::Failed,
+                    check_error_consumption(error),
+                    elapsed,
+                )
+            }),
+        }
     }
 
     fn observe_batch_admission(
@@ -962,59 +962,39 @@ impl PostgresLimiter {
         result: &Result<BatchDecision, CheckError>,
         elapsed: Duration,
     ) {
-        let relevant_check = match result {
-            Ok(BatchDecision::Allowed(decisions)) if decisions.len() == 1 => checks.first(),
-            Ok(BatchDecision::Denied { index, .. } | BatchDecision::ShadowDenied { index, .. }) => {
-                checks.get(*index)
+        match result {
+            Ok(decision) => self
+                .observe_admission(|| AdmissionObservation::from_batch(checks, decision, elapsed)),
+            Err(error) => {
+                self.observe_admission(|| {
+                    let relevant_check = if checks.len() == 1 {
+                        checks.first()
+                    } else {
+                        None
+                    };
+                    let (policy_id, scope_id) = relevant_check.map_or((None, None), |check| {
+                        (Some(check.policy().id()), Some(check.policy().scope()))
+                    });
+                    AdmissionObservation::new(
+                        AdmissionOperation::Batch,
+                        checks.len(),
+                        policy_id,
+                        scope_id,
+                        AdmissionOutcome::Failed,
+                        check_error_consumption(error),
+                        elapsed,
+                    )
+                });
             }
-            Err(_) if checks.len() == 1 => checks.first(),
-            _ => None,
-        };
-        let (outcome, consumption) = match result {
-            Ok(decision) => (
-                batch_admission_outcome(decision),
-                batch_consumption(decision, checks.is_empty()),
-            ),
-            Err(error) => (AdmissionOutcome::Failed, check_error_consumption(error)),
-        };
-        self.observe_admission(
-            AdmissionOperation::Batch,
-            checks.len(),
-            relevant_check,
-            outcome,
-            consumption,
-            elapsed,
-        );
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn observe_admission(
-        &self,
-        operation: AdmissionOperation,
-        batch_size: usize,
-        relevant_check: Option<&Check<'_>>,
-        outcome: AdmissionOutcome,
-        consumption: ConsumptionStatus,
-        elapsed: Duration,
-    ) {
+    fn observe_admission<'a>(&self, build_observation: impl FnOnce() -> AdmissionObservation<'a>) {
         let Some(observer) = &self.observer else {
             return;
         };
-        let (policy_id, scope_id) = relevant_check.map_or((None, None), |check| {
-            (Some(check.policy().id()), Some(check.policy().scope()))
-        });
-        observe_safely(
-            observer.as_ref(),
-            &Observation::Admission(AdmissionObservation::new(
-                operation,
-                batch_size,
-                policy_id,
-                scope_id,
-                outcome,
-                consumption,
-                elapsed,
-            )),
-        );
+        let admission = build_observation();
+        observe_safely(observer.as_ref(), &Observation::Admission(admission));
     }
 
     fn observe_cleanup(
@@ -1061,52 +1041,6 @@ impl Limiter for PostgresLimiter {
         checks: &[Check<'_>],
     ) -> impl Future<Output = Result<BatchDecision, Self::Error>> + Send {
         PostgresLimiter::check_all(self, checks)
-    }
-}
-
-fn decision_admission_outcome(decision: &Decision) -> AdmissionOutcome {
-    if !decision.would_deny() {
-        return AdmissionOutcome::Allowed;
-    }
-    if decision.is_shadow_denied() {
-        return AdmissionOutcome::ShadowDenied;
-    }
-    match decision.denial() {
-        Some(Denial::QuotaExceeded { .. }) => AdmissionOutcome::QuotaDenied,
-        Some(Denial::StorageCapacity { .. }) => AdmissionOutcome::CapacityDenied,
-        _ => AdmissionOutcome::Failed,
-    }
-}
-
-fn decision_consumption(decision: &Decision) -> ConsumptionStatus {
-    if decision.would_deny() {
-        ConsumptionStatus::NotConsumed
-    } else {
-        ConsumptionStatus::Consumed
-    }
-}
-
-fn batch_admission_outcome(decision: &BatchDecision) -> AdmissionOutcome {
-    match decision {
-        BatchDecision::Allowed(_) => AdmissionOutcome::Allowed,
-        BatchDecision::ShadowDenied { .. } => AdmissionOutcome::ShadowDenied,
-        BatchDecision::Denied {
-            denial: Denial::QuotaExceeded { .. },
-            ..
-        } => AdmissionOutcome::QuotaDenied,
-        BatchDecision::Denied {
-            denial: Denial::StorageCapacity { .. },
-            ..
-        } => AdmissionOutcome::CapacityDenied,
-        _ => AdmissionOutcome::Failed,
-    }
-}
-
-fn batch_consumption(decision: &BatchDecision, empty: bool) -> ConsumptionStatus {
-    if matches!(decision, BatchDecision::Allowed(_)) && !empty {
-        ConsumptionStatus::Consumed
-    } else {
-        ConsumptionStatus::NotConsumed
     }
 }
 

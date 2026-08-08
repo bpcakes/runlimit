@@ -328,23 +328,21 @@ impl<C: Clock> GcraStore<C> {
         match &result {
             Ok(evaluation) => {
                 self.observe_shard_effects(&evaluation.shard_effects);
-                self.observe_admission(
+                self.observe_admission(|| {
+                    AdmissionObservation::from_check(check, &evaluation.value, elapsed)
+                });
+            }
+            Err(_) => self.observe_admission(|| {
+                AdmissionObservation::new(
                     AdmissionOperation::Check,
                     1,
-                    Some(check),
-                    decision_outcome(&evaluation.value),
-                    decision_consumption(&evaluation.value),
+                    Some(check.policy().id()),
+                    Some(check.policy().scope()),
+                    AdmissionOutcome::Failed,
+                    ConsumptionStatus::NotConsumed,
                     elapsed,
-                );
-            }
-            Err(_) => self.observe_admission(
-                AdmissionOperation::Check,
-                1,
-                Some(check),
-                AdmissionOutcome::Failed,
-                ConsumptionStatus::NotConsumed,
-                elapsed,
-            ),
+                )
+            }),
         }
         result.map(|evaluation| evaluation.value)
     }
@@ -430,24 +428,21 @@ impl<C: Clock> GcraStore<C> {
         match &result {
             Ok(evaluation) => {
                 self.observe_shard_effects(&evaluation.shard_effects);
-                let relevant_check = batch_relevant_check(checks, &evaluation.value);
-                self.observe_admission(
+                self.observe_admission(|| {
+                    AdmissionObservation::from_batch(checks, &evaluation.value, elapsed)
+                });
+            }
+            Err(_) => self.observe_admission(|| {
+                AdmissionObservation::new(
                     AdmissionOperation::Batch,
                     checks.len(),
-                    relevant_check,
-                    batch_outcome(&evaluation.value),
-                    batch_consumption(&evaluation.value, checks.is_empty()),
+                    None,
+                    None,
+                    AdmissionOutcome::Failed,
+                    ConsumptionStatus::NotConsumed,
                     elapsed,
-                );
-            }
-            Err(_) => self.observe_admission(
-                AdmissionOperation::Batch,
-                checks.len(),
-                None,
-                AdmissionOutcome::Failed,
-                ConsumptionStatus::NotConsumed,
-                elapsed,
-            ),
+                )
+            }),
         }
         result.map(|evaluation| evaluation.value)
     }
@@ -669,34 +664,12 @@ impl<C: Clock> GcraStore<C> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn observe_admission(
-        &self,
-        operation: AdmissionOperation,
-        batch_size: usize,
-        check: Option<&Check<'_, GcraPolicy>>,
-        outcome: AdmissionOutcome,
-        consumption: ConsumptionStatus,
-        elapsed: Duration,
-    ) {
+    fn observe_admission<'a>(&self, build_observation: impl FnOnce() -> AdmissionObservation<'a>) {
         let Some(observer) = &self.observer else {
             return;
         };
-        let (policy_id, scope_id) = check.map_or((None, None), |check| {
-            (Some(check.policy().id()), Some(check.policy().scope()))
-        });
-        observe_safely(
-            observer.as_ref(),
-            &Observation::Admission(AdmissionObservation::new(
-                operation,
-                batch_size,
-                policy_id,
-                scope_id,
-                outcome,
-                consumption,
-                elapsed,
-            )),
-        );
+        let admission = build_observation();
+        observe_safely(observer.as_ref(), &Observation::Admission(admission));
     }
 
     fn shard_index(&self, key: &CounterKey) -> usize {
@@ -738,65 +711,6 @@ fn collect_shard_effects(
             capacity: shard.capacity,
         })
         .collect()
-}
-
-fn decision_outcome(decision: &Decision) -> AdmissionOutcome {
-    if !decision.would_deny() {
-        return AdmissionOutcome::Allowed;
-    }
-    if decision.is_shadow_denied() {
-        return AdmissionOutcome::ShadowDenied;
-    }
-    match decision.denial() {
-        Some(Denial::QuotaExceeded { .. }) => AdmissionOutcome::QuotaDenied,
-        Some(Denial::StorageCapacity { .. }) => AdmissionOutcome::CapacityDenied,
-        _ => AdmissionOutcome::Failed,
-    }
-}
-
-fn decision_consumption(decision: &Decision) -> ConsumptionStatus {
-    if decision.would_deny() {
-        ConsumptionStatus::NotConsumed
-    } else {
-        ConsumptionStatus::Consumed
-    }
-}
-
-fn batch_outcome(decision: &BatchDecision) -> AdmissionOutcome {
-    match decision {
-        BatchDecision::Allowed(_) => AdmissionOutcome::Allowed,
-        BatchDecision::ShadowDenied { .. } => AdmissionOutcome::ShadowDenied,
-        BatchDecision::Denied {
-            denial: Denial::QuotaExceeded { .. },
-            ..
-        } => AdmissionOutcome::QuotaDenied,
-        BatchDecision::Denied {
-            denial: Denial::StorageCapacity { .. },
-            ..
-        } => AdmissionOutcome::CapacityDenied,
-        _ => AdmissionOutcome::Failed,
-    }
-}
-
-fn batch_consumption(decision: &BatchDecision, empty: bool) -> ConsumptionStatus {
-    if matches!(decision, BatchDecision::Allowed(_)) && !empty {
-        ConsumptionStatus::Consumed
-    } else {
-        ConsumptionStatus::NotConsumed
-    }
-}
-
-fn batch_relevant_check<'checks, 'policy>(
-    checks: &'checks [Check<'policy, GcraPolicy>],
-    decision: &BatchDecision,
-) -> Option<&'checks Check<'policy, GcraPolicy>> {
-    match decision {
-        BatchDecision::Allowed(decisions) if decisions.len() == 1 => checks.first(),
-        BatchDecision::Denied { index, .. } | BatchDecision::ShadowDenied { index, .. } => {
-            checks.get(*index)
-        }
-        _ => None,
-    }
 }
 
 fn counter_key_hash(key: CounterKey) -> u64 {
