@@ -144,7 +144,7 @@ use protocol::{
     BATCH_PREFLIGHT_SQL, BATCH_UPSERT_SQL, CLEANUP_SQL, advisory_lock_id, capacity_shard,
 };
 #[cfg(test)]
-use runlimit_core::{BatchError, Denial};
+use runlimit_core::BatchError;
 #[cfg(test)]
 use sqlx::postgres::types::PgInterval;
 
@@ -313,7 +313,7 @@ impl PostgresLimiter {
     ///
     /// New keys lock their capacity-ledger rows in shard order. If the earliest
     /// caller-ordered failure is the configured shard bound, the batch returns
-    /// [`runlimit_core::Denial::StorageCapacity`] with no retry duration and changes neither
+    /// [`runlimit_core::Denial::storage_capacity`] with no retry duration and changes neither
     /// quota nor storage. Existing and expired target rows need no new slot.
     ///
     /// If any check is denied, the backend attempts an explicit rollback and
@@ -342,7 +342,7 @@ impl PostgresLimiter {
     ) -> Result<BatchDecision, CheckError> {
         validate_batch(checks, self.config.max_batch_size())?;
         if checks.is_empty() {
-            return Ok(BatchDecision::Allowed(Vec::new()));
+            return Ok(BatchDecision::allowed(Vec::new()));
         }
 
         // Materialize every SQL array and both lock orders before reserving a
@@ -567,7 +567,8 @@ mod tests {
 
     use super::*;
     use runlimit_core::{
-        FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, PolicyId, ScopeId, SubjectKey,
+        FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, PolicyId, QuotaDenial,
+        ScopeId, SubjectKey,
     };
 
     fn policy(id: &str, scope: &str) -> FixedWindowPolicy {
@@ -689,7 +690,7 @@ mod tests {
 
         assert_eq!(
             limiter.check_all(&[]).await.unwrap(),
-            BatchDecision::Allowed(Vec::new())
+            BatchDecision::allowed(Vec::new())
         );
         assert_eq!(limiter.cleanup_expired(0).await.unwrap(), 0);
         assert_eq!(
@@ -708,7 +709,7 @@ mod tests {
         let panicking = PostgresLimiter::new(pool).with_observer(Arc::new(PanickingObserver));
         assert_eq!(
             panicking.check_all(&[]).await.unwrap(),
-            BatchDecision::Allowed(Vec::new())
+            BatchDecision::allowed(Vec::new())
         );
         assert_eq!(panicking.cleanup_expired(0).await.unwrap(), 0);
     }
@@ -753,16 +754,14 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            outcome,
-            ConnectionOutcome::MustClose(BatchDecision::Denied {
-                index: 2,
-                denial: Denial::QuotaExceeded {
-                    capacity: 10,
-                    retry_after
-                }
-            }) if retry_after == Duration::from_millis(130)
-        ));
+        let ConnectionOutcome::MustClose(decision) = outcome else {
+            panic!("rollback failure must close the connection")
+        };
+        assert_eq!(decision.denied_index(), Some(2));
+        assert_eq!(
+            decision.quota_denial(),
+            Some(QuotaDenial::try_new(10, Duration::from_millis(130)).unwrap())
+        );
     }
 
     #[tokio::test]
@@ -781,13 +780,11 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            outcome,
-            ConnectionOutcome::MustClose(BatchDecision::Denied {
-                index: 0,
-                denial: Denial::QuotaExceeded { capacity: 1, .. }
-            })
-        ));
+        let ConnectionOutcome::MustClose(decision) = outcome else {
+            panic!("rollback deadline must close the connection")
+        };
+        assert_eq!(decision.denied_index(), Some(0));
+        assert_eq!(decision.quota_denial().map(QuotaDenial::capacity), Some(1));
     }
 
     #[tokio::test]
@@ -806,13 +803,12 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            outcome,
-            ConnectionOutcome::Reusable(BatchDecision::ShadowDenied {
-                index: 0,
-                denial: Denial::QuotaExceeded { capacity: 1, .. }
-            })
-        ));
+        let ConnectionOutcome::Reusable(decision) = outcome else {
+            panic!("successful rollback must reuse the connection")
+        };
+        assert!(decision.is_shadow_denied());
+        assert_eq!(decision.denied_index(), Some(0));
+        assert_eq!(decision.quota_denial().map(QuotaDenial::capacity), Some(1));
     }
 
     #[test]
@@ -961,14 +957,11 @@ mod tests {
 
     #[test]
     fn malformed_single_responses_preserve_consumption_status() {
-        let denial = Denial::QuotaExceeded {
-            capacity: 1,
-            retry_after: Duration::from_secs(1),
-        };
+        let denial = QuotaDenial::try_new(1, Duration::from_secs(1)).unwrap();
 
-        let committed = single_decision_from_batch(BatchDecision::Allowed(Vec::new()))
+        let committed = single_decision_from_batch(BatchDecision::allowed(Vec::new()))
             .expect_err("malformed allowed response follows a confirmed commit");
-        let rolled_back = single_decision_from_batch(BatchDecision::Denied { index: 1, denial })
+        let rolled_back = single_decision_from_batch(BatchDecision::denied(1, denial))
             .expect_err("malformed denied response follows a rollback");
 
         assert!(matches!(committed, CheckError::CommittedResponseInvariant));

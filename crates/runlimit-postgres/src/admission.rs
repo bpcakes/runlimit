@@ -1,6 +1,6 @@
 use std::{future::Future, time::Duration};
 
-use runlimit_core::{BatchDecision, Check, Decision, Denial, QuotaMode};
+use runlimit_core::{BatchDecision, Check, Decision, Denial, QuotaDenial, QuotaMode};
 use sqlx::{
     Acquire, PgPool, Postgres, Row, Transaction,
     pool::PoolConnection,
@@ -19,16 +19,14 @@ use crate::{
 };
 
 pub(crate) fn single_decision_from_batch(batch: BatchDecision) -> Result<Decision, CheckError> {
-    batch
-        .try_into_single_decision()
-        .map_err(|invalid| match invalid {
-            BatchDecision::Denied { .. } | BatchDecision::ShadowDenied { .. } => {
-                CheckError::ResponseInvariant
-            }
-            // A future outcome may describe already-committed quota, so keep
-            // the public error's consumption classification conservative.
-            _ => CheckError::CommittedResponseInvariant,
-        })
+    batch.try_into_single_decision().map_err(|invalid| {
+        if invalid.would_deny() {
+            return CheckError::ResponseInvariant;
+        }
+        // A future outcome may describe already-committed quota, so keep
+        // the public error's consumption classification conservative.
+        CheckError::CommittedResponseInvariant
+    })
 }
 
 #[derive(Debug)]
@@ -130,6 +128,16 @@ pub(crate) struct PendingQuotaDenial {
     pub(crate) retry_from_sample: Duration,
 }
 
+impl PendingQuotaDenial {
+    fn finish(self, authoritative_elapsed: Duration) -> QuotaDenial {
+        QuotaDenial::try_new(
+            self.limit,
+            self.retry_from_sample.saturating_sub(authoritative_elapsed),
+        )
+        .expect("persisted policy limits were validated before evaluation")
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum PendingDenial {
     Quota(PendingQuotaDenial),
@@ -139,14 +147,8 @@ pub(crate) enum PendingDenial {
 impl PendingDenial {
     pub(crate) fn finish(self, authoritative_elapsed: Duration) -> Denial {
         match self {
-            Self::Quota(PendingQuotaDenial {
-                limit,
-                retry_from_sample,
-            }) => Denial::QuotaExceeded {
-                capacity: limit,
-                retry_after: retry_from_sample.saturating_sub(authoritative_elapsed),
-            },
-            Self::StorageCapacity => Denial::StorageCapacity { retry_after: None },
+            Self::Quota(denial) => Denial::quota_exceeded(denial.finish(authoritative_elapsed)),
+            Self::StorageCapacity => Denial::storage_capacity(None),
         }
     }
 }
@@ -246,7 +248,7 @@ async fn run_check_transaction_inner(
         }
         PendingBatchOutcome::Allowed(allowances) => {
             commit_check(deadline, transaction).await?;
-            Ok(ConnectionOutcome::Reusable(BatchDecision::Allowed(
+            Ok(ConnectionOutcome::Reusable(BatchDecision::allowed(
                 allowances
                     .into_iter()
                     .map(|allowance| allowance.finish(authoritative_elapsed))
@@ -266,19 +268,12 @@ where
     F: Future<Output = Result<(), sqlx::Error>>,
 {
     let decision = match pending {
-        PendingBatchDenial::Enforced { index, denial } => BatchDecision::Denied {
-            index,
-            denial: denial.finish(authoritative_elapsed),
-        },
-        PendingBatchDenial::Shadow { index, denial } => BatchDecision::ShadowDenied {
-            index,
-            denial: Denial::QuotaExceeded {
-                capacity: denial.limit,
-                retry_after: denial
-                    .retry_from_sample
-                    .saturating_sub(authoritative_elapsed),
-            },
-        },
+        PendingBatchDenial::Enforced { index, denial } => {
+            BatchDecision::denied(index, denial.finish(authoritative_elapsed))
+        }
+        PendingBatchDenial::Shadow { index, denial } => {
+            BatchDecision::shadow_denied(index, denial.finish(authoritative_elapsed))
+        }
     };
     if denied_rollback_succeeded(deadline, rollback).await {
         ConnectionOutcome::Reusable(decision)

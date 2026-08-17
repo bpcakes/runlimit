@@ -8,8 +8,9 @@ release:
    adjust the consumer-facing API from that experience.
 2. [x] Add replica-safe, fail-closed PostgreSQL cardinality enforcement with
    stable capacity sharding and continuous bounded expired-row cleanup.
-3. [ ] Decide whether low-level `Decision` constructors should become
-   validated or private backend SPI.
+3. [x] Make low-level decision and batch construction validated so invalid
+   capacities, shadow capacity denials, and denied members in allowed batches
+   cannot enter the public response algebra.
 4. [x] Define shared portable upper bounds for limits and window durations,
    rejecting nonportable policies in core and preserving exact memory and
    PostgreSQL time arithmetic at the boundary.

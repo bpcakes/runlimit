@@ -10,9 +10,9 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionOutcome, BatchDecision, Check, ConsumptionStatus, Decision, Denial, FixedWindowPolicy,
-    MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, Observation, Observer, PolicyId, QuotaMode, ScopeId,
-    SubjectKey,
+    AdmissionOutcome, BatchDecision, Check, ConsumptionStatus, Decision, Denial, DenialKind,
+    FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, Observation, Observer, PolicyId,
+    QuotaDenial, QuotaMode, ScopeId, SubjectKey,
 };
 use runlimit_memory::{Clock, MemoryStore, MemoryStoreConfig};
 use runlimit_postgres::{
@@ -31,6 +31,7 @@ const PUBLISHED_CREATE_MIGRATION_VERSION: i64 = 20_260_723_000_000;
 const FILLFACTOR_MIGRATION_VERSION: i64 = 20_260_725_000_000;
 const CARDINALITY_MIGRATION_VERSION: i64 = 20_260_726_000_000;
 const ADVISORY_LOCK_DOMAIN: &[u8] = b"runlimit/postgres-advisory-lock/v1\0";
+
 const PUBLISHED_CREATE_MIGRATION_SHA384: [u8; 48] = [
     0x31, 0xd9, 0x3f, 0xde, 0x98, 0xc2, 0x36, 0x4a, 0x33, 0x06, 0x2e, 0x37, 0x35, 0x08, 0xf5, 0x63,
     0xb4, 0x86, 0xdf, 0x28, 0x98, 0xf8, 0xe7, 0x73, 0x65, 0x91, 0x8e, 0x81, 0xda, 0x89, 0x80, 0xa8,
@@ -288,10 +289,7 @@ const FIXED_WINDOW_TRANSITIONS: [TransitionStep; 6] = [
         name: "live denial",
         at_millis: 3_000,
         cost: 2,
-        expected: Decision::denied(Denial::QuotaExceeded {
-            capacity: 5,
-            retry_after: Duration::from_secs(7),
-        }),
+        expected: Decision::quota_denied(QuotaDenial::new(5, Duration::from_secs(7))),
     },
     TransitionStep {
         name: "exact fill after denial",
@@ -303,10 +301,7 @@ const FIXED_WINDOW_TRANSITIONS: [TransitionStep; 6] = [
         name: "full-window denial",
         at_millis: 9_000,
         cost: 1,
-        expected: Decision::denied(Denial::QuotaExceeded {
-            capacity: 5,
-            retry_after: Duration::from_secs(1),
-        }),
+        expected: Decision::quota_denied(QuotaDenial::new(5, Duration::from_secs(1))),
     },
     TransitionStep {
         name: "exact-expiry renewal",
@@ -1189,10 +1184,7 @@ async fn configured_capacity_denies_only_new_keys_in_the_full_shard() {
 
     assert!(first.is_allowed());
     assert!(second.is_allowed());
-    assert_eq!(
-        denied.denial(),
-        Some(&Denial::StorageCapacity { retry_after: None })
-    );
+    assert_eq!(denied.denial(), Some(&Denial::storage_capacity(None)));
     assert!(existing.is_allowed());
     assert!(other.is_allowed());
     assert_eq!(
@@ -1244,10 +1236,7 @@ async fn expired_rows_hold_capacity_until_cleanup_commits() {
         .check(&Check::new(&policy, replacement_subject))
         .await
         .expect("an expired stored row still occupies capacity");
-    assert_eq!(
-        full.denial(),
-        Some(&Denial::StorageCapacity { retry_after: None })
-    );
+    assert_eq!(full.denial(), Some(&Denial::storage_capacity(None)));
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 1);
 
     assert_eq!(
@@ -1300,10 +1289,7 @@ async fn capacity_denied_batch_rolls_back_and_remains_enforced_in_shadow_mode() 
         .expect("capacity exhaustion is a batch decision");
     assert_eq!(
         result,
-        BatchDecision::Denied {
-            index: 1,
-            denial: Denial::StorageCapacity { retry_after: None },
-        }
+        BatchDecision::denied(1, Denial::storage_capacity(None))
     );
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
     assert!(!counter_exists(&pool, &policy, first_subject).await);
@@ -1612,10 +1598,7 @@ async fn concurrent_replicas_never_exceed_configured_shard_capacity() {
         if decision.is_allowed() {
             allowed += 1;
         } else {
-            assert_eq!(
-                decision.denial(),
-                Some(&Denial::StorageCapacity { retry_after: None })
-            );
+            assert_eq!(decision.denial(), Some(&Denial::storage_capacity(None)));
             capacity_denied += 1;
         }
     }
@@ -1676,10 +1659,10 @@ async fn single_quota_denial_and_anchored_reset() {
 
     let denied = limiter.check(&check).await.expect("denial is a decision");
     assert!(denied.is_denied());
-    assert!(matches!(
-        denied.denial(),
-        Some(Denial::QuotaExceeded { .. })
-    ));
+    assert_eq!(
+        denied.denial().map(Denial::kind),
+        Some(DenialKind::QuotaExceeded)
+    );
     let retry_after = denied.retry_after().expect("quota denial has retry time");
     assert!(!retry_after.is_zero());
     assert!(retry_after <= policy.window());
@@ -1765,13 +1748,8 @@ async fn denied_batch_rolls_back_every_counter() {
         .check_all(&[first_check, saturated_check])
         .await
         .expect("denied batch is a decision");
-    assert!(matches!(
-        batch,
-        BatchDecision::Denied {
-            index: 1,
-            denial: _
-        }
-    ));
+    assert!(batch.is_enforced_denial());
+    assert_eq!(batch.denied_index(), Some(1));
 
     let after_rollback = limiter
         .check(&first_check)
@@ -1859,13 +1837,9 @@ ON runlimit_fixed_windows
         injected_error,
         Err(CheckError::DefinitelyNotConsumed(_))
     ));
-    assert!(matches!(
-        batch.expect("later failing statement must not replace a known denial"),
-        BatchDecision::Denied {
-            index: 0,
-            denial: _
-        }
-    ));
+    let batch = batch.expect("later failing statement must not replace a known denial");
+    assert!(batch.is_enforced_denial());
+    assert_eq!(batch.denied_index(), Some(0));
     assert_eq!(deleted_rows, 1);
 }
 
@@ -2101,9 +2075,10 @@ ORDER BY input.input_position
         deleted_rows += delete_counter(&pool, check.policy(), check.subject()).await;
     }
 
-    let BatchDecision::Allowed(decisions) = result.expect("set-based batch succeeds") else {
-        panic!("fresh counters must all be allowed");
-    };
+    let decisions = result
+        .expect("set-based batch succeeds")
+        .try_into_allowed()
+        .expect("fresh counters must all be allowed");
     assert_eq!(decisions.len(), checks.len());
     for (decision, check) in decisions.iter().zip(&checks) {
         assert!(decision.is_allowed());
@@ -2207,22 +2182,18 @@ async fn opposite_order_batches_across_pools_do_not_deadlock_or_over_admit() {
             let outcome = outcome
                 .expect("contending batch task does not panic")
                 .expect("opposite-order batch completes before its deadline");
-            let BatchDecision::Allowed(decisions) = outcome else {
-                panic!("capacity permits every contending batch");
-            };
+            let decisions = outcome
+                .try_into_allowed()
+                .expect("capacity permits every contending batch");
             assert_eq!(decisions.len(), 2);
             assert!(decisions.iter().all(runlimit_core::Decision::is_allowed));
         }
     }
     assert_eq!(u64::try_from(stored_a).unwrap(), ROUNDS * 2);
     assert_eq!(u64::try_from(stored_b).unwrap(), ROUNDS * 2);
-    assert!(matches!(
-        after_capacity.expect("post-capacity batch is a decision"),
-        BatchDecision::Denied {
-            index: 0,
-            denial: _
-        }
-    ));
+    let after_capacity = after_capacity.expect("post-capacity batch is a decision");
+    assert!(after_capacity.is_enforced_denial());
+    assert_eq!(after_capacity.denied_index(), Some(0));
     assert_eq!(deleted_a, 1);
     assert_eq!(deleted_b, 1);
 }
@@ -2394,7 +2365,7 @@ async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
     let target_deleted = delete_counter(&pool, &target_policy, target_subject).await;
     let companion_deleted = delete_counter(&pool, &companion_policy, companion_subject).await;
 
-    assert!(matches!(batch, BatchDecision::Allowed(ref decisions) if decisions.len() == 2));
+    assert_eq!(batch.allowed_decisions().map(<[Decision]>::len), Some(2));
     assert!(single.is_denied());
     assert_eq!(target_stored, 1);
     assert_eq!(companion_stored, 1);

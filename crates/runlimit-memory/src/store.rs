@@ -7,7 +7,7 @@ use std::{
 use runlimit_core::{
     AdmissionObservation, AdmissionOperation, AdmissionOutcome, BatchDecision, BatchError,
     CapacityObservation, Check, CleanupObservation, ConsumptionStatus, CounterKey, Decision,
-    Denial, Limiter, Observation, Observer, observe_safely, validate_batch,
+    Denial, Limiter, Observation, Observer, QuotaDenial, observe_safely, validate_batch,
 };
 use thiserror::Error;
 
@@ -24,12 +24,15 @@ struct Entry {
 }
 
 impl Shard<Entry> {
-    fn quota_denial(&self, check: &PreparedCheck, now_millis: u128) -> Option<Denial> {
+    fn quota_denial(&self, check: &PreparedCheck, now_millis: u128) -> Option<QuotaDenial> {
         let (entry, expires_at_millis) = self.active_entry(check.counter_key, now_millis)?;
         let remaining = remaining_quota(check.limit, entry.used);
-        (check.cost > remaining).then(|| Denial::QuotaExceeded {
-            capacity: check.limit,
-            retry_after: duration_from_millis(expires_at_millis.saturating_sub(now_millis)),
+        (check.cost > remaining).then(|| {
+            QuotaDenial::try_new(
+                check.limit,
+                duration_from_millis(expires_at_millis.saturating_sub(now_millis)),
+            )
+            .expect("prepared policy limits are validated")
         })
     }
 
@@ -258,11 +261,11 @@ impl<C: Clock> MemoryStore<C> {
                 Decision::denied(denial)
             }
         } else if !shard.contains_key(counter_key) && shard.used() >= shard.capacity() {
-            Decision::denied(Denial::StorageCapacity {
-                retry_after: shard
+            Decision::denied(Denial::storage_capacity(
+                shard
                     .capacity_retry_after_millis(now_millis)
                     .map(duration_from_millis),
-            })
+            ))
         } else {
             shard.consume(&prepared, now_millis)
         };
@@ -331,7 +334,7 @@ impl<C: Clock> MemoryStore<C> {
         validate_batch(checks, self.config.max_batch_size())?;
         if checks.is_empty() {
             return Ok(Evaluation {
-                value: BatchDecision::Allowed(Vec::new()),
+                value: BatchDecision::allowed(Vec::new()),
                 shard_effects: Vec::new(),
             });
         }
@@ -405,15 +408,9 @@ impl<C: Clock> MemoryStore<C> {
                 let value = if checks[check.input_index].policy().quota_mode()
                     == runlimit_core::QuotaMode::Shadow
                 {
-                    BatchDecision::ShadowDenied {
-                        index: check.input_index,
-                        denial,
-                    }
+                    BatchDecision::shadow_denied(check.input_index, denial)
                 } else {
-                    BatchDecision::Denied {
-                        index: check.input_index,
-                        denial,
-                    }
+                    BatchDecision::denied(check.input_index, denial)
                 };
                 return Ok(Evaluation {
                     value,
@@ -425,14 +422,14 @@ impl<C: Clock> MemoryStore<C> {
                 let projected_len = shard.used() + pending_insertions[check.shard_position];
                 if projected_len >= shard.capacity() {
                     return Ok(Evaluation {
-                        value: BatchDecision::Denied {
-                            index: check.input_index,
-                            denial: Denial::StorageCapacity {
-                                retry_after: shard
+                        value: BatchDecision::denied(
+                            check.input_index,
+                            Denial::storage_capacity(
+                                shard
                                     .capacity_retry_after_millis(now_millis)
                                     .map(duration_from_millis),
-                            },
-                        },
+                            ),
+                        ),
                         shard_effects: collect_shard_effects(&locked_shards, &cleanup_effects),
                     });
                 }
@@ -447,7 +444,7 @@ impl<C: Clock> MemoryStore<C> {
         }
 
         Ok(Evaluation {
-            value: BatchDecision::Allowed(decisions),
+            value: BatchDecision::allowed(decisions),
             shard_effects: collect_shard_effects(&locked_shards, &cleanup_effects),
         })
     }
@@ -621,12 +618,16 @@ mod tests {
 
     use runlimit_core::{
         AdmissionOutcome, BatchDecision, BatchError, Check, ConsumptionStatus, Decision, Denial,
-        FixedWindowPolicy, KeyHasher, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, Observation,
-        Observer, PolicyId, QuotaMode, ScopeId, SubjectKey,
+        DenialKind, FixedWindowPolicy, KeyHasher, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS,
+        Observation, Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
     };
 
     use super::{Entry, MemoryStore, MemoryStoreError, remaining_quota};
     use crate::{Clock, MemoryStoreConfig, shards::counter_key_hash};
+
+    fn quota(capacity: u64, retry_after: Duration) -> QuotaDenial {
+        QuotaDenial::try_new(capacity, retry_after).unwrap()
+    }
 
     #[derive(Clone, Default)]
     struct ManualClock {
@@ -888,10 +889,7 @@ mod tests {
 
         assert_eq!(
             store.check(&check),
-            Ok(Decision::denied(Denial::QuotaExceeded {
-                capacity: 3,
-                retry_after: Duration::from_secs(60),
-            }))
+            Ok(Decision::denied(quota(3, Duration::from_secs(60))))
         );
     }
 
@@ -965,17 +963,17 @@ mod tests {
         let shadow_denial = store.check(&Check::new(&shadow, subject)).unwrap();
         assert!(shadow_denial.permits_request());
         assert!(shadow_denial.is_shadow_denied());
-        assert!(matches!(
-            shadow_denial.denial(),
-            Some(Denial::QuotaExceeded { .. })
-        ));
+        assert_eq!(
+            shadow_denial.denial().map(Denial::kind),
+            Some(DenialKind::QuotaExceeded)
+        );
 
         let enforced_denial = store.check(&Check::new(&enforced, subject)).unwrap();
         assert!(enforced_denial.is_enforced_denial());
-        assert!(matches!(
-            enforced_denial.denial(),
-            Some(Denial::QuotaExceeded { .. })
-        ));
+        assert_eq!(
+            enforced_denial.denial().map(Denial::kind),
+            Some(DenialKind::QuotaExceeded)
+        );
 
         clock.advance(Duration::from_secs(60));
         assert!(
@@ -996,10 +994,9 @@ mod tests {
         let second = Check::new(&shadow, subject(2));
 
         assert!(store.check(&first).unwrap().is_allowed());
-        assert!(matches!(
-            store.check_all(&[first, second]).unwrap(),
-            BatchDecision::ShadowDenied { index: 0, .. }
-        ));
+        let result = store.check_all(&[first, second]).unwrap();
+        assert!(result.is_shadow_denied());
+        assert_eq!(result.denied_index(), Some(0));
         assert!(
             store.check(&second).unwrap().is_allowed(),
             "a shadow-denied atomic batch must not consume another check"
@@ -1010,10 +1007,10 @@ mod tests {
         assert!(full_store.check(&first).unwrap().is_allowed());
         let capacity = full_store.check(&second).unwrap();
         assert!(capacity.is_enforced_denial());
-        assert!(matches!(
-            capacity.denial(),
-            Some(Denial::StorageCapacity { .. })
-        ));
+        assert_eq!(
+            capacity.denial().map(Denial::kind),
+            Some(DenialKind::StorageCapacity)
+        );
     }
 
     #[test]
@@ -1159,10 +1156,7 @@ mod tests {
                 now: Duration::from_millis(3),
                 subject: 1,
                 cost: 2,
-                expected: Decision::denied(Denial::QuotaExceeded {
-                    capacity: 5,
-                    retry_after: Duration::from_millis(7),
-                }),
+                expected: Decision::denied(quota(5, Duration::from_millis(7))),
             },
             Step {
                 now: Duration::from_millis(9),
@@ -1192,9 +1186,9 @@ mod tests {
                 now: Duration::from_millis(10),
                 subject: 3,
                 cost: 1,
-                expected: Decision::denied(Denial::StorageCapacity {
-                    retry_after: Some(Duration::from_millis(10)),
-                }),
+                expected: Decision::denied(Denial::storage_capacity(Some(Duration::from_millis(
+                    10,
+                )))),
             },
             Step {
                 now: Duration::from_millis(20),
@@ -1336,7 +1330,7 @@ mod tests {
 
         assert_eq!(
             store.check_all(&checks),
-            Ok(BatchDecision::Allowed(vec![
+            Ok(BatchDecision::allowed(vec![
                 Decision::allowed(10, 8, Duration::from_secs(60)),
                 Decision::allowed(10, 7, Duration::from_secs(60)),
                 Decision::allowed(10, 6, Duration::from_secs(60)),
@@ -1375,12 +1369,10 @@ mod tests {
 
         assert_eq!(
             store.check_all(&checks),
-            Ok(BatchDecision::Denied {
-                index: 2,
-                denial: Denial::StorageCapacity {
-                    retry_after: Some(Duration::from_secs(60)),
-                },
-            })
+            Ok(BatchDecision::denied(
+                2,
+                Denial::storage_capacity(Some(Duration::from_secs(60))),
+            ))
         );
         assert_eq!(store.shards.shard(0).lock().unwrap().used(), 2);
         assert_eq!(store.shards.shard(1).lock().unwrap().used(), 0);
@@ -1508,11 +1500,13 @@ mod tests {
             Check::new(&policy, shard_one[4]),
             Check::new(&policy, shard_zero[5]),
         ];
-        assert!(
-            matches!(
-                store.check_all(&checks),
-                Ok(BatchDecision::Allowed(ref decisions)) if decisions.len() == 3
-            ),
+        assert_eq!(
+            store
+                .check_all(&checks)
+                .unwrap()
+                .allowed_decisions()
+                .map(<[Decision]>::len),
+            Some(3),
             "the two checks targeting shard 0 need two cleanup slots"
         );
 
@@ -1550,7 +1544,7 @@ mod tests {
 
         let checks = [4, 5, 6].map(|byte| Check::new(&policy, subject(byte)));
         let result = store.check_all(&checks).unwrap();
-        assert!(matches!(result, BatchDecision::Allowed(ref decisions) if decisions.len() == 3));
+        assert_eq!(result.allowed_decisions().map(<[Decision]>::len), Some(3));
         assert_eq!(store.stats().unwrap().entries(), 3);
     }
 
@@ -1637,7 +1631,8 @@ mod tests {
         let result = store
             .check_all(&[exhausted_check, untouched_check])
             .unwrap();
-        assert!(matches!(result, BatchDecision::Denied { index: 0, .. }));
+        assert!(result.is_enforced_denial());
+        assert_eq!(result.denied_index(), Some(0));
 
         assert!(
             store
@@ -1733,11 +1728,9 @@ mod tests {
                         let checks = subjects.map(|subject| Check::new(policy.as_ref(), subject));
                         let result = store.check_all(&checks).unwrap();
                         assert!(
-                            matches!(
-                                result,
-                                BatchDecision::Allowed(ref decisions)
-                                    if decisions.len() == checks.len()
-                            ),
+                            result
+                                .allowed_decisions()
+                                .is_some_and(|decisions| decisions.len() == checks.len()),
                             "every call through the configured limit must be allowed: {result:?}"
                         );
                     }
@@ -1760,10 +1753,7 @@ mod tests {
         for key in [first, second] {
             assert_eq!(
                 store.check(&Check::new(policy.as_ref(), key)),
-                Ok(Decision::denied(Denial::QuotaExceeded {
-                    capacity: limit,
-                    retry_after: Duration::from_secs(60),
-                }))
+                Ok(Decision::denied(quota(limit, Duration::from_secs(60))))
             );
         }
     }
@@ -1889,10 +1879,11 @@ mod tests {
         assert_eq!(store.recover_poisoned(), 2);
         assert_eq!(store.stats().unwrap().entries(), 0);
         assert!(
-            matches!(
-                store.check_all(&checks),
-                Ok(BatchDecision::Allowed(ref decisions)) if decisions.len() == 2
-            ),
+            store
+                .check_all(&checks)
+                .unwrap()
+                .allowed_decisions()
+                .is_some_and(|decisions| decisions.len() == 2),
             "all shards must be usable after one atomic recovery"
         );
     }

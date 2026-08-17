@@ -1,5 +1,92 @@
 use std::time::Duration;
 
+use thiserror::Error;
+
+use crate::MAX_LIMIT;
+
+/// Why a check was denied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DenialKind {
+    /// Consuming the requested cost would exceed the configured quota.
+    QuotaExceeded,
+    /// A bounded backend could not safely allocate storage for a new key.
+    StorageCapacity,
+}
+
+/// An invalid decision or batch construction.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[non_exhaustive]
+pub enum DecisionError {
+    /// A quota capacity fell outside the portable policy range.
+    #[error("decision capacity {capacity} is outside the portable policy range")]
+    InvalidCapacity {
+        /// Invalid capacity supplied by the caller.
+        capacity: u64,
+    },
+    /// An allowed decision reported more available quota than its capacity.
+    #[error("available quota {available} exceeds decision capacity {capacity}")]
+    AvailableExceedsCapacity {
+        /// Decision capacity.
+        capacity: u64,
+        /// Invalid available quota.
+        available: u64,
+    },
+    /// A denied decision was supplied as a member of an allowed batch.
+    #[error("allowed batch member {index} is not an allowed decision")]
+    DeniedDecisionInAllowedBatch {
+        /// Index of the invalid batch member.
+        index: usize,
+    },
+}
+
+/// Validated details for quota exhaustion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotaDenial {
+    capacity: u64,
+    retry_after: Duration,
+}
+
+impl QuotaDenial {
+    /// Constructs quota-denial details, panicking if capacity is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity` is zero or exceeds [`MAX_LIMIT`].
+    pub const fn new(capacity: u64, retry_after: Duration) -> Self {
+        match Self::try_new(capacity, retry_after) {
+            Ok(denial) => denial,
+            Err(_) => panic!("invalid quota-denial capacity"),
+        }
+    }
+
+    /// Constructs validated quota-denial details.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecisionError::InvalidCapacity`] when `capacity` is zero or
+    /// exceeds [`MAX_LIMIT`].
+    pub const fn try_new(capacity: u64, retry_after: Duration) -> Result<Self, DecisionError> {
+        if capacity == 0 || capacity > MAX_LIMIT {
+            return Err(DecisionError::InvalidCapacity { capacity });
+        }
+        Ok(Self {
+            capacity,
+            retry_after,
+        })
+    }
+
+    /// Returns the maximum immediately available policy allowance.
+    pub const fn capacity(self) -> u64 {
+        self.capacity
+    }
+
+    /// Returns the duration until the rejected cost can be retried.
+    pub const fn retry_after(self) -> Duration {
+        self.retry_after
+    }
+}
+
 /// Structured details for a denied check.
 ///
 /// A quota denial always contains its policy capacity and the duration until
@@ -15,29 +102,61 @@ use std::time::Duration;
 /// With the `serde` feature, this is an object tagged by `reason`. Durations
 /// use Serde's exact `{ "secs": ..., "nanos": ... }` representation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum Denial {
-    /// Consuming the requested cost would exceed the configured quota.
-    QuotaExceeded {
-        /// Maximum immediately available policy allowance.
-        capacity: u64,
-        /// Duration until the rejected cost can be retried.
-        retry_after: Duration,
-    },
-    /// A bounded backend could not safely allocate storage for a new key.
-    StorageCapacity {
-        /// Duration until capacity may become available, when known.
-        retry_after: Option<Duration>,
-    },
+pub struct Denial {
+    reason: DenialReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DenialReason {
+    QuotaExceeded(QuotaDenial),
+    StorageCapacity { retry_after: Option<Duration> },
 }
 
 impl Denial {
+    /// Constructs a quota-exhaustion denial from validated details.
+    pub const fn quota_exceeded(denial: QuotaDenial) -> Self {
+        Self {
+            reason: DenialReason::QuotaExceeded(denial),
+        }
+    }
+
+    /// Constructs a storage-capacity denial.
+    pub const fn storage_capacity(retry_after: Option<Duration>) -> Self {
+        Self {
+            reason: DenialReason::StorageCapacity { retry_after },
+        }
+    }
+
+    /// Returns the denial category.
+    pub const fn kind(&self) -> DenialKind {
+        match self.reason {
+            DenialReason::QuotaExceeded(_) => DenialKind::QuotaExceeded,
+            DenialReason::StorageCapacity { .. } => DenialKind::StorageCapacity,
+        }
+    }
+
+    /// Returns quota-exhaustion details, when this is a quota denial.
+    pub const fn quota(&self) -> Option<QuotaDenial> {
+        match self.reason {
+            DenialReason::QuotaExceeded(denial) => Some(denial),
+            DenialReason::StorageCapacity { .. } => None,
+        }
+    }
+
+    /// Returns the configured quota capacity, when this is a quota denial.
+    pub const fn capacity(&self) -> Option<u64> {
+        match self.quota() {
+            Some(denial) => Some(denial.capacity()),
+            None => None,
+        }
+    }
+
     /// Returns the backend-reported duration after which the caller may retry,
     /// if known.
     pub const fn retry_after(&self) -> Option<Duration> {
-        match self {
-            Self::QuotaExceeded { retry_after, .. } => Some(*retry_after),
-            Self::StorageCapacity { retry_after } => *retry_after,
+        match self.reason {
+            DenialReason::QuotaExceeded(denial) => Some(denial.retry_after()),
+            DenialReason::StorageCapacity { retry_after } => retry_after,
         }
     }
 
@@ -51,6 +170,12 @@ impl Denial {
             Some(duration) => Some(ceil_seconds(duration)),
             None => None,
         }
+    }
+}
+
+impl From<QuotaDenial> for Denial {
+    fn from(denial: QuotaDenial) -> Self {
+        Self::quota_exceeded(denial)
     }
 }
 
@@ -82,35 +207,72 @@ pub struct Decision {
 }
 
 impl Decision {
+    /// Constructs an allowed decision, panicking if its metadata is invalid.
+    ///
+    /// Backend implementations that cannot prove their metadata invariants
+    /// should use [`Decision::try_allowed`] instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capacity is outside the portable policy range or
+    /// `available` exceeds `capacity`.
+    pub const fn allowed(capacity: u64, available: u64, replenishes_after: Duration) -> Self {
+        match Self::try_allowed(capacity, available, replenishes_after) {
+            Ok(decision) => decision,
+            Err(_) => panic!("invalid allowed decision metadata"),
+        }
+    }
+
     /// Constructs an allowed decision.
     ///
     /// Storage backends should pass the available allowance after consuming
-    /// the check's cost. This low-level constructor trusts the backend to
-    /// ensure `available <= capacity`.
-    pub const fn allowed(capacity: u64, available: u64, replenishes_after: Duration) -> Self {
-        Self {
+    /// the check's cost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the capacity is outside the portable policy range
+    /// or `available` exceeds `capacity`.
+    pub const fn try_allowed(
+        capacity: u64,
+        available: u64,
+        replenishes_after: Duration,
+    ) -> Result<Self, DecisionError> {
+        if capacity == 0 || capacity > MAX_LIMIT {
+            return Err(DecisionError::InvalidCapacity { capacity });
+        }
+        if available > capacity {
+            return Err(DecisionError::AvailableExceedsCapacity {
+                capacity,
+                available,
+            });
+        }
+        Ok(Self {
             outcome: Outcome::Allowed(Allowance {
                 capacity,
                 available,
                 replenishes_after,
             }),
-        }
+        })
     }
 
     /// Constructs a denied decision.
-    pub const fn denied(denial: Denial) -> Self {
+    pub fn denied(denial: impl Into<Denial>) -> Self {
         Self {
-            outcome: Outcome::Denied(denial),
+            outcome: Outcome::Denied(denial.into()),
+        }
+    }
+
+    /// Constructs an enforced quota denial.
+    pub const fn quota_denied(denial: QuotaDenial) -> Self {
+        Self {
+            outcome: Outcome::Denied(Denial::quota_exceeded(denial)),
         }
     }
 
     /// Constructs a shadow quota denial.
-    ///
-    /// Backends must use this only for [`Denial::QuotaExceeded`]. Storage
-    /// capacity remains an enforced denial in every quota mode.
-    pub const fn shadow_denied(denial: Denial) -> Self {
+    pub const fn shadow_denied(denial: QuotaDenial) -> Self {
         Self {
-            outcome: Outcome::ShadowDenied(denial),
+            outcome: Outcome::ShadowDenied(Denial::quota_exceeded(denial)),
         }
     }
 
@@ -154,10 +316,7 @@ impl Decision {
     pub const fn capacity(&self) -> Option<u64> {
         match self.outcome {
             Outcome::Allowed(allowance) => Some(allowance.capacity),
-            Outcome::Denied(Denial::QuotaExceeded { capacity, .. })
-            | Outcome::ShadowDenied(Denial::QuotaExceeded { capacity, .. }) => Some(capacity),
-            Outcome::Denied(Denial::StorageCapacity { .. })
-            | Outcome::ShadowDenied(Denial::StorageCapacity { .. }) => None,
+            Outcome::Denied(denial) | Outcome::ShadowDenied(denial) => denial.capacity(),
         }
     }
 
@@ -202,6 +361,14 @@ impl Decision {
         }
     }
 
+    /// Returns quota-denial details for an enforced or shadow quota denial.
+    pub const fn quota_denial(&self) -> Option<QuotaDenial> {
+        match self.outcome {
+            Outcome::Allowed(_) => None,
+            Outcome::Denied(denial) | Outcome::ShadowDenied(denial) => denial.quota(),
+        }
+    }
+
     const fn was_consumed(&self) -> bool {
         matches!(self.outcome, Outcome::Allowed(_))
     }
@@ -211,50 +378,137 @@ impl Decision {
 ///
 /// An allowed batch contains one allowed decision for each input check, in the
 /// same order. A denied batch reports the original input index that failed.
-/// Backends must not consume any check when returning [`BatchDecision::Denied`].
+/// Backends must not consume any check when returning an enforced denial.
 ///
 /// With the `serde` feature, this is an object tagged by `outcome`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum BatchDecision {
-    /// Every input check was allowed.
+pub struct BatchDecision {
+    outcome: BatchOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BatchOutcome {
     Allowed(Vec<Decision>),
-    /// One input check caused the whole batch to be denied.
-    Denied {
-        /// Index in the caller's original input sequence.
-        index: usize,
-        /// Details of the denial.
-        denial: Denial,
-    },
-    /// Quota was exceeded for one shadow policy, so nothing was consumed but
-    /// the application may proceed.
-    ShadowDenied {
-        /// Index in the caller's original input sequence.
-        index: usize,
-        /// Quota-denial details.
-        denial: Denial,
-    },
+    Denied { index: usize, denial: Denial },
+    ShadowDenied { index: usize, denial: Denial },
 }
 
 impl BatchDecision {
+    /// Constructs an allowed batch, panicking if any member is a denial.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a member is an enforced or shadow denial.
+    pub fn allowed(decisions: Vec<Decision>) -> Self {
+        Self::try_allowed(decisions).expect("allowed batches can contain only allowed decisions")
+    }
+
+    /// Constructs an allowed batch from consumed allowed decisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecisionError::DeniedDecisionInAllowedBatch`] when a member is
+    /// an enforced or shadow denial.
+    pub fn try_allowed(decisions: Vec<Decision>) -> Result<Self, DecisionError> {
+        if let Some(index) = decisions
+            .iter()
+            .position(|decision| !decision.was_consumed())
+        {
+            return Err(DecisionError::DeniedDecisionInAllowedBatch { index });
+        }
+        Ok(Self {
+            outcome: BatchOutcome::Allowed(decisions),
+        })
+    }
+
+    /// Constructs an enforced batch denial.
+    pub fn denied(index: usize, denial: impl Into<Denial>) -> Self {
+        Self {
+            outcome: BatchOutcome::Denied {
+                index,
+                denial: denial.into(),
+            },
+        }
+    }
+
+    /// Constructs a shadow batch denial.
+    pub const fn shadow_denied(index: usize, denial: QuotaDenial) -> Self {
+        Self {
+            outcome: BatchOutcome::ShadowDenied {
+                index,
+                denial: Denial::quota_exceeded(denial),
+            },
+        }
+    }
+
     /// Returns whether the application may proceed.
     pub const fn permits_request(&self) -> bool {
-        !matches!(self, Self::Denied { .. })
+        !matches!(self.outcome, BatchOutcome::Denied { .. })
     }
 
     /// Returns whether evaluation encountered quota or capacity denial.
     pub const fn would_deny(&self) -> bool {
-        !matches!(self, Self::Allowed(_))
+        !matches!(self.outcome, BatchOutcome::Allowed(_))
     }
 
     /// Returns whether the application must reject the operation.
     pub const fn is_enforced_denial(&self) -> bool {
-        matches!(self, Self::Denied { .. })
+        matches!(self.outcome, BatchOutcome::Denied { .. })
     }
 
     /// Returns whether quota was exceeded in shadow mode.
     pub const fn is_shadow_denied(&self) -> bool {
-        matches!(self, Self::ShadowDenied { .. })
+        matches!(self.outcome, BatchOutcome::ShadowDenied { .. })
+    }
+
+    /// Returns allowed decisions in caller order, when the batch was allowed.
+    pub fn allowed_decisions(&self) -> Option<&[Decision]> {
+        match &self.outcome {
+            BatchOutcome::Allowed(decisions) => Some(decisions),
+            BatchOutcome::Denied { .. } | BatchOutcome::ShadowDenied { .. } => None,
+        }
+    }
+
+    /// Consumes an allowed batch and returns its decisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged batch when it is an enforced or shadow denial.
+    pub fn try_into_allowed(self) -> Result<Vec<Decision>, Self> {
+        match self.outcome {
+            BatchOutcome::Allowed(decisions) => Ok(decisions),
+            BatchOutcome::Denied { .. } | BatchOutcome::ShadowDenied { .. } => Err(self),
+        }
+    }
+
+    /// Returns the input index that caused a denial, when any.
+    pub const fn denied_index(&self) -> Option<usize> {
+        match self.outcome {
+            BatchOutcome::Allowed(_) => None,
+            BatchOutcome::Denied { index, .. } | BatchOutcome::ShadowDenied { index, .. } => {
+                Some(index)
+            }
+        }
+    }
+
+    /// Returns denial details for an enforced or shadow denial.
+    pub const fn denial(&self) -> Option<&Denial> {
+        match &self.outcome {
+            BatchOutcome::Allowed(_) => None,
+            BatchOutcome::Denied { denial, .. } | BatchOutcome::ShadowDenied { denial, .. } => {
+                Some(denial)
+            }
+        }
+    }
+
+    /// Returns quota-denial details for an enforced or shadow quota denial.
+    pub const fn quota_denial(&self) -> Option<QuotaDenial> {
+        match self.outcome {
+            BatchOutcome::Allowed(_) => None,
+            BatchOutcome::Denied { denial, .. } | BatchOutcome::ShadowDenied { denial, .. } => {
+                denial.quota()
+            }
+        }
     }
 
     /// Converts a batch-of-one outcome into its single-check decision.
@@ -267,76 +521,18 @@ impl BatchDecision {
     ///
     /// Returns the unchanged batch when it is not a valid batch-of-one result.
     pub fn try_into_single_decision(self) -> Result<Decision, Self> {
-        match self {
-            Self::Allowed(decisions) if matches!(decisions.as_slice(), [decision] if decision.was_consumed()) => {
+        match self.outcome {
+            BatchOutcome::Allowed(decisions) if matches!(decisions.as_slice(), [_]) => {
                 Ok(decisions[0])
             }
-            Self::Denied { index: 0, denial } => Ok(Decision::denied(denial)),
-            Self::ShadowDenied { index: 0, denial } => Ok(Decision::shadow_denied(denial)),
-            batch => Err(batch),
-        }
-    }
-}
-
-#[cfg(feature = "serde")]
-fn validate_denial(denial: &Denial) -> Result<(), &'static str> {
-    match denial {
-        Denial::QuotaExceeded { capacity, .. } => {
-            if *capacity == 0 {
-                return Err("a quota denial capacity must be greater than zero");
-            }
-            if *capacity > crate::MAX_LIMIT {
-                return Err("a quota denial capacity exceeds the portable maximum");
-            }
-        }
-        Denial::StorageCapacity { .. } => {}
-    }
-    Ok(())
-}
-
-#[cfg(feature = "serde")]
-fn validate_decision(decision: &Decision) -> Result<(), &'static str> {
-    match decision.outcome {
-        Outcome::Allowed(allowance) => {
-            if allowance.capacity == 0 {
-                return Err("an allowed decision capacity must be greater than zero");
-            }
-            if allowance.capacity > crate::MAX_LIMIT {
-                return Err("an allowed decision capacity exceeds the portable maximum");
-            }
-            if allowance.available > allowance.capacity {
-                return Err("allowed decision available quota exceeds its capacity");
-            }
-            Ok(())
-        }
-        Outcome::Denied(denial) => validate_denial(&denial),
-        Outcome::ShadowDenied(denial) => {
-            if !matches!(denial, Denial::QuotaExceeded { .. }) {
-                return Err("only quota exhaustion can be shadowed");
-            }
-            validate_denial(&denial)
-        }
-    }
-}
-
-#[cfg(feature = "serde")]
-fn validate_batch_decision(batch: &BatchDecision) -> Result<(), &'static str> {
-    match batch {
-        BatchDecision::Allowed(decisions) => {
-            if decisions.iter().any(|decision| !decision.was_consumed()) {
-                return Err("an allowed batch can contain only consumed allowed decisions");
-            }
-            for decision in decisions {
-                validate_decision(decision)?;
-            }
-            Ok(())
-        }
-        BatchDecision::Denied { denial, .. } => validate_denial(denial),
-        BatchDecision::ShadowDenied { denial, .. } => {
-            if !matches!(denial, Denial::QuotaExceeded { .. }) {
-                return Err("only quota exhaustion can be shadowed");
-            }
-            validate_denial(denial)
+            BatchOutcome::Denied { index: 0, denial } => Ok(Decision::denied(denial)),
+            BatchOutcome::ShadowDenied { index: 0, denial } => match denial.quota() {
+                Some(denial) => Ok(Decision::shadow_denied(denial)),
+                None => Err(Self {
+                    outcome: BatchOutcome::ShadowDenied { index: 0, denial },
+                }),
+            },
+            outcome => Err(Self { outcome }),
         }
     }
 }
@@ -373,16 +569,14 @@ impl serde::Serialize for Denial {
     where
         S: serde::Serializer,
     {
-        validate_denial(self).map_err(<S::Error as serde::ser::Error>::custom)?;
-        let wire = match *self {
-            Self::QuotaExceeded {
-                capacity,
-                retry_after,
-            } => DenialRef::QuotaExceeded {
-                capacity,
-                retry_after,
+        let wire = match self.reason {
+            DenialReason::QuotaExceeded(denial) => DenialRef::QuotaExceeded {
+                capacity: denial.capacity(),
+                retry_after: denial.retry_after(),
             },
-            Self::StorageCapacity { retry_after } => DenialRef::StorageCapacity { retry_after },
+            DenialReason::StorageCapacity { retry_after } => {
+                DenialRef::StorageCapacity { retry_after }
+            }
         };
         serde::Serialize::serialize(&wire, serializer)
     }
@@ -395,18 +589,15 @@ impl<'de> serde::Deserialize<'de> for Denial {
         D: serde::Deserializer<'de>,
     {
         let wire = <DenialWire as serde::Deserialize>::deserialize(deserializer)?;
-        let denial = match wire {
+        match wire {
             DenialWire::QuotaExceeded {
                 capacity,
                 retry_after,
-            } => Self::QuotaExceeded {
-                capacity,
-                retry_after,
-            },
-            DenialWire::StorageCapacity { retry_after } => Self::StorageCapacity { retry_after },
-        };
-        validate_denial(&denial).map_err(serde::de::Error::custom)?;
-        Ok(denial)
+            } => QuotaDenial::try_new(capacity, retry_after)
+                .map(Self::quota_exceeded)
+                .map_err(serde::de::Error::custom),
+            DenialWire::StorageCapacity { retry_after } => Ok(Self::storage_capacity(retry_after)),
+        }
     }
 }
 
@@ -450,7 +641,6 @@ impl serde::Serialize for Decision {
     where
         S: serde::Serializer,
     {
-        validate_decision(self).map_err(<S::Error as serde::ser::Error>::custom)?;
         let wire = match &self.outcome {
             Outcome::Allowed(allowance) => DecisionRef::Allowed {
                 capacity: allowance.capacity,
@@ -471,17 +661,19 @@ impl<'de> serde::Deserialize<'de> for Decision {
         D: serde::Deserializer<'de>,
     {
         let wire = <DecisionWire as serde::Deserialize>::deserialize(deserializer)?;
-        let decision = match wire {
+        match wire {
             DecisionWire::Allowed {
                 capacity,
                 available,
                 replenishes_after,
-            } => Self::allowed(capacity, available, replenishes_after),
-            DecisionWire::Denied { denial } => Self::denied(denial),
-            DecisionWire::ShadowDenied { denial } => Self::shadow_denied(denial),
-        };
-        validate_decision(&decision).map_err(serde::de::Error::custom)?;
-        Ok(decision)
+            } => Self::try_allowed(capacity, available, replenishes_after)
+                .map_err(serde::de::Error::custom),
+            DecisionWire::Denied { denial } => Ok(Self::denied(denial)),
+            DecisionWire::ShadowDenied { denial } => denial
+                .quota()
+                .map(Self::shadow_denied)
+                .ok_or_else(|| serde::de::Error::custom("only quota exhaustion can be shadowed")),
+        }
     }
 }
 
@@ -509,14 +701,13 @@ impl serde::Serialize for BatchDecision {
     where
         S: serde::Serializer,
     {
-        validate_batch_decision(self).map_err(<S::Error as serde::ser::Error>::custom)?;
-        let wire = match self {
-            Self::Allowed(decisions) => BatchDecisionRef::Allowed { decisions },
-            Self::Denied { index, denial } => BatchDecisionRef::Denied {
+        let wire = match &self.outcome {
+            BatchOutcome::Allowed(decisions) => BatchDecisionRef::Allowed { decisions },
+            BatchOutcome::Denied { index, denial } => BatchDecisionRef::Denied {
                 index: *index,
                 denial,
             },
-            Self::ShadowDenied { index, denial } => BatchDecisionRef::ShadowDenied {
+            BatchOutcome::ShadowDenied { index, denial } => BatchDecisionRef::ShadowDenied {
                 index: *index,
                 denial,
             },
@@ -532,15 +723,16 @@ impl<'de> serde::Deserialize<'de> for BatchDecision {
         D: serde::Deserializer<'de>,
     {
         let wire = <BatchDecisionWire as serde::Deserialize>::deserialize(deserializer)?;
-        let batch = match wire {
-            BatchDecisionWire::Allowed { decisions } => Self::Allowed(decisions),
-            BatchDecisionWire::Denied { index, denial } => Self::Denied { index, denial },
-            BatchDecisionWire::ShadowDenied { index, denial } => {
-                Self::ShadowDenied { index, denial }
+        match wire {
+            BatchDecisionWire::Allowed { decisions } => {
+                Self::try_allowed(decisions).map_err(serde::de::Error::custom)
             }
-        };
-        validate_batch_decision(&batch).map_err(serde::de::Error::custom)?;
-        Ok(batch)
+            BatchDecisionWire::Denied { index, denial } => Ok(Self::denied(index, denial)),
+            BatchDecisionWire::ShadowDenied { index, denial } => denial
+                .quota()
+                .map(|denial| Self::shadow_denied(index, denial))
+                .ok_or_else(|| serde::de::Error::custom("only quota exhaustion can be shadowed")),
+        }
     }
 }
 
@@ -557,11 +749,19 @@ const fn ceil_seconds(duration: Duration) -> u64 {
 mod tests {
     use std::time::Duration;
 
-    use super::{BatchDecision, Decision, Denial};
+    use super::{BatchDecision, Decision, DecisionError, Denial, DenialKind, QuotaDenial};
+
+    fn allowed(capacity: u64, available: u64, replenishes_after: Duration) -> Decision {
+        Decision::try_allowed(capacity, available, replenishes_after).unwrap()
+    }
+
+    fn quota(capacity: u64, retry_after: Duration) -> QuotaDenial {
+        QuotaDenial::try_new(capacity, retry_after).unwrap()
+    }
 
     #[test]
     fn allowed_decision_exposes_available_and_replenishment() {
-        let decision = Decision::allowed(8, 7, Duration::from_millis(59_999));
+        let decision = allowed(8, 7, Duration::from_millis(59_999));
 
         assert!(decision.is_allowed());
         assert!(!decision.is_denied());
@@ -577,10 +777,8 @@ mod tests {
 
     #[test]
     fn quota_denial_exposes_exact_and_ceiling_retry_duration() {
-        let denial = Denial::QuotaExceeded {
-            capacity: 8,
-            retry_after: Duration::from_millis(1_001),
-        };
+        let quota = quota(8, Duration::from_millis(1_001));
+        let denial = Denial::quota_exceeded(quota);
         let decision = Decision::denied(denial);
 
         assert!(decision.is_denied());
@@ -590,21 +788,13 @@ mod tests {
         assert_eq!(decision.retry_after(), Some(Duration::from_millis(1_001)));
         assert_eq!(decision.retry_after_seconds(), Some(2));
         assert_eq!(decision.denial(), Some(&denial));
-        assert!(matches!(
-            denial,
-            Denial::QuotaExceeded {
-                capacity: 8,
-                retry_after
-            } if retry_after == Duration::from_millis(1_001)
-        ));
+        assert_eq!(denial.kind(), DenialKind::QuotaExceeded);
+        assert_eq!(denial.quota(), Some(quota));
     }
 
     #[test]
     fn retry_after_seconds_preserves_exact_seconds() {
-        let denial = Denial::QuotaExceeded {
-            capacity: 1,
-            retry_after: Duration::from_secs(3),
-        };
+        let denial = Denial::quota_exceeded(quota(1, Duration::from_secs(3)));
 
         assert_eq!(denial.retry_after_seconds(), Some(3));
     }
@@ -612,10 +802,7 @@ mod tests {
     #[test]
     fn retry_after_seconds_saturates_without_losing_exact_duration() {
         let duration = Duration::new(u64::MAX, 1);
-        let denial = Denial::QuotaExceeded {
-            capacity: 1,
-            retry_after: duration,
-        };
+        let denial = Denial::quota_exceeded(quota(1, duration));
 
         assert_eq!(denial.retry_after(), Some(duration));
         assert_eq!(denial.retry_after_seconds(), Some(u64::MAX));
@@ -623,13 +810,10 @@ mod tests {
 
     #[test]
     fn storage_capacity_retry_can_be_unknown() {
-        let denial = Denial::StorageCapacity { retry_after: None };
+        let denial = Denial::storage_capacity(None);
         let decision = Decision::denied(denial);
 
-        assert!(matches!(
-            denial,
-            Denial::StorageCapacity { retry_after: None }
-        ));
+        assert_eq!(denial.kind(), DenialKind::StorageCapacity);
         assert_eq!(denial.retry_after(), None);
         assert_eq!(denial.retry_after_seconds(), None);
         assert_eq!(decision.capacity(), None);
@@ -638,51 +822,44 @@ mod tests {
 
     #[test]
     fn batch_of_one_converts_to_a_single_decision() {
-        let allowed = Decision::allowed(8, 7, Duration::from_secs(60));
-        let denied = Denial::QuotaExceeded {
-            capacity: 8,
-            retry_after: Duration::from_secs(60),
-        };
+        let allowed = allowed(8, 7, Duration::from_secs(60));
+        let denied = quota(8, Duration::from_secs(60));
 
         assert_eq!(
-            BatchDecision::Allowed(vec![allowed]).try_into_single_decision(),
+            BatchDecision::try_allowed(vec![allowed])
+                .unwrap()
+                .try_into_single_decision(),
             Ok(allowed)
         );
         assert_eq!(
-            BatchDecision::Denied {
-                index: 0,
-                denial: denied
-            }
-            .try_into_single_decision(),
+            BatchDecision::denied(0, denied).try_into_single_decision(),
             Ok(Decision::denied(denied))
         );
     }
 
     #[test]
     fn malformed_batch_of_one_is_rejected() {
-        let decision = Decision::allowed(8, 7, Duration::from_secs(60));
-        let denial = Denial::QuotaExceeded {
-            capacity: 8,
-            retry_after: Duration::from_secs(60),
-        };
+        let decision = allowed(8, 7, Duration::from_secs(60));
+        let denial = quota(8, Duration::from_secs(60));
 
         assert!(
-            BatchDecision::Allowed(Vec::new())
+            BatchDecision::try_allowed(Vec::new())
+                .unwrap()
                 .try_into_single_decision()
                 .is_err()
         );
         assert!(
-            BatchDecision::Allowed(vec![decision, decision])
+            BatchDecision::try_allowed(vec![decision, decision])
+                .unwrap()
                 .try_into_single_decision()
                 .is_err()
         );
-        assert!(
-            BatchDecision::Allowed(vec![Decision::denied(denial)])
-                .try_into_single_decision()
-                .is_err()
+        assert_eq!(
+            BatchDecision::try_allowed(vec![Decision::denied(denial)]),
+            Err(DecisionError::DeniedDecisionInAllowedBatch { index: 0 })
         );
         assert!(
-            BatchDecision::Denied { index: 1, denial }
+            BatchDecision::denied(1, denial)
                 .try_into_single_decision()
                 .is_err()
         );
@@ -690,10 +867,7 @@ mod tests {
 
     #[test]
     fn shadow_denial_permits_the_request_without_claiming_consumption() {
-        let denial = Denial::QuotaExceeded {
-            capacity: 8,
-            retry_after: Duration::from_secs(30),
-        };
+        let denial = quota(8, Duration::from_secs(30));
         let decision = Decision::shadow_denied(denial);
 
         assert!(decision.is_allowed());
@@ -704,8 +878,23 @@ mod tests {
         assert_eq!(decision.available(), None);
         assert_eq!(decision.retry_after(), Some(Duration::from_secs(30)));
         assert_eq!(
-            BatchDecision::ShadowDenied { index: 0, denial }.try_into_single_decision(),
+            BatchDecision::shadow_denied(0, denial).try_into_single_decision(),
             Ok(decision)
+        );
+    }
+
+    #[test]
+    fn invalid_decision_metadata_is_rejected_at_construction() {
+        assert_eq!(
+            QuotaDenial::try_new(0, Duration::ZERO),
+            Err(DecisionError::InvalidCapacity { capacity: 0 })
+        );
+        assert_eq!(
+            Decision::try_allowed(8, 9, Duration::ZERO),
+            Err(DecisionError::AvailableExceedsCapacity {
+                capacity: 8,
+                available: 9,
+            })
         );
     }
 }

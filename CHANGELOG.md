@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** replace directly constructible decision and denial enum states
+  with validated constructors and read-only accessors. Shadow denials now
+  require `QuotaDenial`, allowed batches reject denied members, and the Serde
+  wire representation remains unchanged.
+
 ## [0.2.1] - 2026-08-08
 
 ### Added

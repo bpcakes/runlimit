@@ -41,11 +41,10 @@ fn key(byte: u8) -> SubjectKey {
 }
 
 fn expect_allowed<E: Debug>(result: Result<BatchDecision, E>) -> Vec<runlimit_core::Decision> {
-    match result.expect("generic limiter call succeeds") {
-        BatchDecision::Allowed(decisions) => decisions,
-        BatchDecision::Denied { .. } => panic!("generic limiter call should be allowed"),
-        _ => panic!("generic limiter call returned an unknown batch outcome"),
-    }
+    result
+        .expect("generic limiter call succeeds")
+        .try_into_allowed()
+        .expect("generic limiter call should be allowed")
 }
 
 #[tokio::test]
@@ -70,13 +69,13 @@ async fn one_generic_function_swaps_between_backends() {
     );
     assert_eq!(
         check_batch(&memory, &[]).await,
-        Ok(BatchDecision::Allowed(Vec::new()))
+        Ok(BatchDecision::allowed(Vec::new()))
     );
     assert_eq!(
         check_batch(&postgres, &[])
             .await
             .expect("an empty PostgreSQL batch needs no connection"),
-        BatchDecision::Allowed(Vec::new())
+        BatchDecision::allowed(Vec::new())
     );
     assert!(matches!(
         check_batch(&memory, &duplicate_checks).await,

@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -20,11 +20,11 @@ publish = ["crates-io"]
 [workspace.dependencies]
 axum = { version = "0.8.4", default-features = false }
 http-body = "1.0.1"
-runlimit-core = { version = "0.2.1", path = "crates/runlimit-core" }
-runlimit-axum = { version = "0.2.1", path = "crates/runlimit-axum" }
-runlimit-http = { version = "0.2.1", path = "crates/runlimit-http" }
-runlimit-memory = { version = "0.2.1", path = "crates/runlimit-memory" }
-runlimit-postgres = { version = "0.2.1", path = "crates/runlimit-postgres" }
+runlimit-core = { version = "0.3.0", path = "crates/runlimit-core" }
+runlimit-axum = { version = "0.3.0", path = "crates/runlimit-axum" }
+runlimit-http = { version = "0.3.0", path = "crates/runlimit-http" }
+runlimit-memory = { version = "0.3.0", path = "crates/runlimit-memory" }
+runlimit-postgres = { version = "0.3.0", path = "crates/runlimit-postgres" }
 hmac = { version = "0.13.0", features = ["zeroize"] }
 http = "1.4.2"
 serde = { version = "1.0.219", features = ["derive"] }

@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use runlimit_core::{
-    BatchDecision, Decision, Denial, FixedWindowPolicy, GcraPolicy, MAX_WINDOW_MILLIS, PolicyId,
-    QuotaMode, ScopeId,
+    BatchDecision, Decision, DecisionError, Denial, FixedWindowPolicy, GcraPolicy,
+    MAX_WINDOW_MILLIS, PolicyId, QuotaDenial, QuotaMode, ScopeId,
 };
 use serde_json::json;
 
@@ -151,13 +151,10 @@ fn gcra_policy_has_a_validated_wire_contract() {
 
 #[test]
 fn decisions_and_denials_have_exact_tagged_wire_shapes() {
-    let allowed = Decision::allowed(8, 7, Duration::new(1, 234_567));
-    let quota_denial = Denial::QuotaExceeded {
-        capacity: 8,
-        retry_after: Duration::new(2, 345_678),
-    };
+    let allowed = Decision::try_allowed(8, 7, Duration::new(1, 234_567)).unwrap();
+    let quota_denial = QuotaDenial::try_new(8, Duration::new(2, 345_678)).unwrap();
     let denied = Decision::denied(quota_denial);
-    let storage_denial = Denial::StorageCapacity { retry_after: None };
+    let storage_denial = Denial::storage_capacity(None);
 
     assert_eq!(
         serde_json::to_value(allowed).unwrap(),
@@ -234,21 +231,22 @@ fn decision_deserialization_rejects_impossible_metadata() {
 }
 
 #[test]
-fn invalid_constructed_decisions_are_not_serialized() {
-    assert!(serde_json::to_value(Decision::allowed(8, 9, Duration::from_secs(1))).is_err());
+fn invalid_decisions_cannot_be_constructed() {
+    assert_eq!(
+        Decision::try_allowed(8, 9, Duration::from_secs(1)),
+        Err(DecisionError::AvailableExceedsCapacity {
+            capacity: 8,
+            available: 9,
+        })
+    );
 }
 
 #[test]
 fn zero_response_durations_round_trip_without_losing_backend_metadata() {
     let values = [
-        Decision::allowed(8, 7, Duration::ZERO),
-        Decision::denied(Denial::QuotaExceeded {
-            capacity: 8,
-            retry_after: Duration::ZERO,
-        }),
-        Decision::denied(Denial::StorageCapacity {
-            retry_after: Some(Duration::ZERO),
-        }),
+        Decision::try_allowed(8, 7, Duration::ZERO).unwrap(),
+        Decision::denied(QuotaDenial::try_new(8, Duration::ZERO).unwrap()),
+        Decision::denied(Denial::storage_capacity(Some(Duration::ZERO))),
     ];
 
     for decision in values {
@@ -259,10 +257,8 @@ fn zero_response_durations_round_trip_without_losing_backend_metadata() {
 
 #[test]
 fn shadow_decisions_round_trip_but_storage_capacity_cannot_be_shadowed() {
-    let decision = Decision::shadow_denied(Denial::QuotaExceeded {
-        capacity: 8,
-        retry_after: Duration::from_secs(1),
-    });
+    let decision =
+        Decision::shadow_denied(QuotaDenial::try_new(8, Duration::from_secs(1)).unwrap());
     let value = serde_json::to_value(decision).unwrap();
 
     assert_eq!(
@@ -278,8 +274,9 @@ fn shadow_decisions_round_trip_but_storage_capacity_cannot_be_shadowed() {
     );
     assert_eq!(serde_json::from_value::<Decision>(value).unwrap(), decision);
     assert!(
-        serde_json::to_value(Decision::shadow_denied(Denial::StorageCapacity {
-            retry_after: None
+        serde_json::from_value::<Decision>(json!({
+            "outcome": "shadow_denied",
+            "denial": {"reason": "storage_capacity", "retry_after": null}
         }))
         .is_err()
     );
@@ -287,16 +284,12 @@ fn shadow_decisions_round_trip_but_storage_capacity_cannot_be_shadowed() {
 
 #[test]
 fn batch_decisions_round_trip_and_reject_denied_members_in_allowed_batches() {
-    let allowed = BatchDecision::Allowed(vec![
-        Decision::allowed(8, 7, Duration::from_secs(60)),
-        Decision::allowed(3, 1, Duration::from_millis(750)),
-    ]);
-    let denied = BatchDecision::Denied {
-        index: 1,
-        denial: Denial::StorageCapacity {
-            retry_after: Some(Duration::from_millis(5)),
-        },
-    };
+    let allowed = BatchDecision::try_allowed(vec![
+        Decision::try_allowed(8, 7, Duration::from_secs(60)).unwrap(),
+        Decision::try_allowed(3, 1, Duration::from_millis(750)).unwrap(),
+    ])
+    .unwrap();
+    let denied = BatchDecision::denied(1, Denial::storage_capacity(Some(Duration::from_millis(5))));
 
     assert_eq!(
         serde_json::from_value::<BatchDecision>(serde_json::to_value(&allowed).unwrap()).unwrap(),
@@ -333,12 +326,9 @@ fn batch_decisions_round_trip_and_reject_denied_members_in_allowed_batches() {
         .is_err()
     );
     assert!(
-        serde_json::to_value(BatchDecision::Allowed(vec![Decision::denied(
-            Denial::QuotaExceeded {
-                capacity: 8,
-                retry_after: Duration::from_secs(1),
-            }
-        )]))
+        BatchDecision::try_allowed(vec![Decision::denied(
+            QuotaDenial::try_new(8, Duration::from_secs(1)).unwrap()
+        )])
         .is_err()
     );
 }

@@ -26,7 +26,7 @@ use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use runlimit_axum::{RateLimitLayer, RateLimitRejection, RejectionKind};
 use runlimit_core::{
-    BatchDecision, Check, Decision, Denial, FixedWindowPolicy, Limiter, PolicyId, ScopeId,
+    BatchDecision, Check, Decision, FixedWindowPolicy, Limiter, PolicyId, QuotaDenial, ScopeId,
     SubjectKey,
 };
 use tower::{Layer, Service, ServiceExt, service_fn};
@@ -181,10 +181,7 @@ async fn allowed_request_proceeds_with_decision_extension() {
 
 #[tokio::test]
 async fn enforced_denial_is_mapped_and_short_circuits_inner_service() {
-    let decision = Decision::denied(Denial::QuotaExceeded {
-        capacity: 8,
-        retry_after: Duration::from_secs(17),
-    });
+    let decision = Decision::denied(QuotaDenial::new(8, Duration::from_secs(17)));
     let limiter = StubLimiter::returning(decision);
     let inner_calls = Arc::new(AtomicUsize::new(0));
     let inner_calls_for_service = Arc::clone(&inner_calls);
@@ -218,10 +215,7 @@ async fn enforced_denial_is_mapped_and_short_circuits_inner_service() {
 
 #[tokio::test]
 async fn shadow_denial_proceeds_with_decision_extension() {
-    let decision = Decision::shadow_denied(Denial::QuotaExceeded {
-        capacity: 8,
-        retry_after: Duration::from_secs(17),
-    });
+    let decision = Decision::shadow_denied(QuotaDenial::new(8, Duration::from_secs(17)));
     let limiter = StubLimiter::returning(decision);
     let inner = service_fn(move |request: Request<Body>| async move {
         assert_eq!(request.extensions().get::<Decision>(), Some(&decision));
@@ -439,10 +433,10 @@ async fn rejected_request_body_is_never_polled() {
         ready(Ok::<_, Infallible>(response(StatusCode::NO_CONTENT)))
     });
     let layer = RateLimitLayer::new(
-        StubLimiter::returning(Decision::denied(Denial::QuotaExceeded {
-            capacity: 8,
-            retry_after: Duration::from_secs(5),
-        })),
+        StubLimiter::returning(Decision::denied(QuotaDenial::new(
+            8,
+            Duration::from_secs(5),
+        ))),
         policy(),
         |_request: &Request<ProbeBody>, _policy: &FixedWindowPolicy| {
             Ok::<_, Infallible>(subject(8))

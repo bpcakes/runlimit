@@ -51,7 +51,7 @@ If either quota is unavailable, neither counter is consumed.
 ```rust
 use std::{env, error::Error, time::Duration};
 
-use runlimit_core::{BatchDecision, Check, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId};
+use runlimit_core::{Check, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId};
 use runlimit_memory::{MemoryStore, MemoryStoreConfig};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -83,18 +83,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         Check::new(&identity_policy, identity),
     ];
 
-    match limiter.check_all(&checks)? {
-        BatchDecision::Allowed(decisions) => {
-            assert_eq!(decisions.len(), checks.len());
-            println!("request admitted");
-        }
-        BatchDecision::Denied { index, denial } => match denial.retry_after_seconds() {
+    let decision = limiter.check_all(&checks)?;
+    if let Some(decisions) = decision.allowed_decisions() {
+        assert_eq!(decisions.len(), checks.len());
+        println!("request admitted");
+    } else if decision.is_enforced_denial() {
+        let index = decision.denied_index().expect("denials name an input");
+        let denial = decision.denial().expect("denials include details");
+        match denial.retry_after_seconds() {
             Some(seconds) => {
                 println!("check {index} denied; retry after {seconds} seconds");
             }
             None => println!("check {index} denied; retry time unavailable"),
-        },
-        _ => return Err("unsupported batch decision variant".into()),
+        }
+    } else if decision.is_shadow_denied() {
+        println!("request admitted after shadow denial");
+    } else {
+        return Err("unsupported batch decision state".into());
     }
 
     Ok(())
@@ -319,7 +324,7 @@ same time can each admit traffic against different counters.
   capacity }`. This is a structural error: waiting for expiry cannot make the
   batch fit.
 - A new key that cannot fit in its shard is denied with
-  `Denial::StorageCapacity`, optionally including the earliest known retry
+  `Denial::storage_capacity`, optionally including the earliest known retry
   duration when the same operation may fit after existing entries expire.
 
 If application code panics while holding a shard lock, that shard remains
@@ -365,7 +370,7 @@ shards. `PostgresConfig::maximum_rows_per_shard` defaults to 4,096 and can be
 lowered or raised through the database-enforced maximum of 65,536. Admission
 locks the affected ledger shards and reserves all missing batch keys in the
 same transaction as quota consumption. A full shard denies new keys with
-`Denial::StorageCapacity`; existing keys remain usable and active rows are
+`Denial::storage_capacity`; existing keys remain usable and active rows are
 never evicted. The migration's trigger-maintained ledger also caps inserts
 from older replicas at 65,536 rows per shard during a rolling deployment.
 

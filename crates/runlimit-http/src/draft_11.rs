@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
-use runlimit_core::{Decision, Denial, RateLimitPolicy};
+use runlimit_core::{Decision, RateLimitPolicy};
 use thiserror::Error;
 
 /// Largest integer representable by an RFC 9651 Structured Field.
@@ -77,13 +77,12 @@ pub fn quota_policy<P: RateLimitPolicy + ?Sized>(
 /// quota service metadata.
 pub fn service_limit(name: &str, decision: &Decision) -> Result<HeaderField, EncodingError> {
     let name = encode_policy_name(name)?;
-    let (available, effective_window) = match (
-        decision.available(),
-        decision.replenishes_after(),
-        decision.denial(),
-    ) {
-        (Some(available), Some(replenishes_after), None) => (available, replenishes_after),
-        (None, None, Some(Denial::QuotaExceeded { retry_after, .. })) => (0, *retry_after),
+    let (available, effective_window) = match (decision.available(), decision.replenishes_after()) {
+        (Some(available), Some(replenishes_after)) => (available, replenishes_after),
+        (None, None) => match decision.quota_denial() {
+            Some(denial) => (0, denial.retry_after()),
+            None => return Err(EncodingError::UnsupportedDecision),
+        },
         _ => return Err(EncodingError::UnsupportedDecision),
     };
     let available = structured_integer(available)?;
@@ -195,8 +194,8 @@ mod tests {
     use std::time::Duration;
 
     use runlimit_core::{
-        Decision, Denial, FixedWindowPolicy, GcraPolicy, PolicyFingerprint, PolicyId, QuotaMode,
-        RateLimitPolicy, ScopeId,
+        Decision, Denial, FixedWindowPolicy, GcraPolicy, PolicyFingerprint, PolicyId, QuotaDenial,
+        QuotaMode, RateLimitPolicy, ScopeId,
     };
 
     use super::{
@@ -285,10 +284,7 @@ mod tests {
 
     #[test]
     fn quota_and_shadow_denials_are_would_deny_service_values() {
-        let denial = Denial::QuotaExceeded {
-            capacity: 10,
-            retry_after: Duration::from_millis(1_001),
-        };
+        let denial = QuotaDenial::try_new(10, Duration::from_millis(1_001)).unwrap();
 
         assert_eq!(
             service_limit("default", &Decision::denied(denial))
@@ -414,17 +410,11 @@ mod tests {
 
     #[test]
     fn rejects_capacity_denials_as_quota_service_limits() {
-        for decision in [
-            Decision::denied(Denial::StorageCapacity {
-                retry_after: Some(Duration::from_secs(1)),
-            }),
-            Decision::shadow_denied(Denial::StorageCapacity { retry_after: None }),
-        ] {
-            assert_eq!(
-                service_limit("default", &decision),
-                Err(EncodingError::UnsupportedDecision)
-            );
-        }
+        let decision = Decision::denied(Denial::storage_capacity(Some(Duration::from_secs(1))));
+        assert_eq!(
+            service_limit("default", &decision),
+            Err(EncodingError::UnsupportedDecision)
+        );
     }
 
     #[test]
