@@ -103,6 +103,21 @@ use sqlx::{
 };
 use tokio::time::Instant;
 
+#[derive(Debug)]
+pub(crate) enum ConnectionOutcome<T> {
+    Reusable(T),
+    MustClose(T),
+}
+
+impl<T> ConnectionOutcome<T> {
+    fn map<U>(self, map: impl FnOnce(T) -> U) -> ConnectionOutcome<U> {
+        match self {
+            Self::Reusable(value) => ConnectionOutcome::Reusable(map(value)),
+            Self::MustClose(value) => ConnectionOutcome::MustClose(map(value)),
+        }
+    }
+}
+
 mod admission;
 mod config;
 mod errors;
@@ -117,10 +132,13 @@ use admission::{
     BatchSqlInput, acquire_check_connection, run_check_transaction, single_decision_from_batch,
 };
 use errors::check_error_consumption;
-use maintenance::{MaintenanceRunError, acquire_maintenance_connection, run_cleanup_transaction};
+use maintenance::{acquire_maintenance_connection, run_cleanup_transaction};
 
 #[cfg(test)]
-use admission::{PendingAllowance, PendingDenial, database_integer, finish_denied_transaction};
+use admission::{
+    PendingAllowance, PendingBatchDenial, PendingDenial, PendingQuotaDenial, database_integer,
+    finish_denied_transaction,
+};
 #[cfg(test)]
 use protocol::{
     BATCH_PREFLIGHT_SQL, BATCH_UPSERT_SQL, CLEANUP_SQL, advisory_lock_id, capacity_shard,
@@ -260,7 +278,7 @@ impl PostgresLimiter {
             .run_direct(&mut **guarded_connection.connection())
             .await;
         if result.is_ok() {
-            guarded_connection.disarm();
+            guarded_connection.reuse();
         }
         result
     }
@@ -338,7 +356,7 @@ impl PostgresLimiter {
         // rollback, and commit.
         let deadline = Instant::now() + self.config.operation_timeout();
         let mut guarded_connection = ConnectionCancellationGuard::new(connection);
-        let result = run_check_transaction(
+        let outcome = run_check_transaction(
             guarded_connection.connection(),
             &input,
             checks,
@@ -346,20 +364,7 @@ impl PostgresLimiter {
             deadline,
         )
         .await;
-        match result {
-            Ok(outcome) => {
-                if outcome.connection_reusable {
-                    guarded_connection.disarm();
-                }
-                Ok(outcome.decision)
-            }
-            Err(error) => {
-                if !error.client_timeout_won() {
-                    guarded_connection.disarm();
-                }
-                Err(error.into_public())
-            }
-        }
+        guarded_connection.finish(outcome)
     }
 
     /// Deletes at most `maximum_rows` expired windows and releases their
@@ -393,15 +398,9 @@ impl PostgresLimiter {
             acquire_maintenance_connection(&self.pool, self.config.pool_acquire_timeout()).await?;
         let deadline = Instant::now() + self.config.operation_timeout();
         let mut guarded_connection = ConnectionCancellationGuard::new(connection);
-        let result =
+        let outcome =
             run_cleanup_transaction(guarded_connection.connection(), maximum_rows, deadline).await;
-        if !result
-            .as_ref()
-            .is_err_and(MaintenanceRunError::client_timeout_won)
-        {
-            guarded_connection.disarm();
-        }
-        result.map_err(MaintenanceRunError::into_public)
+        guarded_connection.finish(outcome)
     }
 
     fn observe_single_admission(
@@ -532,8 +531,18 @@ impl ConnectionCancellationGuard {
         &mut self.connection
     }
 
-    const fn disarm(&mut self) {
+    const fn reuse(&mut self) {
         self.armed = false;
+    }
+
+    fn finish<T, E>(mut self, outcome: ConnectionOutcome<Result<T, E>>) -> Result<T, E> {
+        match outcome {
+            ConnectionOutcome::Reusable(result) => {
+                self.reuse();
+                result
+            }
+            ConnectionOutcome::MustClose(result) => result,
+        }
     }
 }
 
@@ -712,10 +721,10 @@ mod tests {
             reset_from_sample: Duration::from_millis(250),
         }
         .finish(Duration::from_millis(80));
-        let denied = PendingDenial::QuotaExceeded {
+        let denied = PendingDenial::Quota(PendingQuotaDenial {
             limit: 10,
             retry_from_sample: Duration::from_millis(150),
-        }
+        })
         .finish(Duration::from_millis(80));
 
         assert_eq!(
@@ -730,12 +739,13 @@ mod tests {
     async fn denied_decision_survives_rollback_failure_and_discards_connection() {
         let outcome = finish_denied_transaction(
             Instant::now() + Duration::from_secs(1),
-            2,
-            PendingDenial::QuotaExceeded {
-                limit: 10,
-                retry_from_sample: Duration::from_millis(150),
+            PendingBatchDenial::Enforced {
+                index: 2,
+                denial: PendingDenial::Quota(PendingQuotaDenial {
+                    limit: 10,
+                    retry_from_sample: Duration::from_millis(150),
+                }),
             },
-            false,
             Duration::from_millis(20),
             std::future::ready(Err(sqlx::Error::Protocol(
                 "injected rollback failure".to_owned(),
@@ -744,66 +754,65 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome.decision,
-            BatchDecision::Denied {
+            outcome,
+            ConnectionOutcome::MustClose(BatchDecision::Denied {
                 index: 2,
                 denial: Denial::QuotaExceeded {
                     capacity: 10,
                     retry_after
                 }
-            } if retry_after == Duration::from_millis(130)
+            }) if retry_after == Duration::from_millis(130)
         ));
-        assert!(!outcome.connection_reusable);
     }
 
     #[tokio::test]
     async fn denied_decision_survives_rollback_deadline_and_discards_connection() {
         let outcome = finish_denied_transaction(
             Instant::now(),
-            0,
-            PendingDenial::QuotaExceeded {
-                limit: 1,
-                retry_from_sample: Duration::from_millis(50),
+            PendingBatchDenial::Enforced {
+                index: 0,
+                denial: PendingDenial::Quota(PendingQuotaDenial {
+                    limit: 1,
+                    retry_from_sample: Duration::from_millis(50),
+                }),
             },
-            false,
             Duration::ZERO,
             std::future::pending(),
         )
         .await;
 
         assert!(matches!(
-            outcome.decision,
-            BatchDecision::Denied {
+            outcome,
+            ConnectionOutcome::MustClose(BatchDecision::Denied {
                 index: 0,
                 denial: Denial::QuotaExceeded { capacity: 1, .. }
-            }
+            })
         ));
-        assert!(!outcome.connection_reusable);
     }
 
     #[tokio::test]
     async fn shadow_quota_denial_is_reported_after_rollback() {
         let outcome = finish_denied_transaction(
             Instant::now() + Duration::from_secs(1),
-            0,
-            PendingDenial::QuotaExceeded {
-                limit: 1,
-                retry_from_sample: Duration::from_secs(1),
+            PendingBatchDenial::Shadow {
+                index: 0,
+                denial: PendingQuotaDenial {
+                    limit: 1,
+                    retry_from_sample: Duration::from_secs(1),
+                },
             },
-            true,
             Duration::ZERO,
             std::future::ready(Ok(())),
         )
         .await;
 
         assert!(matches!(
-            outcome.decision,
-            BatchDecision::ShadowDenied {
+            outcome,
+            ConnectionOutcome::Reusable(BatchDecision::ShadowDenied {
                 index: 0,
                 denial: Denial::QuotaExceeded { capacity: 1, .. }
-            }
+            })
         ));
-        assert!(outcome.connection_reusable);
     }
 
     #[test]

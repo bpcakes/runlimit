@@ -10,7 +10,7 @@ use sqlx::{
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::{
-    CheckError,
+    CheckError, ConnectionOutcome,
     protocol::{
         BATCH_ADVISORY_LOCK_SQL, BATCH_CAPACITY_LOCK_SQL, BATCH_PREFLIGHT_SQL, BATCH_ROW_LOCK_SQL,
         BATCH_UPSERT_SQL, CAPACITY_SHARD_COUNT, SET_LOCAL_TIMEOUTS_SQL, advisory_lock_id,
@@ -29,44 +29,6 @@ pub(crate) fn single_decision_from_batch(batch: BatchDecision) -> Result<Decisio
             // the public error's consumption classification conservative.
             _ => CheckError::CommittedResponseInvariant,
         })
-}
-
-#[derive(Debug)]
-pub(crate) enum CheckRunError {
-    Public(CheckError),
-    ClientTimedOutBeforeCommit { operation: &'static str },
-    ClientCommitTimedOut,
-}
-
-#[derive(Debug)]
-pub(crate) struct CheckRunOutcome {
-    pub(crate) decision: BatchDecision,
-    pub(crate) connection_reusable: bool,
-}
-
-impl CheckRunError {
-    pub(crate) const fn client_timeout_won(&self) -> bool {
-        matches!(
-            self,
-            Self::ClientTimedOutBeforeCommit { .. } | Self::ClientCommitTimedOut
-        )
-    }
-
-    pub(crate) fn into_public(self) -> CheckError {
-        match self {
-            Self::Public(error) => error,
-            Self::ClientTimedOutBeforeCommit { operation } => {
-                CheckError::TimedOutBeforeCommit { operation }
-            }
-            Self::ClientCommitTimedOut => CheckError::CommitTimedOut,
-        }
-    }
-}
-
-impl From<CheckError> for CheckRunError {
-    fn from(error: CheckError) -> Self {
-        Self::Public(error)
-    }
 }
 
 #[derive(Debug)]
@@ -163,31 +125,42 @@ impl PendingAllowance {
 }
 
 #[derive(Debug)]
+pub(crate) struct PendingQuotaDenial {
+    pub(crate) limit: u64,
+    pub(crate) retry_from_sample: Duration,
+}
+
+#[derive(Debug)]
 pub(crate) enum PendingDenial {
-    QuotaExceeded {
-        limit: u64,
-        retry_from_sample: Duration,
-    },
+    Quota(PendingQuotaDenial),
     StorageCapacity,
 }
 
 impl PendingDenial {
-    pub(crate) const fn is_quota_exceeded(&self) -> bool {
-        matches!(self, Self::QuotaExceeded { .. })
-    }
-
     pub(crate) fn finish(self, authoritative_elapsed: Duration) -> Denial {
         match self {
-            Self::QuotaExceeded {
+            Self::Quota(PendingQuotaDenial {
                 limit,
                 retry_from_sample,
-            } => Denial::QuotaExceeded {
+            }) => Denial::QuotaExceeded {
                 capacity: limit,
                 retry_after: retry_from_sample.saturating_sub(authoritative_elapsed),
             },
             Self::StorageCapacity => Denial::StorageCapacity { retry_after: None },
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum PendingBatchDenial {
+    Enforced {
+        index: usize,
+        denial: PendingDenial,
+    },
+    Shadow {
+        index: usize,
+        denial: PendingQuotaDenial,
+    },
 }
 
 pub(crate) async fn acquire_check_connection(
@@ -208,7 +181,22 @@ pub(crate) async fn run_check_transaction(
     checks: &[Check<'_>],
     maximum_rows_per_shard: u32,
     deadline: Instant,
-) -> Result<CheckRunOutcome, CheckRunError> {
+) -> ConnectionOutcome<Result<BatchDecision, CheckError>> {
+    match run_check_transaction_inner(connection, input, checks, maximum_rows_per_shard, deadline)
+        .await
+    {
+        Ok(outcome) => outcome.map(Ok),
+        Err(outcome) => outcome.map(Err),
+    }
+}
+
+async fn run_check_transaction_inner(
+    connection: &mut PoolConnection<Postgres>,
+    input: &BatchSqlInput,
+    checks: &[Check<'_>],
+    maximum_rows_per_shard: u32,
+    deadline: Instant,
+) -> Result<ConnectionOutcome<BatchDecision>, ConnectionOutcome<CheckError>> {
     let mut transaction =
         check_before_commit(deadline, "beginning transaction", connection.begin()).await?;
     set_check_server_timeouts(
@@ -242,13 +230,15 @@ pub(crate) async fn run_check_transaction(
 
     match pending {
         PendingBatchOutcome::Denied { index, denial } => {
-            let shadow =
-                denial.is_quota_exceeded() && checks[0].policy().quota_mode() == QuotaMode::Shadow;
+            let denial = match (denial, checks[0].policy().quota_mode()) {
+                (PendingDenial::Quota(denial), QuotaMode::Shadow) => {
+                    PendingBatchDenial::Shadow { index, denial }
+                }
+                (denial, _) => PendingBatchDenial::Enforced { index, denial },
+            };
             Ok(finish_denied_transaction(
                 deadline,
-                index,
                 denial,
-                shadow,
                 authoritative_elapsed,
                 transaction.rollback(),
             )
@@ -256,40 +246,44 @@ pub(crate) async fn run_check_transaction(
         }
         PendingBatchOutcome::Allowed(allowances) => {
             commit_check(deadline, transaction).await?;
-            Ok(CheckRunOutcome {
-                decision: BatchDecision::Allowed(
-                    allowances
-                        .into_iter()
-                        .map(|allowance| allowance.finish(authoritative_elapsed))
-                        .collect(),
-                ),
-                connection_reusable: true,
-            })
+            Ok(ConnectionOutcome::Reusable(BatchDecision::Allowed(
+                allowances
+                    .into_iter()
+                    .map(|allowance| allowance.finish(authoritative_elapsed))
+                    .collect(),
+            )))
         }
     }
 }
 
 pub(crate) async fn finish_denied_transaction<F>(
     deadline: Instant,
-    index: usize,
-    denial: PendingDenial,
-    shadow: bool,
+    pending: PendingBatchDenial,
     authoritative_elapsed: Duration,
     rollback: F,
-) -> CheckRunOutcome
+) -> ConnectionOutcome<BatchDecision>
 where
     F: Future<Output = Result<(), sqlx::Error>>,
 {
-    let denial = denial.finish(authoritative_elapsed);
-    let decision = if shadow {
-        BatchDecision::ShadowDenied { index, denial }
-    } else {
-        BatchDecision::Denied { index, denial }
+    let decision = match pending {
+        PendingBatchDenial::Enforced { index, denial } => BatchDecision::Denied {
+            index,
+            denial: denial.finish(authoritative_elapsed),
+        },
+        PendingBatchDenial::Shadow { index, denial } => BatchDecision::ShadowDenied {
+            index,
+            denial: Denial::QuotaExceeded {
+                capacity: denial.limit,
+                retry_after: denial
+                    .retry_from_sample
+                    .saturating_sub(authoritative_elapsed),
+            },
+        },
     };
-    let connection_reusable = denied_rollback_succeeded(deadline, rollback).await;
-    CheckRunOutcome {
-        decision,
-        connection_reusable,
+    if denied_rollback_succeeded(deadline, rollback).await {
+        ConnectionOutcome::Reusable(decision)
+    } else {
+        ConnectionOutcome::MustClose(decision)
     }
 }
 
@@ -304,30 +298,32 @@ async fn check_before_commit<T, F>(
     deadline: Instant,
     operation: &'static str,
     future: F,
-) -> Result<T, CheckRunError>
+) -> Result<T, ConnectionOutcome<CheckError>>
 where
     F: Future<Output = Result<T, sqlx::Error>>,
 {
     timeout_at(deadline, future)
         .await
-        .map_err(|_| CheckRunError::ClientTimedOutBeforeCommit { operation })?
-        .map_err(|error| CheckRunError::Public(map_check_database_error(error, operation)))
+        .map_err(|_| ConnectionOutcome::MustClose(CheckError::TimedOutBeforeCommit { operation }))?
+        .map_err(|error| ConnectionOutcome::Reusable(map_check_database_error(error, operation)))
 }
 
 async fn commit_check(
     deadline: Instant,
     transaction: Transaction<'_, Postgres>,
-) -> Result<(), CheckRunError> {
+) -> Result<(), ConnectionOutcome<CheckError>> {
     if Instant::now() >= deadline {
-        return Err(CheckRunError::Public(CheckError::TimedOutBeforeCommit {
-            operation: "starting commit",
-        }));
+        return Err(ConnectionOutcome::Reusable(
+            CheckError::TimedOutBeforeCommit {
+                operation: "starting commit",
+            },
+        ));
     }
 
     timeout_at(deadline, transaction.commit())
         .await
-        .map_err(|_| CheckRunError::ClientCommitTimedOut)?
-        .map_err(|error| CheckRunError::Public(CheckError::CommitOutcomeUnknown(error)))
+        .map_err(|_| ConnectionOutcome::MustClose(CheckError::CommitTimedOut))?
+        .map_err(|error| ConnectionOutcome::Reusable(CheckError::CommitOutcomeUnknown(error)))
 }
 
 fn map_check_database_error(error: sqlx::Error, operation: &'static str) -> CheckError {
@@ -338,13 +334,17 @@ fn map_check_database_error(error: sqlx::Error, operation: &'static str) -> Chec
     }
 }
 
+const fn reusable_check_error(error: CheckError) -> ConnectionOutcome<CheckError> {
+    ConnectionOutcome::Reusable(error)
+}
+
 async fn set_check_server_timeouts(
     transaction: &mut Transaction<'_, Postgres>,
     deadline: Instant,
     operation: &'static str,
-) -> Result<(), CheckRunError> {
+) -> Result<(), ConnectionOutcome<CheckError>> {
     let (statement_timeout, lock_timeout) = remaining_server_timeout_settings(deadline).ok_or(
-        CheckRunError::Public(CheckError::TimedOutBeforeCommit { operation }),
+        ConnectionOutcome::Reusable(CheckError::TimedOutBeforeCommit { operation }),
     )?;
     check_before_commit(
         deadline,
@@ -362,7 +362,7 @@ async fn acquire_advisory_locks(
     transaction: &mut Transaction<'_, Postgres>,
     advisory_lock_ids: &[i64],
     deadline: Instant,
-) -> Result<(), CheckRunError> {
+) -> Result<(), ConnectionOutcome<CheckError>> {
     check_before_commit(deadline, "acquiring logical key lock", async {
         sqlx::query(BATCH_ADVISORY_LOCK_SQL)
             .bind(advisory_lock_ids)
@@ -377,7 +377,7 @@ async fn acquire_existing_row_locks(
     transaction: &mut Transaction<'_, Postgres>,
     input: &BatchSqlInput,
     deadline: Instant,
-) -> Result<(), CheckRunError> {
+) -> Result<(), ConnectionOutcome<CheckError>> {
     check_before_commit(deadline, "acquiring counter row lock", async {
         sqlx::query(BATCH_ROW_LOCK_SQL)
             .bind(input.fingerprints.as_slice())
@@ -395,7 +395,7 @@ async fn first_capacity_denial(
     input: &BatchSqlInput,
     maximum_rows_per_shard: u32,
     deadline: Instant,
-) -> Result<Option<(usize, PendingDenial)>, CheckRunError> {
+) -> Result<Option<(usize, PendingDenial)>, ConnectionOutcome<CheckError>> {
     let rows = check_before_commit(
         deadline,
         "acquiring capacity shard lock",
@@ -411,49 +411,59 @@ async fn first_capacity_denial(
     for row in rows {
         let input_index: i64 = row
             .try_get("input_index")
-            .map_err(CheckError::DefinitelyNotConsumed)?;
-        let input_index = usize::try_from(input_index).map_err(|_| {
-            CheckError::StorageInvariant("capacity preflight returned an invalid input index")
-        })?;
-        let expected_shard =
-            input
-                .capacity_shards
-                .get(input_index)
-                .ok_or(CheckError::StorageInvariant(
-                    "capacity preflight returned an out-of-range input index",
-                ))?;
+            .map_err(CheckError::DefinitelyNotConsumed)
+            .map_err(reusable_check_error)?;
+        let input_index = usize::try_from(input_index)
+            .map_err(|_| {
+                CheckError::StorageInvariant("capacity preflight returned an invalid input index")
+            })
+            .map_err(reusable_check_error)?;
+        let expected_shard = input
+            .capacity_shards
+            .get(input_index)
+            .ok_or(CheckError::StorageInvariant(
+                "capacity preflight returned an out-of-range input index",
+            ))
+            .map_err(reusable_check_error)?;
         let returned_shard: i16 = row
             .try_get("capacity_shard")
-            .map_err(CheckError::DefinitelyNotConsumed)?;
+            .map_err(CheckError::DefinitelyNotConsumed)
+            .map_err(reusable_check_error)?;
         if &returned_shard != expected_shard {
-            return Err(CheckError::StorageInvariant(
+            return Err(reusable_check_error(CheckError::StorageInvariant(
                 "capacity preflight returned a mismatched shard",
-            )
-            .into());
+            )));
         }
-        let shard_index = usize::try_from(returned_shard).map_err(|_| {
-            CheckError::StorageInvariant("capacity preflight returned a negative shard")
-        })?;
-        let pending =
-            pending_insertions
-                .get_mut(shard_index)
-                .ok_or(CheckError::StorageInvariant(
-                    "capacity preflight returned an out-of-range shard",
-                ))?;
+        let shard_index = usize::try_from(returned_shard)
+            .map_err(|_| {
+                CheckError::StorageInvariant("capacity preflight returned a negative shard")
+            })
+            .map_err(reusable_check_error)?;
+        let pending = pending_insertions
+            .get_mut(shard_index)
+            .ok_or(CheckError::StorageInvariant(
+                "capacity preflight returned an out-of-range shard",
+            ))
+            .map_err(reusable_check_error)?;
         let stored_rows: Option<i64> = row
             .try_get("row_count")
-            .map_err(CheckError::DefinitelyNotConsumed)?;
-        let stored_rows = stored_rows.ok_or(CheckError::StorageInvariant(
-            "capacity shard ledger row is missing",
-        ))?;
+            .map_err(CheckError::DefinitelyNotConsumed)
+            .map_err(reusable_check_error)?;
+        let stored_rows = stored_rows
+            .ok_or(CheckError::StorageInvariant(
+                "capacity shard ledger row is missing",
+            ))
+            .map_err(reusable_check_error)?;
         let stored_rows = u64::try_from(stored_rows)
-            .map_err(|_| CheckError::StorageInvariant("capacity shard ledger count is negative"))?;
+            .map_err(|_| CheckError::StorageInvariant("capacity shard ledger count is negative"))
+            .map_err(reusable_check_error)?;
         let projected_rows = stored_rows
             .checked_add(u64::from(*pending))
             .and_then(|rows| rows.checked_add(1))
             .ok_or(CheckError::StorageInvariant(
                 "capacity shard ledger count overflowed",
-            ))?;
+            ))
+            .map_err(reusable_check_error)?;
         if projected_rows > u64::from(maximum_rows_per_shard) {
             return Ok(Some((input_index, PendingDenial::StorageCapacity)));
         }
@@ -474,7 +484,7 @@ async fn execute_batch(
     checks: &[Check<'_>],
     maximum_rows_per_shard: u32,
     deadline: Instant,
-) -> Result<(PendingBatchOutcome, Duration), CheckRunError> {
+) -> Result<(PendingBatchOutcome, Duration), ConnectionOutcome<CheckError>> {
     let capacity_denial =
         first_capacity_denial(transaction, input, maximum_rows_per_shard, deadline).await?;
     let preflight = preflight_batch(transaction, input, checks, deadline).await?;
@@ -507,7 +517,7 @@ async fn preflight_batch(
     input: &BatchSqlInput,
     checks: &[Check<'_>],
     deadline: Instant,
-) -> Result<BatchPreflight, CheckRunError> {
+) -> Result<BatchPreflight, ConnectionOutcome<CheckError>> {
     let preflight_row = check_before_commit(
         deadline,
         "preflighting counter batch",
@@ -522,39 +532,48 @@ async fn preflight_batch(
 
     let database_now: DateTime<Utc> = preflight_row
         .try_get("database_now")
-        .map_err(CheckError::DefinitelyNotConsumed)?;
+        .map_err(CheckError::DefinitelyNotConsumed)
+        .map_err(reusable_check_error)?;
     let preflight_response_now: DateTime<Utc> = preflight_row
         .try_get("response_now")
-        .map_err(CheckError::DefinitelyNotConsumed)?;
+        .map_err(CheckError::DefinitelyNotConsumed)
+        .map_err(reusable_check_error)?;
     let denied_index: Option<i64> = preflight_row
         .try_get("input_index")
-        .map_err(CheckError::DefinitelyNotConsumed)?;
+        .map_err(CheckError::DefinitelyNotConsumed)
+        .map_err(reusable_check_error)?;
     let denied_expiry: Option<DateTime<Utc>> = preflight_row
         .try_get("window_expires_at")
-        .map_err(CheckError::DefinitelyNotConsumed)?;
+        .map_err(CheckError::DefinitelyNotConsumed)
+        .map_err(reusable_check_error)?;
 
     let denial = match (denied_index, denied_expiry) {
         (Some(input_index), Some(expires_at)) => {
-            let input_index = usize::try_from(input_index).map_err(|_| {
-                CheckError::StorageInvariant("batch preflight returned an invalid input index")
-            })?;
-            let check = checks.get(input_index).ok_or(CheckError::StorageInvariant(
-                "batch preflight returned an out-of-range input index",
-            ))?;
+            let input_index = usize::try_from(input_index)
+                .map_err(|_| {
+                    CheckError::StorageInvariant("batch preflight returned an invalid input index")
+                })
+                .map_err(reusable_check_error)?;
+            let check = checks
+                .get(input_index)
+                .ok_or(CheckError::StorageInvariant(
+                    "batch preflight returned an out-of-range input index",
+                ))
+                .map_err(reusable_check_error)?;
             Some((
                 input_index,
-                PendingDenial::QuotaExceeded {
+                PendingDenial::Quota(PendingQuotaDenial {
                     limit: check.policy().limit(),
-                    retry_from_sample: duration_until(expires_at, database_now)?,
-                },
+                    retry_from_sample: duration_until(expires_at, database_now)
+                        .map_err(reusable_check_error)?,
+                }),
             ))
         }
         (None, None) => None,
         _ => {
-            return Err(CheckError::StorageInvariant(
+            return Err(reusable_check_error(CheckError::StorageInvariant(
                 "batch preflight returned an incomplete denial",
-            )
-            .into());
+            )));
         }
     };
 
@@ -571,7 +590,7 @@ async fn upsert_batch(
     checks: &[Check<'_>],
     database_now: DateTime<Utc>,
     deadline: Instant,
-) -> Result<(Vec<PendingAllowance>, DateTime<Utc>), CheckRunError> {
+) -> Result<(Vec<PendingAllowance>, DateTime<Utc>), ConnectionOutcome<CheckError>> {
     let rows = check_before_commit(
         deadline,
         "updating counter batch",
@@ -589,46 +608,49 @@ async fn upsert_batch(
     .await?;
 
     if rows.is_empty() {
-        return Err(
-            CheckError::StorageInvariant("allowed batch update returned no decisions").into(),
-        );
+        return Err(reusable_check_error(CheckError::StorageInvariant(
+            "allowed batch update returned no decisions",
+        )));
     }
     let response_now: DateTime<Utc> = rows[0]
         .try_get("response_now")
-        .map_err(CheckError::DefinitelyNotConsumed)?;
+        .map_err(CheckError::DefinitelyNotConsumed)
+        .map_err(reusable_check_error)?;
 
     let mut allowances = Vec::with_capacity(checks.len());
     for (output_position, row) in rows.iter().enumerate() {
         let input_index: i64 = row
             .try_get("input_index")
-            .map_err(CheckError::DefinitelyNotConsumed)?;
-        let input_index = usize::try_from(input_index).map_err(|_| {
-            CheckError::StorageInvariant("batch evaluation returned an invalid input index")
-        })?;
+            .map_err(CheckError::DefinitelyNotConsumed)
+            .map_err(reusable_check_error)?;
+        let input_index = usize::try_from(input_index)
+            .map_err(|_| {
+                CheckError::StorageInvariant("batch evaluation returned an invalid input index")
+            })
+            .map_err(reusable_check_error)?;
         let Some(check) = checks.get(input_index) else {
-            return Err(CheckError::StorageInvariant(
+            return Err(reusable_check_error(CheckError::StorageInvariant(
                 "batch evaluation returned an out-of-range input index",
-            )
-            .into());
+            )));
         };
-        let expires_at = read_expiry(row)?;
-        let remaining_from_sample = duration_until(expires_at, database_now)?;
+        let expires_at = read_expiry(row).map_err(reusable_check_error)?;
+        let remaining_from_sample =
+            duration_until(expires_at, database_now).map_err(reusable_check_error)?;
 
         if input_index != output_position {
-            return Err(CheckError::StorageInvariant(
+            return Err(reusable_check_error(CheckError::StorageInvariant(
                 "allowed batch decisions were not returned in caller order",
-            )
-            .into());
+            )));
         }
-        let used = read_used(row)?;
-        let remaining =
-            check
-                .policy()
-                .limit()
-                .checked_sub(used)
-                .ok_or(CheckError::StorageInvariant(
-                    "stored usage exceeds its policy limit",
-                ))?;
+        let used = read_used(row).map_err(reusable_check_error)?;
+        let remaining = check
+            .policy()
+            .limit()
+            .checked_sub(used)
+            .ok_or(CheckError::StorageInvariant(
+                "stored usage exceeds its policy limit",
+            ))
+            .map_err(reusable_check_error)?;
         allowances.push(PendingAllowance {
             limit: check.policy().limit(),
             remaining,
@@ -637,10 +659,9 @@ async fn upsert_batch(
     }
 
     if allowances.len() != checks.len() {
-        return Err(CheckError::StorageInvariant(
+        return Err(reusable_check_error(CheckError::StorageInvariant(
             "allowed batch returned an incomplete decision set",
-        )
-        .into());
+        )));
     }
     Ok((allowances, response_now))
 }
