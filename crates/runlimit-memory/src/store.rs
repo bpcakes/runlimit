@@ -1,5 +1,4 @@
 use std::{
-    collections::hash_map::Entry as MapEntry,
     fmt,
     sync::Arc,
     time::{Duration, Instant},
@@ -15,80 +14,51 @@ use thiserror::Error;
 use crate::{
     Clock, MemoryStoreConfig, SystemClock,
     shards::{
-        BoundedShards, CleanupEffect, Expiration, ExpiringEntry, PrehashedCounterKey, Shard,
-        ShardEffect, collect_shard_effects, usize_to_u64,
+        BoundedShards, CleanupEffect, Shard, ShardEffect, collect_shard_effects, usize_to_u64,
     },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Entry {
     used: u64,
-    expires_at_millis: u128,
-}
-
-impl ExpiringEntry for Entry {
-    fn expires_at_millis(&self) -> u128 {
-        self.expires_at_millis
-    }
 }
 
 impl Shard<Entry> {
     fn quota_denial(&self, check: &PreparedCheck, now_millis: u128) -> Option<Denial> {
-        let entry = self
-            .entries
-            .get(&PrehashedCounterKey(check.counter_key))
-            .filter(|entry| entry.expires_at_millis > now_millis)?;
+        let (entry, expires_at_millis) = self.active_entry(check.counter_key, now_millis)?;
         let remaining = remaining_quota(check.limit, entry.used);
         (check.cost > remaining).then(|| Denial::QuotaExceeded {
             capacity: check.limit,
-            retry_after: duration_from_millis(entry.expires_at_millis.saturating_sub(now_millis)),
+            retry_after: duration_from_millis(expires_at_millis.saturating_sub(now_millis)),
         })
     }
 
     fn consume(&mut self, check: &PreparedCheck, now_millis: u128) -> Decision {
         let expires_at_millis = now_millis + u128::from(check.window_millis);
-        let fresh_entry = Entry {
-            used: check.cost,
-            expires_at_millis,
-        };
-        let fresh_expiration = Expiration {
-            expires_at_millis,
-            key: check.counter_key,
-        };
-
-        match self.entries.entry(PrehashedCounterKey(check.counter_key)) {
-            MapEntry::Occupied(mut occupied) => {
-                if occupied.get().expires_at_millis > now_millis {
-                    let entry = occupied.get_mut();
-                    let remaining = remaining_quota(check.limit, entry.used);
-                    debug_assert!(
-                        check.cost <= remaining,
-                        "quota denial must be checked before consumption"
-                    );
-                    entry.used = entry.used.saturating_add(check.cost);
-                    return Decision::allowed(
-                        check.limit,
-                        remaining.saturating_sub(check.cost),
-                        duration_from_millis(entry.expires_at_millis.saturating_sub(now_millis)),
-                    );
-                }
-
-                let expired = *occupied.get();
-                let removed = self.expirations.remove(&Expiration {
-                    expires_at_millis: expired.expires_at_millis,
-                    key: check.counter_key,
-                });
-                debug_assert!(removed, "an expired entry must have an expiration");
-                let replaced = occupied.insert(fresh_entry);
-                debug_assert_eq!(replaced, expired);
-            }
-            MapEntry::Vacant(vacant) => {
-                vacant.insert(fresh_entry);
-            }
+        if let Some((entry, active_expires_at_millis)) =
+            self.active_entry(check.counter_key, now_millis)
+        {
+            let remaining = remaining_quota(check.limit, entry.used);
+            debug_assert!(
+                check.cost <= remaining,
+                "quota denial must be checked before consumption"
+            );
+            self.update_value(check.counter_key, |entry| {
+                entry.used = entry.used.saturating_add(check.cost);
+            })
+            .expect("the active entry was present");
+            return Decision::allowed(
+                check.limit,
+                remaining.saturating_sub(check.cost),
+                duration_from_millis(active_expires_at_millis.saturating_sub(now_millis)),
+            );
         }
 
-        let inserted = self.expirations.insert(fresh_expiration);
-        debug_assert!(inserted, "an inserted entry must have one expiration");
+        self.replace(
+            check.counter_key,
+            Entry { used: check.cost },
+            expires_at_millis,
+        );
         Decision::allowed(
             check.limit,
             remaining_quota(check.limit, check.cost),
@@ -274,8 +244,8 @@ impl<C: Clock> MemoryStore<C> {
         let prepared = PreparedCheck::new(0, check, shard_index);
         let mut shard = self.shards.lock_shard(shard_index)?;
         let observed_millis = self.clock.now().as_millis();
-        let now_millis = observed_millis.max(shard.latest_observed_millis);
-        shard.latest_observed_millis = now_millis;
+        let now_millis = observed_millis.max(shard.latest_observed_millis());
+        shard.record_observed_millis(now_millis);
         let cleanup_requested = self.config.max_expired_removals_per_check();
         let cleanup_started = Instant::now();
         let cleanup_removed = shard.prune_expired(now_millis, cleanup_requested);
@@ -287,11 +257,7 @@ impl<C: Clock> MemoryStore<C> {
             } else {
                 Decision::denied(denial)
             }
-        } else if !shard
-            .entries
-            .contains_key(&PrehashedCounterKey(counter_key))
-            && shard.entries.len() >= shard.capacity
-        {
+        } else if !shard.contains_key(counter_key) && shard.used() >= shard.capacity() {
             Decision::denied(Denial::StorageCapacity {
                 retry_after: shard
                     .capacity_retry_after_millis(now_millis)
@@ -310,8 +276,8 @@ impl<C: Clock> MemoryStore<C> {
                     removed: cleanup_removed,
                     elapsed: cleanup_elapsed,
                 },
-                used: shard.entries.len(),
-                capacity: shard.capacity,
+                used: shard.used(),
+                capacity: shard.capacity(),
             }],
         })
     }
@@ -414,11 +380,11 @@ impl<C: Clock> MemoryStore<C> {
         let observed_millis = self.clock.now().as_millis();
         let now_millis = locked_shards
             .iter()
-            .map(|(_, shard)| shard.latest_observed_millis)
+            .map(|(_, shard)| shard.latest_observed_millis())
             .fold(observed_millis, u128::max);
         let mut cleanup_effects = Vec::with_capacity(locked_shards.len());
         for ((_, shard), &check_count) in locked_shards.iter_mut().zip(&checks_per_shard) {
-            shard.latest_observed_millis = now_millis;
+            shard.record_observed_millis(now_millis);
             let cleanup_limit = self
                 .config
                 .max_expired_removals_per_check()
@@ -455,12 +421,9 @@ impl<C: Clock> MemoryStore<C> {
                 });
             }
 
-            if !shard
-                .entries
-                .contains_key(&PrehashedCounterKey(check.counter_key))
-            {
-                let projected_len = shard.entries.len() + pending_insertions[check.shard_position];
-                if projected_len >= shard.capacity {
+            if !shard.contains_key(check.counter_key) {
+                let projected_len = shard.used() + pending_insertions[check.shard_position];
+                if projected_len >= shard.capacity() {
                     return Ok(Evaluation {
                         value: BatchDecision::Denied {
                             index: check.input_index,
@@ -663,10 +626,7 @@ mod tests {
     };
 
     use super::{Entry, MemoryStore, MemoryStoreError, remaining_quota};
-    use crate::{
-        Clock, MemoryStoreConfig,
-        shards::{Expiration, PrehashedCounterKey, counter_key_hash},
-    };
+    use crate::{Clock, MemoryStoreConfig, shards::counter_key_hash};
 
     #[derive(Clone, Default)]
     struct ManualClock {
@@ -923,17 +883,7 @@ mod tests {
             MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
         {
             let mut shard = store.shards.shard(0).lock().unwrap();
-            shard.entries.insert(
-                PrehashedCounterKey(key),
-                Entry {
-                    used: 4,
-                    expires_at_millis: 60_000,
-                },
-            );
-            assert!(shard.expirations.insert(Expiration {
-                expires_at_millis: 60_000,
-                key,
-            }));
+            assert!(shard.replace(key, Entry { used: 4 }, 60_000).is_none());
         }
 
         assert_eq!(
@@ -1392,8 +1342,8 @@ mod tests {
                 Decision::allowed(10, 6, Duration::from_secs(60)),
             ]))
         );
-        assert_eq!(store.shards.shard(0).lock().unwrap().entries.len(), 1);
-        assert_eq!(store.shards.shard(1).lock().unwrap().entries.len(), 2);
+        assert_eq!(store.shards.shard(0).lock().unwrap().used(), 1);
+        assert_eq!(store.shards.shard(1).lock().unwrap().used(), 2);
     }
 
     #[test]
@@ -1432,8 +1382,8 @@ mod tests {
                 },
             })
         );
-        assert_eq!(store.shards.shard(0).lock().unwrap().entries.len(), 2);
-        assert_eq!(store.shards.shard(1).lock().unwrap().entries.len(), 0);
+        assert_eq!(store.shards.shard(0).lock().unwrap().used(), 2);
+        assert_eq!(store.shards.shard(1).lock().unwrap().used(), 0);
 
         assert!(
             store
@@ -1567,27 +1517,13 @@ mod tests {
         );
 
         let shard = store.shards.shard(0).lock().unwrap();
-        assert_eq!(shard.entries.len(), 4);
-        assert_eq!(
-            shard
-                .expirations
-                .iter()
-                .filter(|expiration| expiration.expires_at_millis <= 1_000)
-                .count(),
-            2
-        );
+        assert_eq!(shard.used(), 4);
+        assert_eq!(shard.expiration_count_at_or_before(1_000), 2);
         drop(shard);
 
         let shard = store.shards.shard(1).lock().unwrap();
-        assert_eq!(shard.entries.len(), 4);
-        assert_eq!(
-            shard
-                .expirations
-                .iter()
-                .filter(|expiration| expiration.expires_at_millis <= 1_000)
-                .count(),
-            3
-        );
+        assert_eq!(shard.used(), 4);
+        assert_eq!(shard.expiration_count_at_or_before(1_000), 3);
     }
 
     #[test]
@@ -1637,8 +1573,8 @@ mod tests {
         }
 
         let shard = store.shards.shard(0).lock().unwrap();
-        assert_eq!(shard.entries.len(), 1);
-        assert_eq!(shard.expirations.len(), 1);
+        assert_eq!(shard.used(), 1);
+        assert_eq!(shard.expiration_count(), 1);
     }
 
     #[test]
@@ -1676,19 +1612,10 @@ mod tests {
 
             let key = target.counter_key();
             let shard = store.shards.shard(0).lock().unwrap();
-            assert_eq!(shard.entries.len(), 1);
-            assert_eq!(shard.expirations.len(), 1);
-            assert_eq!(
-                shard.entries.get(&PrehashedCounterKey(key)),
-                Some(&Entry {
-                    used: 1,
-                    expires_at_millis: 5,
-                })
-            );
-            assert!(shard.expirations.contains(&Expiration {
-                expires_at_millis: 5,
-                key,
-            }));
+            assert_eq!(shard.used(), 1);
+            assert_eq!(shard.expiration_count(), 1);
+            assert_eq!(shard.entry(key), Some((&Entry { used: 1 }, 5)));
+            assert!(shard.contains_expiration(key, 5));
         }
     }
 

@@ -13,21 +13,13 @@ use runlimit_core::{
 use crate::{
     Clock, MemoryStoreConfig, MemoryStoreError, MemoryStoreStats, SystemClock,
     shards::{
-        BoundedShards, CleanupEffect, Expiration, ExpiringEntry, PrehashedCounterKey, Shard,
-        ShardEffect, collect_shard_effects, usize_to_u64,
+        BoundedShards, CleanupEffect, Shard, ShardEffect, collect_shard_effects, usize_to_u64,
     },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Entry {
     tat_scaled: u128,
-    expires_at_millis: u128,
-}
-
-impl ExpiringEntry for Entry {
-    fn expires_at_millis(&self) -> u128 {
-        self.expires_at_millis
-    }
 }
 
 impl Shard<Entry> {
@@ -40,10 +32,8 @@ impl Shard<Entry> {
             .checked_mul(u128::from(check.quota))
             .ok_or(EvaluationError::Arithmetic)?;
         let active_tat = self
-            .entries
-            .get(&PrehashedCounterKey(check.counter_key))
-            .filter(|entry| entry.expires_at_millis > now_millis)
-            .map_or(scaled_now, |entry| entry.tat_scaled.max(scaled_now));
+            .active_entry(check.counter_key, now_millis)
+            .map_or(scaled_now, |(entry, _)| entry.tat_scaled.max(scaled_now));
         let increment = u128::from(check.cost)
             .checked_mul(u128::from(check.period_millis))
             .ok_or(EvaluationError::Arithmetic)?;
@@ -81,25 +71,13 @@ impl Shard<Entry> {
     }
 
     fn consume(&mut self, check: &PreparedCheck, allowance: PendingAllowance) -> Decision {
-        let fresh_entry = Entry {
-            tat_scaled: allowance.tat_scaled,
-            expires_at_millis: allowance.expires_at_millis,
-        };
-        if let Some(previous) = self
-            .entries
-            .insert(PrehashedCounterKey(check.counter_key), fresh_entry)
-        {
-            let removed = self.expirations.remove(&Expiration {
-                expires_at_millis: previous.expires_at_millis,
-                key: check.counter_key,
-            });
-            debug_assert!(removed, "a replaced entry must have one expiration");
-        }
-        let inserted = self.expirations.insert(Expiration {
-            expires_at_millis: allowance.expires_at_millis,
-            key: check.counter_key,
-        });
-        debug_assert!(inserted, "an inserted entry must have one expiration");
+        self.replace(
+            check.counter_key,
+            Entry {
+                tat_scaled: allowance.tat_scaled,
+            },
+            allowance.expires_at_millis,
+        );
 
         Decision::allowed(
             check.burst_capacity,
@@ -250,14 +228,14 @@ impl<C: Clock> GcraStore<C> {
         let prepared = PreparedCheck::new(0, check, shard_index);
         let mut shard = self.shards.lock_shard(shard_index)?;
         let observed_millis = self.clock.now().as_millis();
-        let now_millis = observed_millis.max(shard.latest_observed_millis);
+        let now_millis = observed_millis.max(shard.latest_observed_millis());
         let evaluated = match shard.evaluate(&prepared, now_millis) {
             Err(EvaluationError::Arithmetic) => {
                 return Err(MemoryStoreError::ArithmeticOverflow);
             }
             result => result,
         };
-        shard.latest_observed_millis = now_millis;
+        shard.record_observed_millis(now_millis);
         let cleanup_requested = self.config.max_expired_removals_per_check();
         let cleanup_started = Instant::now();
         let cleanup_removed = shard.prune_expired(now_millis, cleanup_requested);
@@ -265,11 +243,7 @@ impl<C: Clock> GcraStore<C> {
 
         let decision = match evaluated {
             Ok(allowance) => {
-                if !shard
-                    .entries
-                    .contains_key(&PrehashedCounterKey(counter_key))
-                    && shard.entries.len() >= shard.capacity
-                {
+                if !shard.contains_key(counter_key) && shard.used() >= shard.capacity() {
                     Decision::denied(Denial::StorageCapacity {
                         retry_after: shard
                             .capacity_retry_after_millis(now_millis)
@@ -298,8 +272,8 @@ impl<C: Clock> GcraStore<C> {
                     removed: cleanup_removed,
                     elapsed: cleanup_elapsed,
                 },
-                used: shard.entries.len(),
-                capacity: shard.capacity,
+                used: shard.used(),
+                capacity: shard.capacity(),
             }],
         })
     }
@@ -395,7 +369,7 @@ impl<C: Clock> GcraStore<C> {
         let observed_millis = self.clock.now().as_millis();
         let now_millis = locked_shards
             .iter()
-            .map(|(_, shard)| shard.latest_observed_millis)
+            .map(|(_, shard)| shard.latest_observed_millis())
             .fold(observed_millis, u128::max);
         let mut evaluations = Vec::with_capacity(prepared.len());
         for check in &prepared {
@@ -411,7 +385,7 @@ impl<C: Clock> GcraStore<C> {
         }
         let mut cleanup_effects = Vec::with_capacity(locked_shards.len());
         for ((_, shard), &check_count) in locked_shards.iter_mut().zip(&checks_per_shard) {
-            shard.latest_observed_millis = now_millis;
+            shard.record_observed_millis(now_millis);
             let requested = self
                 .config
                 .max_expired_removals_per_check()
@@ -451,12 +425,9 @@ impl<C: Clock> GcraStore<C> {
                 Err(EvaluationError::Arithmetic) => unreachable!("arithmetic was preflighted"),
             };
 
-            if !shard
-                .entries
-                .contains_key(&PrehashedCounterKey(check.counter_key))
-            {
-                let projected_len = shard.entries.len() + pending_insertions[check.shard_position];
-                if projected_len >= shard.capacity {
+            if !shard.contains_key(check.counter_key) {
+                let projected_len = shard.used() + pending_insertions[check.shard_position];
+                if projected_len >= shard.capacity() {
                     return Ok(Evaluation {
                         value: BatchDecision::Denied {
                             index: check.input_index,

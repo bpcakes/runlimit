@@ -13,13 +13,13 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct Expiration {
-    pub(crate) expires_at_millis: u128,
-    pub(crate) key: CounterKey,
+struct Expiration {
+    expires_at_millis: u128,
+    key: CounterKey,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PrehashedCounterKey(pub(crate) CounterKey);
+struct PrehashedCounterKey(CounterKey);
 
 impl Hash for PrehashedCounterKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -28,7 +28,7 @@ impl Hash for PrehashedCounterKey {
 }
 
 #[derive(Default)]
-pub(crate) struct PassThroughHasher(u64);
+struct PassThroughHasher(u64);
 
 impl Hasher for PassThroughHasher {
     fn finish(&self) -> u64 {
@@ -49,19 +49,21 @@ impl Hasher for PassThroughHasher {
     }
 }
 
-pub(crate) type EntryMap<E> =
-    HashMap<PrehashedCounterKey, E, BuildHasherDefault<PassThroughHasher>>;
+type EntryMap<E> =
+    HashMap<PrehashedCounterKey, StoredEntry<E>, BuildHasherDefault<PassThroughHasher>>;
 
-pub(crate) trait ExpiringEntry {
-    fn expires_at_millis(&self) -> u128;
+#[derive(Debug)]
+struct StoredEntry<E> {
+    value: E,
+    expires_at_millis: u128,
 }
 
 #[derive(Debug)]
 pub(crate) struct Shard<E> {
-    pub(crate) capacity: usize,
-    pub(crate) latest_observed_millis: u128,
-    pub(crate) entries: EntryMap<E>,
-    pub(crate) expirations: BTreeSet<Expiration>,
+    capacity: usize,
+    latest_observed_millis: u128,
+    entries: EntryMap<E>,
+    expirations: BTreeSet<Expiration>,
 }
 
 impl<E> Shard<E> {
@@ -78,9 +80,70 @@ impl<E> Shard<E> {
         self.entries.clear();
         self.expirations.clear();
     }
-}
 
-impl<E: ExpiringEntry> Shard<E> {
+    pub(crate) const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub(crate) fn used(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) const fn latest_observed_millis(&self) -> u128 {
+        self.latest_observed_millis
+    }
+
+    pub(crate) const fn record_observed_millis(&mut self, now_millis: u128) {
+        self.latest_observed_millis = now_millis;
+    }
+
+    pub(crate) fn contains_key(&self, key: CounterKey) -> bool {
+        self.entries.contains_key(&PrehashedCounterKey(key))
+    }
+
+    pub(crate) fn active_entry(&self, key: CounterKey, now_millis: u128) -> Option<(&E, u128)> {
+        let entry = self.entries.get(&PrehashedCounterKey(key))?;
+        (entry.expires_at_millis > now_millis).then_some((&entry.value, entry.expires_at_millis))
+    }
+
+    pub(crate) fn update_value<R>(
+        &mut self,
+        key: CounterKey,
+        update: impl FnOnce(&mut E) -> R,
+    ) -> Option<R> {
+        self.entries
+            .get_mut(&PrehashedCounterKey(key))
+            .map(|entry| update(&mut entry.value))
+    }
+
+    pub(crate) fn replace(
+        &mut self,
+        key: CounterKey,
+        value: E,
+        expires_at_millis: u128,
+    ) -> Option<E> {
+        let previous = self.entries.insert(
+            PrehashedCounterKey(key),
+            StoredEntry {
+                value,
+                expires_at_millis,
+            },
+        );
+        if let Some(previous) = &previous {
+            let removed = self.expirations.remove(&Expiration {
+                expires_at_millis: previous.expires_at_millis,
+                key,
+            });
+            debug_assert!(removed, "a replaced entry must have one expiration");
+        }
+        let inserted = self.expirations.insert(Expiration {
+            expires_at_millis,
+            key,
+        });
+        debug_assert!(inserted, "an inserted entry must have one expiration");
+        previous.map(|entry| entry.value)
+    }
+
     pub(crate) fn prune_expired(&mut self, now_millis: u128, maximum: usize) -> usize {
         let mut removed_count = 0;
         for _ in 0..maximum {
@@ -97,7 +160,7 @@ impl<E: ExpiringEntry> Shard<E> {
                 .expect("the first expiration was present");
             let removed = self.entries.remove(&PrehashedCounterKey(expiration.key));
             debug_assert_eq!(
-                removed.as_ref().map(ExpiringEntry::expires_at_millis),
+                removed.as_ref().map(|entry| entry.expires_at_millis),
                 Some(expiration.expires_at_millis),
                 "the entry and expiration indexes diverged"
             );
@@ -112,6 +175,34 @@ impl<E: ExpiringEntry> Shard<E> {
                 .expires_at_millis
                 .saturating_sub(now_millis)
                 .max(1)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry(&self, key: CounterKey) -> Option<(&E, u128)> {
+        self.entries
+            .get(&PrehashedCounterKey(key))
+            .map(|entry| (&entry.value, entry.expires_at_millis))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expiration_count(&self) -> usize {
+        self.expirations.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expiration_count_at_or_before(&self, now_millis: u128) -> usize {
+        self.expirations
+            .iter()
+            .take_while(|expiration| expiration.expires_at_millis <= now_millis)
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_expiration(&self, key: CounterKey, expires_at_millis: u128) -> bool {
+        self.expirations.contains(&Expiration {
+            expires_at_millis,
+            key,
         })
     }
 }
@@ -176,7 +267,7 @@ impl<E> BoundedShards<E> {
         let indexes = (0..self.shards.len()).collect::<Vec<_>>();
         let locked = self.lock_shards(&indexes)?;
         Ok(MemoryStoreStats::from_parts(
-            locked.iter().map(|(_, shard)| shard.entries.len()).sum(),
+            locked.iter().map(|(_, shard)| shard.used()).sum(),
             config.max_keys(),
             config.shard_count(),
         ))
@@ -249,8 +340,8 @@ pub(crate) fn collect_shard_effects<E>(
         .map(|((shard_index, shard), cleanup)| ShardEffect {
             shard_index: *shard_index,
             cleanup: *cleanup,
-            used: shard.entries.len(),
-            capacity: shard.capacity,
+            used: shard.used(),
+            capacity: shard.capacity(),
         })
         .collect()
 }
@@ -286,19 +377,11 @@ mod tests {
 
     use runlimit_core::{Check, CounterKey, FixedWindowPolicy, PolicyId, ScopeId, SubjectKey};
 
-    use super::{BoundedShards, Expiration, ExpiringEntry, PrehashedCounterKey};
+    use super::BoundedShards;
     use crate::{MemoryStoreConfig, MemoryStoreError};
 
     #[derive(Clone, Copy)]
-    struct TestEntry {
-        expires_at_millis: u128,
-    }
-
-    impl ExpiringEntry for TestEntry {
-        fn expires_at_millis(&self) -> u128 {
-            self.expires_at_millis
-        }
-    }
+    struct TestEntry;
 
     fn counter_key(subject_byte: u8) -> CounterKey {
         let policy = FixedWindowPolicy::new(
@@ -312,16 +395,7 @@ mod tests {
     }
 
     fn insert(shard: &mut super::Shard<TestEntry>, key: CounterKey, expires_at_millis: u128) {
-        assert!(
-            shard
-                .entries
-                .insert(PrehashedCounterKey(key), TestEntry { expires_at_millis },)
-                .is_none()
-        );
-        assert!(shard.expirations.insert(Expiration {
-            expires_at_millis,
-            key,
-        }));
+        assert!(shard.replace(key, TestEntry, expires_at_millis).is_none());
     }
 
     #[test]
@@ -336,14 +410,33 @@ mod tests {
         insert(&mut shard, second, 20);
 
         assert_eq!(shard.prune_expired(10, 1), 1);
-        assert_eq!(shard.entries.len(), 1);
+        assert_eq!(shard.used(), 1);
         assert_eq!(shard.capacity_retry_after_millis(10), Some(10));
 
         assert_eq!(shard.prune_expired(20, 0), 0);
         assert_eq!(shard.capacity_retry_after_millis(20), Some(1));
         assert_eq!(shard.prune_expired(20, 1), 1);
-        assert!(shard.entries.is_empty());
+        assert_eq!(shard.used(), 0);
         assert_eq!(shard.capacity_retry_after_millis(20), None);
+    }
+
+    #[test]
+    fn replacing_an_entry_moves_its_expiration_atomically() {
+        let config = MemoryStoreConfig::new(1).unwrap();
+        let shards = BoundedShards::<TestEntry>::new(&config);
+        let key = counter_key(3);
+        let mut shard = shards.shard(0).lock().unwrap();
+
+        insert(&mut shard, key, 10);
+        assert!(shard.replace(key, TestEntry, 20).is_some());
+
+        assert_eq!(shard.used(), 1);
+        assert_eq!(shard.expiration_count(), 1);
+        assert!(!shard.contains_expiration(key, 10));
+        assert!(shard.contains_expiration(key, 20));
+        assert_eq!(shard.prune_expired(10, 1), 0);
+        assert_eq!(shard.prune_expired(20, 1), 1);
+        assert_eq!(shard.used(), 0);
     }
 
     #[test]
@@ -372,11 +465,7 @@ mod tests {
         assert_eq!(shards.recover_poisoned(&config), 1);
         assert!(shards.lock_shard(0).is_ok());
         let healthy = shards.lock_shard(1).unwrap();
-        assert_eq!(healthy.entries.len(), 1);
-        assert!(
-            healthy
-                .entries
-                .contains_key(&PrehashedCounterKey(healthy_key))
-        );
+        assert_eq!(healthy.used(), 1);
+        assert!(healthy.contains_key(healthy_key));
     }
 }
