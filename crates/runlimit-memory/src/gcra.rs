@@ -27,29 +27,29 @@ impl Shard<Entry> {
         &self,
         check: &PreparedCheck,
         now_millis: u128,
-    ) -> Result<PendingAllowance, EvaluationError> {
+    ) -> Result<QuotaEvaluation, ArithmeticOverflow> {
         let scaled_now = now_millis
             .checked_mul(u128::from(check.quota))
-            .ok_or(EvaluationError::Arithmetic)?;
+            .ok_or(ArithmeticOverflow)?;
         let active_tat = self
             .active_entry(check.counter_key, now_millis)
             .map_or(scaled_now, |(entry, _)| entry.tat_scaled.max(scaled_now));
         let increment = u128::from(check.cost)
             .checked_mul(u128::from(check.period_millis))
-            .ok_or(EvaluationError::Arithmetic)?;
+            .ok_or(ArithmeticOverflow)?;
         let candidate = active_tat
             .checked_add(increment)
-            .ok_or(EvaluationError::Arithmetic)?;
+            .ok_or(ArithmeticOverflow)?;
         let burst_span = u128::from(check.burst_capacity)
             .checked_mul(u128::from(check.period_millis))
-            .ok_or(EvaluationError::Arithmetic)?;
+            .ok_or(ArithmeticOverflow)?;
         let ceiling = scaled_now
             .checked_add(burst_span)
-            .ok_or(EvaluationError::Arithmetic)?;
+            .ok_or(ArithmeticOverflow)?;
 
         if candidate > ceiling {
             let retry_millis = div_ceil(candidate - ceiling, u128::from(check.quota));
-            return Err(EvaluationError::Quota(
+            return Ok(QuotaEvaluation::Denied(
                 QuotaDenial::try_new(check.burst_capacity, duration_from_millis(retry_millis))
                     .expect("prepared policy capacities are validated"),
             ));
@@ -59,15 +59,15 @@ impl Shard<Entry> {
         let replenish_millis = div_ceil(candidate - scaled_now, u128::from(check.quota));
         let expires_at_millis = now_millis
             .checked_add(replenish_millis)
-            .ok_or(EvaluationError::Arithmetic)?;
+            .ok_or(ArithmeticOverflow)?;
 
-        Ok(PendingAllowance {
+        Ok(QuotaEvaluation::Allowed(PendingAllowance {
             tat_scaled: candidate,
             expires_at_millis,
             available: u64::try_from(available)
                 .expect("available allowance cannot exceed the u64 burst capacity"),
             replenishes_after: duration_from_millis(replenish_millis),
-        })
+        }))
     }
 
     fn consume(&mut self, check: &PreparedCheck, allowance: PendingAllowance) -> Decision {
@@ -87,13 +87,16 @@ impl Shard<Entry> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum EvaluationError {
-    Quota(QuotaDenial),
-    Arithmetic,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArithmeticOverflow;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuotaEvaluation {
+    Allowed(PendingAllowance),
+    Denied(QuotaDenial),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingAllowance {
     tat_scaled: u128,
     expires_at_millis: u128,
@@ -229,12 +232,9 @@ impl<C: Clock> GcraStore<C> {
         let mut shard = self.shards.lock_shard(shard_index)?;
         let observed_millis = self.clock.now().as_millis();
         let now_millis = observed_millis.max(shard.latest_observed_millis());
-        let evaluated = match shard.evaluate(&prepared, now_millis) {
-            Err(EvaluationError::Arithmetic) => {
-                return Err(MemoryStoreError::ArithmeticOverflow);
-            }
-            result => result,
-        };
+        let evaluated = shard
+            .evaluate(&prepared, now_millis)
+            .map_err(|ArithmeticOverflow| MemoryStoreError::ArithmeticOverflow)?;
         shard.record_observed_millis(now_millis);
         let cleanup_requested = self.config.max_expired_removals_per_check();
         let cleanup_started = Instant::now();
@@ -242,7 +242,7 @@ impl<C: Clock> GcraStore<C> {
         let cleanup_elapsed = cleanup_started.elapsed();
 
         let decision = match evaluated {
-            Ok(allowance) => {
+            QuotaEvaluation::Allowed(allowance) => {
                 if !shard.contains_key(counter_key) && shard.used() >= shard.capacity() {
                     Decision::denied(Denial::storage_capacity(
                         shard
@@ -253,14 +253,13 @@ impl<C: Clock> GcraStore<C> {
                     shard.consume(&prepared, allowance)
                 }
             }
-            Err(EvaluationError::Quota(denial)) => {
+            QuotaEvaluation::Denied(denial) => {
                 if prepared.quota_mode == QuotaMode::Shadow {
                     Decision::shadow_denied(denial)
                 } else {
                     Decision::denied(denial)
                 }
             }
-            Err(EvaluationError::Arithmetic) => unreachable!("arithmetic was preflighted"),
         };
 
         Ok(Evaluation {
@@ -373,15 +372,12 @@ impl<C: Clock> GcraStore<C> {
             .fold(observed_millis, u128::max);
         let mut evaluations = Vec::with_capacity(prepared.len());
         for check in &prepared {
-            match locked_shards[check.shard_position]
-                .1
-                .evaluate(check, now_millis)
-            {
-                Err(EvaluationError::Arithmetic) => {
-                    return Err(MemoryStoreError::ArithmeticOverflow);
-                }
-                evaluation => evaluations.push(evaluation),
-            }
+            evaluations.push(
+                locked_shards[check.shard_position]
+                    .1
+                    .evaluate(check, now_millis)
+                    .map_err(|ArithmeticOverflow| MemoryStoreError::ArithmeticOverflow)?,
+            );
         }
         let mut cleanup_effects = Vec::with_capacity(locked_shards.len());
         for ((_, shard), &check_count) in locked_shards.iter_mut().zip(&checks_per_shard) {
@@ -404,8 +400,8 @@ impl<C: Clock> GcraStore<C> {
         for (check, evaluation) in prepared.iter().zip(evaluations) {
             let shard = &locked_shards[check.shard_position].1;
             let allowance = match evaluation {
-                Ok(allowance) => allowance,
-                Err(EvaluationError::Quota(denial)) => {
+                QuotaEvaluation::Allowed(allowance) => allowance,
+                QuotaEvaluation::Denied(denial) => {
                     let value = if check.quota_mode == QuotaMode::Shadow {
                         BatchDecision::shadow_denied(check.input_index, denial)
                     } else {
@@ -416,7 +412,6 @@ impl<C: Clock> GcraStore<C> {
                         shard_effects: collect_shard_effects(&locked_shards, &cleanup_effects),
                     });
                 }
-                Err(EvaluationError::Arithmetic) => unreachable!("arithmetic was preflighted"),
             };
 
             if !shard.contains_key(check.counter_key) {
@@ -1118,6 +1113,37 @@ mod tests {
             store.stats().unwrap().entries(),
             1,
             "arithmetic preflight must fail before pruning the now-expired entry"
+        );
+        assert_eq!(
+            observer.take(),
+            vec![RecordedObservation::Admission {
+                outcome: AdmissionOutcome::Failed,
+                consumption: ConsumptionStatus::NotConsumed,
+            }]
+        );
+    }
+
+    #[test]
+    fn later_batch_overflow_supersedes_an_earlier_denial_without_effects() {
+        let observer = Arc::new(RecordingObserver::default());
+        let store = GcraStore::with_clock(MemoryStoreConfig::new(2).unwrap(), MaximumClock)
+            .with_observer(observer.clone());
+        let limited = policy("api.limited", 1, Duration::from_millis(1), 1);
+        let exhausted = Check::new(&limited, subject(1));
+        assert!(store.check(&exhausted).unwrap().is_allowed());
+        observer.take();
+
+        let overflowing = policy("api.overflowing", MAX_LIMIT, Duration::from_millis(1), 1);
+        let later = Check::new(&overflowing, subject(2));
+        assert_eq!(
+            store.check_all(&[exhausted, later]),
+            Err(MemoryStoreError::ArithmeticOverflow),
+            "a later arithmetic failure must supersede an earlier quota denial"
+        );
+        assert_eq!(
+            store.stats().unwrap().entries(),
+            1,
+            "arithmetic preflight must not clean up or insert entries"
         );
         assert_eq!(
             observer.take(),
