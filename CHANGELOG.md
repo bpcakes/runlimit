@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Add borrowed `DecisionView` and `BatchDecisionView` enums so callers can
+  exhaustively match valid decision states without reconstructing them from
+  optional accessors. Existing accessors and Serde representations remain
+  unchanged.
+
 ### Changed
 
 - **Breaking:** replace directly constructible decision and denial enum states

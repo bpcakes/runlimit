@@ -27,7 +27,10 @@ mod policy;
 pub use batch::{BatchError, validate_batch};
 pub use check::{Check, CheckError};
 pub use counter::CounterKey;
-pub use decision::{BatchDecision, Decision, DecisionError, Denial, DenialKind, QuotaDenial};
+pub use decision::{
+    BatchDecision, BatchDecisionView, Decision, DecisionError, DecisionView, Denial, DenialKind,
+    QuotaDenial,
+};
 pub use identifier::{IdentifierError, MAX_IDENTIFIER_LENGTH, PolicyId, ScopeId};
 pub use key::{KeyHasher, KeyHasherError, SubjectKey};
 pub use limiter::Limiter;

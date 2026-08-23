@@ -3,7 +3,10 @@ use std::{
     time::Duration,
 };
 
-use crate::{BatchDecision, Check, Decision, DenialKind, PolicyId, RateLimitPolicy, ScopeId};
+use crate::{
+    BatchDecision, BatchDecisionView, Check, Decision, DecisionView, Denial, DenialKind, PolicyId,
+    RateLimitPolicy, ScopeId,
+};
 
 /// Receives synchronous, backend-neutral operational observations.
 ///
@@ -204,60 +207,45 @@ impl<'a> AdmissionObservation<'a> {
     }
 }
 
-const fn classify_decision(decision: &Decision) -> (AdmissionOutcome, ConsumptionStatus) {
-    if !decision.would_deny() {
-        return (AdmissionOutcome::Allowed, ConsumptionStatus::Consumed);
-    }
-    if decision.is_shadow_denied() {
-        return (
+fn classify_decision(decision: &Decision) -> (AdmissionOutcome, ConsumptionStatus) {
+    match decision.view() {
+        DecisionView::Allowed { .. } => (AdmissionOutcome::Allowed, ConsumptionStatus::Consumed),
+        DecisionView::Denied { denial } => classify_denial(denial),
+        DecisionView::ShadowDenied { .. } => (
             AdmissionOutcome::ShadowDenied,
             ConsumptionStatus::NotConsumed,
-        );
-    }
-    match decision.denial() {
-        Some(denial) => match denial.kind() {
-            DenialKind::QuotaExceeded => (
-                AdmissionOutcome::QuotaDenied,
-                ConsumptionStatus::NotConsumed,
-            ),
-            DenialKind::StorageCapacity => (
-                AdmissionOutcome::CapacityDenied,
-                ConsumptionStatus::NotConsumed,
-            ),
-        },
-        None => (AdmissionOutcome::Failed, ConsumptionStatus::NotConsumed),
+        ),
     }
 }
 
 fn classify_batch(decision: &BatchDecision, empty: bool) -> (AdmissionOutcome, ConsumptionStatus) {
-    if decision.allowed_decisions().is_some() {
-        return (
+    match decision.view() {
+        BatchDecisionView::Allowed { .. } => (
             AdmissionOutcome::Allowed,
             if empty {
                 ConsumptionStatus::NotConsumed
             } else {
                 ConsumptionStatus::Consumed
             },
-        );
-    }
-    if decision.is_shadow_denied() {
-        return (
+        ),
+        BatchDecisionView::Denied { denial, .. } => classify_denial(denial),
+        BatchDecisionView::ShadowDenied { .. } => (
             AdmissionOutcome::ShadowDenied,
             ConsumptionStatus::NotConsumed,
-        );
+        ),
     }
-    match decision.denial() {
-        Some(denial) => match denial.kind() {
-            DenialKind::QuotaExceeded => (
-                AdmissionOutcome::QuotaDenied,
-                ConsumptionStatus::NotConsumed,
-            ),
-            DenialKind::StorageCapacity => (
-                AdmissionOutcome::CapacityDenied,
-                ConsumptionStatus::NotConsumed,
-            ),
-        },
-        None => (AdmissionOutcome::Failed, ConsumptionStatus::NotConsumed),
+}
+
+const fn classify_denial(denial: &Denial) -> (AdmissionOutcome, ConsumptionStatus) {
+    match denial.kind() {
+        DenialKind::QuotaExceeded => (
+            AdmissionOutcome::QuotaDenied,
+            ConsumptionStatus::NotConsumed,
+        ),
+        DenialKind::StorageCapacity => (
+            AdmissionOutcome::CapacityDenied,
+            ConsumptionStatus::NotConsumed,
+        ),
     }
 }
 
@@ -265,13 +253,12 @@ fn batch_relevant_check<'checks, 'policy, P: RateLimitPolicy + ?Sized>(
     checks: &'checks [Check<'policy, P>],
     decision: &BatchDecision,
 ) -> Option<&'checks Check<'policy, P>> {
-    if decision
-        .allowed_decisions()
-        .is_some_and(|decisions| decisions.len() == 1)
-    {
-        checks.first()
-    } else {
-        decision.denied_index().and_then(|index| checks.get(index))
+    match decision.view() {
+        BatchDecisionView::Allowed { decisions } if decisions.len() == 1 => checks.first(),
+        BatchDecisionView::Allowed { .. } => None,
+        BatchDecisionView::Denied { index, .. } | BatchDecisionView::ShadowDenied { index, .. } => {
+            checks.get(index)
+        }
     }
 }
 

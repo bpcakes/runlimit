@@ -51,7 +51,9 @@ If either quota is unavailable, neither counter is consumed.
 ```rust
 use std::{env, error::Error, time::Duration};
 
-use runlimit_core::{Check, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId};
+use runlimit_core::{
+    BatchDecisionView, Check, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
+};
 use runlimit_memory::{MemoryStore, MemoryStoreConfig};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -84,22 +86,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     let decision = limiter.check_all(&checks)?;
-    if let Some(decisions) = decision.allowed_decisions() {
-        assert_eq!(decisions.len(), checks.len());
-        println!("request admitted");
-    } else if decision.is_enforced_denial() {
-        let index = decision.denied_index().expect("denials name an input");
-        let denial = decision.denial().expect("denials include details");
-        match denial.retry_after_seconds() {
+    match decision.view() {
+        BatchDecisionView::Allowed { decisions } => {
+            assert_eq!(decisions.len(), checks.len());
+            println!("request admitted");
+        }
+        BatchDecisionView::Denied { index, denial } => match denial.retry_after_seconds() {
             Some(seconds) => {
                 println!("check {index} denied; retry after {seconds} seconds");
             }
             None => println!("check {index} denied; retry time unavailable"),
+        },
+        BatchDecisionView::ShadowDenied { index, .. } => {
+            println!("request admitted after check {index} was shadow denied");
         }
-    } else if decision.is_shadow_denied() {
-        println!("request admitted after shadow denial");
-    } else {
-        return Err("unsupported batch decision state".into());
     }
 
     Ok(())

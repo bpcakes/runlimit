@@ -193,6 +193,34 @@ enum Outcome {
     ShadowDenied(Denial),
 }
 
+/// A read-only, discriminated view of a [`Decision`].
+///
+/// Unlike the legacy optional accessors on `Decision`, each variant exposes
+/// exactly the metadata that is valid for that outcome. Shadow denials contain
+/// only quota details because storage-capacity denials are always enforced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecisionView<'a> {
+    /// Quota was consumed and the request may proceed.
+    Allowed {
+        /// Maximum immediately available policy allowance.
+        capacity: u64,
+        /// Allowance available after consuming this check.
+        available: u64,
+        /// Time until the policy's full capacity is next available.
+        replenishes_after: Duration,
+    },
+    /// The application must enforce this denial.
+    Denied {
+        /// Backend-reported denial details.
+        denial: &'a Denial,
+    },
+    /// Quota was exceeded in shadow mode, so the request may proceed.
+    ShadowDenied {
+        /// Validated quota-exhaustion details.
+        denial: QuotaDenial,
+    },
+}
+
 /// The outcome of evaluating one check.
 ///
 /// Allowed outcomes report immediately available allowance after the check
@@ -273,6 +301,24 @@ impl Decision {
     pub const fn shadow_denied(denial: QuotaDenial) -> Self {
         Self {
             outcome: Outcome::ShadowDenied(Denial::quota_exceeded(denial)),
+        }
+    }
+
+    /// Returns a read-only view that discriminates every valid outcome.
+    pub fn view(&self) -> DecisionView<'_> {
+        match &self.outcome {
+            Outcome::Allowed(allowance) => DecisionView::Allowed {
+                capacity: allowance.capacity,
+                available: allowance.available,
+                replenishes_after: allowance.replenishes_after,
+            },
+            Outcome::Denied(denial) => DecisionView::Denied { denial },
+            Outcome::ShadowDenied(denial) => match denial.reason {
+                DenialReason::QuotaExceeded(denial) => DecisionView::ShadowDenied { denial },
+                DenialReason::StorageCapacity { .. } => {
+                    unreachable!("storage-capacity denials cannot be shadowed")
+                }
+            },
         }
     }
 
@@ -393,6 +439,33 @@ enum BatchOutcome {
     ShadowDenied { index: usize, denial: Denial },
 }
 
+/// A read-only, discriminated view of a [`BatchDecision`].
+///
+/// Allowed decisions remain in caller order. Denial indices always refer to
+/// the original caller-supplied input order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchDecisionView<'a> {
+    /// Every check was allowed and consumed atomically.
+    Allowed {
+        /// Allowed decisions in caller order.
+        decisions: &'a [Decision],
+    },
+    /// The application must enforce the named input's denial.
+    Denied {
+        /// Index of the denied input in caller order.
+        index: usize,
+        /// Backend-reported denial details.
+        denial: &'a Denial,
+    },
+    /// The named input exceeded quota in shadow mode.
+    ShadowDenied {
+        /// Index of the shadow-denied input in caller order.
+        index: usize,
+        /// Validated quota-exhaustion details.
+        denial: QuotaDenial,
+    },
+}
+
 impl BatchDecision {
     /// Constructs an allowed batch, panicking if any member is a denial.
     ///
@@ -437,6 +510,26 @@ impl BatchDecision {
             outcome: BatchOutcome::ShadowDenied {
                 index,
                 denial: Denial::quota_exceeded(denial),
+            },
+        }
+    }
+
+    /// Returns a read-only view that discriminates every valid outcome.
+    pub fn view(&self) -> BatchDecisionView<'_> {
+        match &self.outcome {
+            BatchOutcome::Allowed(decisions) => BatchDecisionView::Allowed { decisions },
+            BatchOutcome::Denied { index, denial } => BatchDecisionView::Denied {
+                index: *index,
+                denial,
+            },
+            BatchOutcome::ShadowDenied { index, denial } => match denial.reason {
+                DenialReason::QuotaExceeded(denial) => BatchDecisionView::ShadowDenied {
+                    index: *index,
+                    denial,
+                },
+                DenialReason::StorageCapacity { .. } => {
+                    unreachable!("storage-capacity denials cannot be shadowed")
+                }
             },
         }
     }
@@ -749,7 +842,10 @@ const fn ceil_seconds(duration: Duration) -> u64 {
 mod tests {
     use std::time::Duration;
 
-    use super::{BatchDecision, Decision, DecisionError, Denial, DenialKind, QuotaDenial};
+    use super::{
+        BatchDecision, BatchDecisionView, Decision, DecisionError, DecisionView, Denial,
+        DenialKind, QuotaDenial,
+    };
 
     fn allowed(capacity: u64, available: u64, replenishes_after: Duration) -> Decision {
         Decision::try_allowed(capacity, available, replenishes_after).unwrap()
@@ -880,6 +976,76 @@ mod tests {
         assert_eq!(
             BatchDecision::shadow_denied(0, denial).try_into_single_decision(),
             Ok(decision)
+        );
+    }
+
+    #[test]
+    fn decision_views_discriminate_every_legacy_accessor_shape() {
+        let allowed = allowed(8, 7, Duration::from_secs(60));
+        assert_eq!(
+            allowed.view(),
+            DecisionView::Allowed {
+                capacity: allowed.capacity().unwrap(),
+                available: allowed.available().unwrap(),
+                replenishes_after: allowed.replenishes_after().unwrap(),
+            }
+        );
+
+        let quota = quota(8, Duration::from_secs(30));
+        let denied = Decision::denied(quota);
+        assert_eq!(
+            denied.view(),
+            DecisionView::Denied {
+                denial: denied.denial().unwrap(),
+            }
+        );
+
+        let capacity = Decision::denied(Denial::storage_capacity(None));
+        assert_eq!(
+            capacity.view(),
+            DecisionView::Denied {
+                denial: capacity.denial().unwrap(),
+            }
+        );
+
+        let shadow = Decision::shadow_denied(quota);
+        assert_eq!(
+            shadow.view(),
+            DecisionView::ShadowDenied {
+                denial: shadow.quota_denial().unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn batch_views_preserve_allowed_order_and_denial_indices() {
+        let first = allowed(8, 7, Duration::from_secs(60));
+        let second = allowed(4, 2, Duration::from_secs(30));
+        let allowed_batch = BatchDecision::allowed(vec![first, second]);
+        assert_eq!(
+            allowed_batch.view(),
+            BatchDecisionView::Allowed {
+                decisions: allowed_batch.allowed_decisions().unwrap(),
+            }
+        );
+
+        let quota = quota(8, Duration::from_secs(30));
+        let denied = BatchDecision::denied(1, quota);
+        assert_eq!(
+            denied.view(),
+            BatchDecisionView::Denied {
+                index: denied.denied_index().unwrap(),
+                denial: denied.denial().unwrap(),
+            }
+        );
+
+        let shadow = BatchDecision::shadow_denied(2, quota);
+        assert_eq!(
+            shadow.view(),
+            BatchDecisionView::ShadowDenied {
+                index: shadow.denied_index().unwrap(),
+                denial: shadow.quota_denial().unwrap(),
+            }
         );
     }
 
