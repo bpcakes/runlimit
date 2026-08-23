@@ -172,7 +172,7 @@ impl FixedWindowPolicy {
                 maximum: MAX_LIMIT,
             });
         }
-        let window_millis = validate_window(window)?;
+        let window_millis = validate_window(window).map_err(PolicyError::from)?;
         let fingerprint = fingerprint(&id, &scope, limit, window_millis);
 
         Ok(Self {
@@ -320,15 +320,22 @@ impl<'de> serde::Deserialize<'de> for FixedWindowPolicy {
     }
 }
 
-fn validate_window(window: Duration) -> Result<NonZeroU64, PolicyError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DurationValidationError {
+    Zero,
+    NotWholeMilliseconds,
+    TooLarge { actual: Duration, maximum: Duration },
+}
+
+fn validate_window(window: Duration) -> Result<NonZeroU64, DurationValidationError> {
     if window.is_zero() {
-        return Err(PolicyError::ZeroWindow);
+        return Err(DurationValidationError::Zero);
     }
     if !window.subsec_nanos().is_multiple_of(1_000_000) {
-        return Err(PolicyError::WindowNotWholeMilliseconds);
+        return Err(DurationValidationError::NotWholeMilliseconds);
     }
     if window > MAX_WINDOW {
-        return Err(PolicyError::WindowTooLarge {
+        return Err(DurationValidationError::TooLarge {
             actual: window,
             maximum: MAX_WINDOW,
         });
@@ -336,7 +343,7 @@ fn validate_window(window: Duration) -> Result<NonZeroU64, PolicyError> {
 
     let millis =
         u64::try_from(window.as_millis()).expect("the portable window maximum fits in u64");
-    NonZeroU64::new(millis).ok_or(PolicyError::ZeroWindow)
+    Ok(NonZeroU64::new(millis).expect("the validated duration is nonzero"))
 }
 
 fn fingerprint(
@@ -677,16 +684,25 @@ pub enum GcraPolicyError {
     },
 }
 
-impl From<PolicyError> for GcraPolicyError {
-    fn from(error: PolicyError) -> Self {
+impl From<DurationValidationError> for PolicyError {
+    fn from(error: DurationValidationError) -> Self {
         match error {
-            PolicyError::ZeroWindow => Self::ZeroPeriod,
-            PolicyError::WindowNotWholeMilliseconds => Self::PeriodNotWholeMilliseconds,
-            PolicyError::WindowTooLarge { actual, maximum } => {
-                Self::PeriodTooLarge { actual, maximum }
+            DurationValidationError::Zero => Self::ZeroWindow,
+            DurationValidationError::NotWholeMilliseconds => Self::WindowNotWholeMilliseconds,
+            DurationValidationError::TooLarge { actual, maximum } => {
+                Self::WindowTooLarge { actual, maximum }
             }
-            PolicyError::ZeroLimit | PolicyError::LimitTooLarge { .. } => {
-                unreachable!("period validation cannot produce a limit error")
+        }
+    }
+}
+
+impl From<DurationValidationError> for GcraPolicyError {
+    fn from(error: DurationValidationError) -> Self {
+        match error {
+            DurationValidationError::Zero => Self::ZeroPeriod,
+            DurationValidationError::NotWholeMilliseconds => Self::PeriodNotWholeMilliseconds,
+            DurationValidationError::TooLarge { actual, maximum } => {
+                Self::PeriodTooLarge { actual, maximum }
             }
         }
     }
@@ -928,9 +944,32 @@ mod tests {
             make(1, Duration::from_nanos(1), 1),
             Err(GcraPolicyError::PeriodNotWholeMilliseconds)
         );
+        assert_eq!(make(1, Duration::ZERO, 1), Err(GcraPolicyError::ZeroPeriod));
+        let period_too_large = MAX_WINDOW + Duration::from_millis(1);
+        assert_eq!(
+            make(1, period_too_large, 1),
+            Err(GcraPolicyError::PeriodTooLarge {
+                actual: period_too_large,
+                maximum: MAX_WINDOW,
+            })
+        );
         assert!(matches!(
             make(1, MAX_WINDOW, 2),
             Err(GcraPolicyError::RefillDurationTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn policy_validation_preserves_precedence_for_multiple_invalid_fields() {
+        assert_eq!(policy(0, Duration::ZERO), Err(PolicyError::ZeroLimit));
+
+        let gcra = GcraPolicy::new(
+            PolicyId::new("api.read").unwrap(),
+            ScopeId::new("account").unwrap(),
+            0,
+            Duration::ZERO,
+            0,
+        );
+        assert_eq!(gcra, Err(GcraPolicyError::ZeroQuota));
     }
 }

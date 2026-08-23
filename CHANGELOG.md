@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog], and this project adheres to
   with validated constructors and read-only accessors. Shadow denials now
   require `QuotaDenial`, allowed batches reject denied members, and the Serde
   wire representation remains unchanged.
+- **Breaking:** remove `From<PolicyError> for GcraPolicyError`, whose public
+  conversion could panic for constructible fixed-window limit errors. Policy
+  constructors continue to report the same algorithm-specific validation
+  errors in the same order.
 
 ## [0.2.1] - 2026-08-08
 
