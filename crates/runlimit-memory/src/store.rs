@@ -5,16 +5,17 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionObservation, AdmissionOperation, AdmissionOutcome, BatchDecision, BatchError,
-    CapacityObservation, Check, CleanupObservation, ConsumptionStatus, CounterKey, Decision,
-    Denial, Limiter, Observation, Observer, QuotaDenial, observe_safely, validate_batch,
+    AdmissionObservation, BatchDecision, BatchError, CapacityObservation, Check,
+    CleanupObservation, ConsumptionStatus, CounterKey, Decision, Denial, Limiter, Observation,
+    Observer, QuotaDenial, observe_safely, validate_batch,
 };
 use thiserror::Error;
 
 use crate::{
     Clock, MemoryStoreConfig, SystemClock,
     shards::{
-        BoundedShards, CleanupEffect, Shard, ShardEffect, collect_shard_effects, usize_to_u64,
+        BatchTopology, BoundedShards, CleanupEffect, Shard, ShardEffect, collect_shard_effects,
+        usize_to_u64,
     },
 };
 
@@ -74,7 +75,6 @@ impl Shard<Entry> {
 struct PreparedCheck {
     input_index: usize,
     counter_key: CounterKey,
-    shard_index: usize,
     shard_position: usize,
     limit: u64,
     window_millis: u64,
@@ -82,12 +82,11 @@ struct PreparedCheck {
 }
 
 impl PreparedCheck {
-    fn new(input_index: usize, check: &Check<'_>, shard_index: usize) -> Self {
+    fn new(input_index: usize, check: &Check<'_>, shard_position: usize) -> Self {
         Self {
             input_index,
             counter_key: check.counter_key(),
-            shard_index,
-            shard_position: 0,
+            shard_position,
             limit: check.policy().limit(),
             window_millis: check.policy().window_millis(),
             cost: check.cost(),
@@ -96,9 +95,9 @@ impl PreparedCheck {
 }
 
 #[derive(Debug)]
-struct Evaluation<T> {
+struct Evaluation<T, E> {
     value: T,
-    shard_effects: Vec<ShardEffect>,
+    effect: E,
 }
 
 /// A sharded, hard-bounded, process-local fixed-window store.
@@ -174,29 +173,32 @@ impl<C: Clock> MemoryStore<C> {
     }
 
     fn observe_shard_effects(&self, effects: &[ShardEffect]) {
+        for effect in effects {
+            self.observe_shard_effect(effect);
+        }
+    }
+
+    fn observe_shard_effect(&self, effect: &ShardEffect) {
         let Some(observer) = &self.observer else {
             return;
         };
 
-        for effect in effects {
-            observe_safely(
-                observer.as_ref(),
-                &Observation::Cleanup(CleanupObservation::new(
-                    effect.cleanup.requested,
-                    Some(usize_to_u64(effect.cleanup.removed)),
-                    effect.cleanup.elapsed,
-                    ConsumptionStatus::Consumed,
-                )),
-            );
-            observe_safely(
-                observer.as_ref(),
-                &Observation::Capacity(CapacityObservation::new(
-                    usize_to_u64(effect.used),
-                    usize_to_u64(effect.capacity),
-                    Some(effect.shard_index),
-                )),
-            );
-        }
+        observe_safely(
+            observer.as_ref(),
+            &Observation::Cleanup(CleanupObservation::confirmed(
+                effect.cleanup.requested,
+                usize_to_u64(effect.cleanup.removed),
+                effect.cleanup.elapsed,
+            )),
+        );
+        observe_safely(
+            observer.as_ref(),
+            &Observation::Capacity(CapacityObservation::new(
+                usize_to_u64(effect.used),
+                usize_to_u64(effect.capacity),
+                Some(effect.shard_index),
+            )),
+        );
     }
 
     fn observe_admission<'a>(&self, build_observation: impl FnOnce() -> AdmissionObservation<'a>) {
@@ -220,31 +222,26 @@ impl<C: Clock> MemoryStore<C> {
 
         match &result {
             Ok(evaluation) => {
-                self.observe_shard_effects(&evaluation.shard_effects);
+                self.observe_shard_effect(&evaluation.effect);
                 self.observe_admission(|| {
                     AdmissionObservation::from_check(check, &evaluation.value, elapsed)
                 });
             }
             Err(_) => self.observe_admission(|| {
-                AdmissionObservation::new(
-                    AdmissionOperation::Check,
-                    1,
-                    Some(check.policy().id()),
-                    Some(check.policy().scope()),
-                    AdmissionOutcome::Failed,
-                    ConsumptionStatus::NotConsumed,
-                    elapsed,
-                )
+                AdmissionObservation::failed_check(check, ConsumptionStatus::NotConsumed, elapsed)
             }),
         }
 
         result.map(|evaluation| evaluation.value)
     }
 
-    fn check_inner(&self, check: &Check<'_>) -> Result<Evaluation<Decision>, MemoryStoreError> {
+    fn check_inner(
+        &self,
+        check: &Check<'_>,
+    ) -> Result<Evaluation<Decision, ShardEffect>, MemoryStoreError> {
         let counter_key = check.counter_key();
         let shard_index = self.shards.shard_index(&counter_key);
-        let prepared = PreparedCheck::new(0, check, shard_index);
+        let prepared = PreparedCheck::new(0, check, 0);
         let mut shard = self.shards.lock_shard(shard_index)?;
         let observed_millis = self.clock.now().as_millis();
         let now_millis = observed_millis.max(shard.latest_observed_millis());
@@ -272,7 +269,7 @@ impl<C: Clock> MemoryStore<C> {
 
         Ok(Evaluation {
             value: decision,
-            shard_effects: vec![ShardEffect {
+            effect: ShardEffect {
                 shard_index,
                 cleanup: CleanupEffect {
                     requested: cleanup_requested,
@@ -281,7 +278,7 @@ impl<C: Clock> MemoryStore<C> {
                 },
                 used: shard.used(),
                 capacity: shard.capacity(),
-            }],
+            },
         })
     }
 
@@ -305,18 +302,14 @@ impl<C: Clock> MemoryStore<C> {
 
         match &result {
             Ok(evaluation) => {
-                self.observe_shard_effects(&evaluation.shard_effects);
+                self.observe_shard_effects(&evaluation.effect);
                 self.observe_admission(|| {
                     AdmissionObservation::from_batch(checks, &evaluation.value, elapsed)
                 });
             }
             Err(_) => self.observe_admission(|| {
-                AdmissionObservation::new(
-                    AdmissionOperation::Batch,
+                AdmissionObservation::failed_batch(
                     checks.len(),
-                    None,
-                    None,
-                    AdmissionOutcome::Failed,
                     ConsumptionStatus::NotConsumed,
                     elapsed,
                 )
@@ -330,63 +323,37 @@ impl<C: Clock> MemoryStore<C> {
     fn check_all_inner(
         &self,
         checks: &[Check<'_>],
-    ) -> Result<Evaluation<BatchDecision>, MemoryStoreError> {
+    ) -> Result<Evaluation<BatchDecision, Vec<ShardEffect>>, MemoryStoreError> {
         validate_batch(checks, self.config.max_batch_size())?;
         if checks.is_empty() {
             return Ok(Evaluation {
                 value: BatchDecision::allowed(Vec::new()),
-                shard_effects: Vec::new(),
+                effect: Vec::new(),
             });
         }
 
-        let mut prepared = Vec::with_capacity(checks.len());
-        for (input_index, check) in checks.iter().enumerate() {
-            let counter_key = check.counter_key();
-            prepared.push(PreparedCheck::new(
-                input_index,
-                check,
-                self.shards.shard_index(&counter_key),
-            ));
-        }
-
-        let mut shard_indexes = prepared
+        let topology = BatchTopology::new(
+            checks
+                .iter()
+                .map(|check| self.shards.shard_index(&check.counter_key())),
+            &self.config,
+        )?;
+        let prepared = checks
             .iter()
-            .map(|check| check.shard_index)
+            .enumerate()
+            .map(|(input_index, check)| {
+                PreparedCheck::new(input_index, check, topology.shard_position(input_index))
+            })
             .collect::<Vec<_>>();
-        shard_indexes.sort_unstable();
-        shard_indexes.dedup();
-        for check in &mut prepared {
-            check.shard_position =
-                shard_indexes.partition_point(|index| *index < check.shard_index);
-            debug_assert_eq!(
-                shard_indexes.get(check.shard_position),
-                Some(&check.shard_index)
-            );
-        }
 
-        let mut checks_per_shard = vec![0_usize; shard_indexes.len()];
-        for check in &prepared {
-            checks_per_shard[check.shard_position] += 1;
-        }
-        for (&shard_index, &key_count) in shard_indexes.iter().zip(&checks_per_shard) {
-            let capacity = self.config.shard_capacity(shard_index);
-            if key_count > capacity {
-                return Err(MemoryStoreError::BatchExceedsShardCapacity {
-                    shard_index,
-                    key_count,
-                    capacity,
-                });
-            }
-        }
-
-        let mut locked_shards = self.shards.lock_shards(&shard_indexes)?;
+        let mut locked_shards = self.shards.lock_topology(&topology)?;
         let observed_millis = self.clock.now().as_millis();
         let now_millis = locked_shards
             .iter()
             .map(|(_, shard)| shard.latest_observed_millis())
             .fold(observed_millis, u128::max);
         let mut cleanup_effects = Vec::with_capacity(locked_shards.len());
-        for ((_, shard), &check_count) in locked_shards.iter_mut().zip(&checks_per_shard) {
+        for ((_, shard), check_count) in locked_shards.iter_mut().zip(topology.check_counts()) {
             shard.record_observed_millis(now_millis);
             let cleanup_limit = self
                 .config
@@ -414,7 +381,7 @@ impl<C: Clock> MemoryStore<C> {
                 };
                 return Ok(Evaluation {
                     value,
-                    shard_effects: collect_shard_effects(&locked_shards, &cleanup_effects),
+                    effect: collect_shard_effects(&locked_shards, &cleanup_effects),
                 });
             }
 
@@ -430,7 +397,7 @@ impl<C: Clock> MemoryStore<C> {
                                     .map(duration_from_millis),
                             ),
                         ),
-                        shard_effects: collect_shard_effects(&locked_shards, &cleanup_effects),
+                        effect: collect_shard_effects(&locked_shards, &cleanup_effects),
                     });
                 }
                 pending_insertions[check.shard_position] += 1;
@@ -445,7 +412,7 @@ impl<C: Clock> MemoryStore<C> {
 
         Ok(Evaluation {
             value: BatchDecision::allowed(decisions),
-            shard_effects: collect_shard_effects(&locked_shards, &cleanup_effects),
+            effect: collect_shard_effects(&locked_shards, &cleanup_effects),
         })
     }
 
@@ -617,9 +584,10 @@ mod tests {
     };
 
     use runlimit_core::{
-        AdmissionOutcome, BatchDecision, BatchError, Check, ConsumptionStatus, Decision, Denial,
-        DenialKind, FixedWindowPolicy, KeyHasher, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS,
-        Observation, Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
+        AdmissionOperation, AdmissionOutcome, BatchDecision, BatchError, Check, ConsumptionStatus,
+        Decision, Denial, DenialKind, FixedWindowPolicy, KeyHasher, MAX_LIMIT, MAX_WINDOW,
+        MAX_WINDOW_MILLIS, Observation, Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId,
+        SubjectKey,
     };
 
     use super::{Entry, MemoryStore, MemoryStoreError, remaining_quota};
@@ -731,6 +699,42 @@ mod tests {
                 _ => return,
             };
             self.observations.lock().unwrap().push(owned);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RecordedAdmissionMetadata {
+        operation: AdmissionOperation,
+        batch_size: usize,
+        has_policy_id: bool,
+        has_scope_id: bool,
+        has_policy_fingerprint: bool,
+        outcome: AdmissionOutcome,
+        consumption: ConsumptionStatus,
+    }
+
+    #[derive(Default)]
+    struct AdmissionMetadataObserver {
+        admissions: Mutex<Vec<RecordedAdmissionMetadata>>,
+    }
+
+    impl Observer for AdmissionMetadataObserver {
+        fn observe(&self, observation: &Observation<'_>) {
+            let Observation::Admission(admission) = observation else {
+                return;
+            };
+            self.admissions
+                .lock()
+                .unwrap()
+                .push(RecordedAdmissionMetadata {
+                    operation: admission.operation(),
+                    batch_size: admission.batch_size(),
+                    has_policy_id: admission.policy_id().is_some(),
+                    has_scope_id: admission.scope_id().is_some(),
+                    has_policy_fingerprint: admission.policy_fingerprint().is_some(),
+                    outcome: admission.outcome(),
+                    consumption: admission.consumption(),
+                });
         }
     }
 
@@ -1790,6 +1794,119 @@ mod tests {
         assert_eq!(
             store.clear(),
             Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+        );
+    }
+
+    #[test]
+    fn batch_preflight_preserves_validation_capacity_and_lock_precedence() {
+        let clock = PanicOnceClock::default();
+        let store = MemoryStore::with_clock(
+            MemoryStoreConfig::new(1)
+                .unwrap()
+                .with_shard_count(1)
+                .unwrap()
+                .with_max_batch_size(2)
+                .unwrap(),
+            clock.clone(),
+        );
+        let policy = policy("auth.preflight", "client", 1, Duration::from_secs(60));
+        let checks = [
+            Check::new(&policy, subject(1)),
+            Check::new(&policy, subject(2)),
+            Check::new(&policy, subject(3)),
+        ];
+
+        clock.panic_once();
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.check(&checks[0]);
+        }));
+        assert!(panic_result.is_err());
+
+        assert_eq!(store.check_all(&[]), Ok(BatchDecision::allowed(Vec::new())));
+        assert_eq!(
+            store.check_all(&[checks[0], checks[0]]),
+            Err(MemoryStoreError::InvalidBatch(BatchError::DuplicateKey {
+                first_index: 0,
+                duplicate_index: 1,
+            }))
+        );
+        assert_eq!(
+            store.check_all(&checks),
+            Err(MemoryStoreError::InvalidBatch(BatchError::BatchTooLarge {
+                actual: 3,
+                maximum: 2,
+            }))
+        );
+        assert_eq!(
+            store.check_all(&checks[..2]),
+            Err(MemoryStoreError::BatchExceedsShardCapacity {
+                shard_index: 0,
+                key_count: 2,
+                capacity: 1,
+            })
+        );
+        assert_eq!(
+            store.check_all(&checks[..1]),
+            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+        );
+    }
+
+    #[test]
+    fn failed_checks_keep_policy_metadata_but_failed_batches_remain_anonymous() {
+        let clock = PanicOnceClock::default();
+        let observer = Arc::new(AdmissionMetadataObserver::default());
+        let store = MemoryStore::with_clock(
+            MemoryStoreConfig::new(1)
+                .unwrap()
+                .with_shard_count(1)
+                .unwrap(),
+            clock.clone(),
+        )
+        .with_observer(observer.clone());
+        let policy = policy(
+            "auth.observed-failure",
+            "client",
+            1,
+            Duration::from_secs(60),
+        );
+        let check = Check::new(&policy, subject(1));
+
+        clock.panic_once();
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.check(&check);
+        }));
+        assert!(panic_result.is_err());
+        assert_eq!(
+            store.check(&check),
+            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+        );
+        assert_eq!(
+            store.check_all(&[check]),
+            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+        );
+
+        assert_eq!(
+            observer.admissions.lock().unwrap().as_slice(),
+            [
+                RecordedAdmissionMetadata {
+                    operation: AdmissionOperation::Check,
+                    batch_size: 1,
+                    has_policy_id: true,
+                    has_scope_id: true,
+                    has_policy_fingerprint: true,
+                    outcome: AdmissionOutcome::Failed,
+                    consumption: ConsumptionStatus::NotConsumed,
+                },
+                RecordedAdmissionMetadata {
+                    operation: AdmissionOperation::Batch,
+                    batch_size: 1,
+                    has_policy_id: false,
+                    has_scope_id: false,
+                    has_policy_fingerprint: false,
+                    outcome: AdmissionOutcome::Failed,
+                    consumption: ConsumptionStatus::NotConsumed,
+                },
+            ]
         );
     }
 

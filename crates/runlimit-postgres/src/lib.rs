@@ -92,9 +92,8 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionObservation, AdmissionOperation, AdmissionOutcome, BatchDecision, Check,
-    CleanupObservation, ConsumptionStatus, Decision, FixedWindowPolicy, Limiter, Observation,
-    Observer, observe_safely, validate_batch,
+    AdmissionObservation, BatchDecision, Check, CleanupObservation, Decision, FixedWindowPolicy,
+    Limiter, Observation, Observer, observe_safely, validate_batch,
 };
 use sqlx::{
     PgPool, Postgres,
@@ -413,15 +412,7 @@ impl PostgresLimiter {
             Ok(decision) => self
                 .observe_admission(|| AdmissionObservation::from_check(check, decision, elapsed)),
             Err(error) => self.observe_admission(|| {
-                AdmissionObservation::new(
-                    AdmissionOperation::Check,
-                    1,
-                    Some(check.policy().id()),
-                    Some(check.policy().scope()),
-                    AdmissionOutcome::Failed,
-                    check_error_consumption(error),
-                    elapsed,
-                )
+                AdmissionObservation::failed_check(check, check_error_consumption(error), elapsed)
             }),
         }
     }
@@ -437,23 +428,19 @@ impl PostgresLimiter {
                 .observe_admission(|| AdmissionObservation::from_batch(checks, decision, elapsed)),
             Err(error) => {
                 self.observe_admission(|| {
-                    let relevant_check = if checks.len() == 1 {
-                        checks.first()
+                    if let [check] = checks {
+                        AdmissionObservation::failed_batch_for_check(
+                            check,
+                            check_error_consumption(error),
+                            elapsed,
+                        )
                     } else {
-                        None
-                    };
-                    let (policy_id, scope_id) = relevant_check.map_or((None, None), |check| {
-                        (Some(check.policy().id()), Some(check.policy().scope()))
-                    });
-                    AdmissionObservation::new(
-                        AdmissionOperation::Batch,
-                        checks.len(),
-                        policy_id,
-                        scope_id,
-                        AdmissionOutcome::Failed,
-                        check_error_consumption(error),
-                        elapsed,
-                    )
+                        AdmissionObservation::failed_batch(
+                            checks.len(),
+                            check_error_consumption(error),
+                            elapsed,
+                        )
+                    }
                 });
             }
         }
@@ -476,22 +463,15 @@ impl PostgresLimiter {
         let Some(observer) = &self.observer else {
             return;
         };
-        let (removed, consumption) = match result {
-            Ok(removed) => (Some(*removed), ConsumptionStatus::Consumed),
+        let requested = usize::try_from(requested).unwrap_or(usize::MAX);
+        let observation = match result {
+            Ok(removed) => CleanupObservation::confirmed(requested, *removed, elapsed),
             Err(error) if error.may_have_removed_rows() => {
-                (None, ConsumptionStatus::PossiblyConsumed)
+                CleanupObservation::outcome_unknown(requested, elapsed)
             }
-            Err(_) => (Some(0), ConsumptionStatus::NotConsumed),
+            Err(_) => CleanupObservation::definitely_no_effect(requested, elapsed),
         };
-        observe_safely(
-            observer.as_ref(),
-            &Observation::Cleanup(CleanupObservation::new(
-                usize::try_from(requested).unwrap_or(usize::MAX),
-                removed,
-                elapsed,
-                consumption,
-            )),
-        );
+        observe_safely(observer.as_ref(), &Observation::Cleanup(observation));
     }
 }
 
@@ -567,8 +547,8 @@ mod tests {
 
     use super::*;
     use runlimit_core::{
-        FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, PolicyId, QuotaDenial,
-        ScopeId, SubjectKey,
+        AdmissionOperation, AdmissionOutcome, ConsumptionStatus, FixedWindowPolicy, MAX_LIMIT,
+        MAX_WINDOW, MAX_WINDOW_MILLIS, PolicyId, QuotaDenial, ScopeId, SubjectKey,
     };
 
     fn policy(id: &str, scope: &str) -> FixedWindowPolicy {
@@ -606,6 +586,40 @@ mod tests {
                 )),
                 _ => {}
             }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RecordedAdmissionMetadata {
+        operation: AdmissionOperation,
+        batch_size: usize,
+        has_policy_id: bool,
+        has_scope_id: bool,
+        has_policy_fingerprint: bool,
+        consumption: ConsumptionStatus,
+    }
+
+    #[derive(Default)]
+    struct AdmissionMetadataObserver {
+        admissions: Mutex<Vec<RecordedAdmissionMetadata>>,
+    }
+
+    impl Observer for AdmissionMetadataObserver {
+        fn observe(&self, observation: &Observation<'_>) {
+            let Observation::Admission(admission) = observation else {
+                return;
+            };
+            self.admissions
+                .lock()
+                .unwrap()
+                .push(RecordedAdmissionMetadata {
+                    operation: admission.operation(),
+                    batch_size: admission.batch_size(),
+                    has_policy_id: admission.policy_id().is_some(),
+                    has_scope_id: admission.scope_id().is_some(),
+                    has_policy_fingerprint: admission.policy_fingerprint().is_some(),
+                    consumption: admission.consumption(),
+                });
         }
     }
 
@@ -712,6 +726,101 @@ mod tests {
             BatchDecision::allowed(Vec::new())
         );
         assert_eq!(panicking.cleanup_expired(0).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_postgres_batches_preserve_one_item_policy_metadata() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://runlimit:runlimit@127.0.0.1:1/runlimit")
+            .expect("syntactically valid database URL");
+        let observer = Arc::new(AdmissionMetadataObserver::default());
+        let limiter = PostgresLimiter::new(pool).with_observer(observer.clone());
+        let first_policy = policy("observed.failure.first", "client");
+        let second_policy = policy("observed.failure.second", "client");
+        let first = Check::new(&first_policy, key(1));
+        let second = Check::new(&second_policy, key(2));
+        let elapsed = Duration::from_millis(5);
+
+        limiter.observe_single_admission(&first, &Err(CheckError::CommitTimedOut), elapsed);
+        limiter.observe_batch_admission(&[first], &Err(CheckError::CommitTimedOut), elapsed);
+        limiter.observe_batch_admission(
+            &[first, second],
+            &Err(CheckError::CommitTimedOut),
+            elapsed,
+        );
+
+        assert_eq!(
+            observer.admissions.lock().unwrap().as_slice(),
+            [
+                RecordedAdmissionMetadata {
+                    operation: AdmissionOperation::Check,
+                    batch_size: 1,
+                    has_policy_id: true,
+                    has_scope_id: true,
+                    has_policy_fingerprint: true,
+                    consumption: ConsumptionStatus::PossiblyConsumed,
+                },
+                RecordedAdmissionMetadata {
+                    operation: AdmissionOperation::Batch,
+                    batch_size: 1,
+                    has_policy_id: true,
+                    has_scope_id: true,
+                    has_policy_fingerprint: true,
+                    consumption: ConsumptionStatus::PossiblyConsumed,
+                },
+                RecordedAdmissionMetadata {
+                    operation: AdmissionOperation::Batch,
+                    batch_size: 2,
+                    has_policy_id: false,
+                    has_scope_id: false,
+                    has_policy_fingerprint: false,
+                    consumption: ConsumptionStatus::PossiblyConsumed,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_observations_map_every_backend_effect_class() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://runlimit:runlimit@127.0.0.1:1/runlimit")
+            .expect("syntactically valid database URL");
+        let observer = Arc::new(RecordingObserver::default());
+        let limiter = PostgresLimiter::new(pool).with_observer(observer.clone());
+        let elapsed = Duration::from_millis(5);
+
+        limiter.observe_cleanup(7, &Ok(3), elapsed);
+        limiter.observe_cleanup(
+            7,
+            &Err(MaintenanceError::Database(sqlx::Error::RowNotFound)),
+            elapsed,
+        );
+        limiter.observe_cleanup(
+            7,
+            &Err(MaintenanceError::TimedOutBeforeCommit {
+                operation: "testing",
+            }),
+            elapsed,
+        );
+        limiter.observe_cleanup(
+            7,
+            &Err(MaintenanceError::CommitOutcomeUnknown(
+                sqlx::Error::RowNotFound,
+            )),
+            elapsed,
+        );
+        limiter.observe_cleanup(7, &Err(MaintenanceError::CommitTimedOut), elapsed);
+
+        assert_eq!(
+            observer.cleanups.lock().unwrap().as_slice(),
+            [
+                (7, Some(3), ConsumptionStatus::Consumed),
+                (7, Some(0), ConsumptionStatus::NotConsumed),
+                (7, Some(0), ConsumptionStatus::NotConsumed),
+                (7, None, ConsumptionStatus::PossiblyConsumed),
+                (7, None, ConsumptionStatus::PossiblyConsumed),
+            ]
+        );
     }
 
     #[test]

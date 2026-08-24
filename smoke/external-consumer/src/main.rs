@@ -1,11 +1,16 @@
 use std::{env, error::Error, time::Duration};
 
 use runlimit_core::{
-    BatchDecisionView, Check, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
+    AdmissionObservation, BatchDecisionView, Check, CleanupObservation, ConsumptionStatus,
+    FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
 };
 use runlimit_memory::{MemoryStore, MemoryStoreConfig};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let cleanup = CleanupObservation::outcome_unknown(100, Duration::from_millis(5));
+    assert_eq!(cleanup.removed(), None);
+    assert_eq!(cleanup.consumption(), ConsumptionStatus::PossiblyConsumed);
+
     let client_policy = FixedWindowPolicy::new(
         PolicyId::new("auth.login")?,
         ScopeId::new("client")?,
@@ -32,6 +37,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         Check::new(&client_policy, client),
         Check::new(&identity_policy, identity),
     ];
+    let failed_batch = AdmissionObservation::failed_batch_for_check(
+        &checks[0],
+        ConsumptionStatus::NotConsumed,
+        Duration::from_millis(5),
+    );
+    assert_eq!(
+        failed_batch.policy_id().map(PolicyId::as_str),
+        Some("auth.login")
+    );
+    assert!(failed_batch.policy_fingerprint().is_some());
 
     let decision = limiter.check_all(&checks)?;
     match decision.view() {

@@ -277,8 +277,9 @@ nothing.
 `runlimit_core::Observer`. Admission observations classify outcome, quota
 consumption certainty, and elapsed time; cleanup observations report bounded
 work. The memory stores also report per-shard capacity headroom. Observations
-intentionally omit subject keys, policy fingerprints, backend error text, and
-other sensitive high-cardinality values.
+intentionally omit subject keys, backend error text, and other sensitive
+high-cardinality values. When relevant to a single check, admission observations
+include the policy fingerprint alongside its policy and scope identifiers.
 
 Callbacks run synchronously after memory locks are released or database
 transactions are finalized. Keep them fast and hand expensive export work to

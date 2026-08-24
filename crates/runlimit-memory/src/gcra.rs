@@ -5,15 +5,16 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionObservation, AdmissionOperation, AdmissionOutcome, BatchDecision, CapacityObservation,
-    Check, CleanupObservation, ConsumptionStatus, CounterKey, Decision, Denial, GcraPolicy,
-    Limiter, Observation, Observer, QuotaDenial, QuotaMode, observe_safely, validate_batch,
+    AdmissionObservation, BatchDecision, CapacityObservation, Check, CleanupObservation,
+    ConsumptionStatus, CounterKey, Decision, Denial, GcraPolicy, Limiter, Observation, Observer,
+    QuotaDenial, QuotaMode, observe_safely, validate_batch,
 };
 
 use crate::{
     Clock, MemoryStoreConfig, MemoryStoreError, MemoryStoreStats, SystemClock,
     shards::{
-        BoundedShards, CleanupEffect, Shard, ShardEffect, collect_shard_effects, usize_to_u64,
+        BatchTopology, BoundedShards, CleanupEffect, Shard, ShardEffect, collect_shard_effects,
+        usize_to_u64,
     },
 };
 
@@ -108,7 +109,6 @@ struct PendingAllowance {
 struct PreparedCheck {
     input_index: usize,
     counter_key: CounterKey,
-    shard_index: usize,
     shard_position: usize,
     quota: u64,
     period_millis: u64,
@@ -118,12 +118,11 @@ struct PreparedCheck {
 }
 
 impl PreparedCheck {
-    fn new(input_index: usize, check: &Check<'_, GcraPolicy>, shard_index: usize) -> Self {
+    fn new(input_index: usize, check: &Check<'_, GcraPolicy>, shard_position: usize) -> Self {
         Self {
             input_index,
             counter_key: check.counter_key(),
-            shard_index,
-            shard_position: 0,
+            shard_position,
             quota: check.policy().quota(),
             period_millis: check.policy().period_millis(),
             burst_capacity: check.policy().burst_capacity(),
@@ -134,9 +133,9 @@ impl PreparedCheck {
 }
 
 #[derive(Debug)]
-struct Evaluation<T> {
+struct Evaluation<T, E> {
     value: T,
-    shard_effects: Vec<ShardEffect>,
+    effect: E,
 }
 
 /// A hard-bounded, process-local generic-cell-rate-algorithm store.
@@ -202,21 +201,13 @@ impl<C: Clock> GcraStore<C> {
         let elapsed = started.elapsed();
         match &result {
             Ok(evaluation) => {
-                self.observe_shard_effects(&evaluation.shard_effects);
+                self.observe_shard_effect(&evaluation.effect);
                 self.observe_admission(|| {
                     AdmissionObservation::from_check(check, &evaluation.value, elapsed)
                 });
             }
             Err(_) => self.observe_admission(|| {
-                AdmissionObservation::new(
-                    AdmissionOperation::Check,
-                    1,
-                    Some(check.policy().id()),
-                    Some(check.policy().scope()),
-                    AdmissionOutcome::Failed,
-                    ConsumptionStatus::NotConsumed,
-                    elapsed,
-                )
+                AdmissionObservation::failed_check(check, ConsumptionStatus::NotConsumed, elapsed)
             }),
         }
         result.map(|evaluation| evaluation.value)
@@ -225,10 +216,10 @@ impl<C: Clock> GcraStore<C> {
     fn check_inner(
         &self,
         check: &Check<'_, GcraPolicy>,
-    ) -> Result<Evaluation<Decision>, MemoryStoreError> {
+    ) -> Result<Evaluation<Decision, ShardEffect>, MemoryStoreError> {
         let counter_key = check.counter_key();
         let shard_index = self.shards.shard_index(&counter_key);
-        let prepared = PreparedCheck::new(0, check, shard_index);
+        let prepared = PreparedCheck::new(0, check, 0);
         let mut shard = self.shards.lock_shard(shard_index)?;
         let observed_millis = self.clock.now().as_millis();
         let now_millis = observed_millis.max(shard.latest_observed_millis());
@@ -264,7 +255,7 @@ impl<C: Clock> GcraStore<C> {
 
         Ok(Evaluation {
             value: decision,
-            shard_effects: vec![ShardEffect {
+            effect: ShardEffect {
                 shard_index,
                 cleanup: CleanupEffect {
                     requested: cleanup_requested,
@@ -273,7 +264,7 @@ impl<C: Clock> GcraStore<C> {
                 },
                 used: shard.used(),
                 capacity: shard.capacity(),
-            }],
+            },
         })
     }
 
@@ -296,18 +287,14 @@ impl<C: Clock> GcraStore<C> {
         let elapsed = started.elapsed();
         match &result {
             Ok(evaluation) => {
-                self.observe_shard_effects(&evaluation.shard_effects);
+                self.observe_shard_effects(&evaluation.effect);
                 self.observe_admission(|| {
                     AdmissionObservation::from_batch(checks, &evaluation.value, elapsed)
                 });
             }
             Err(_) => self.observe_admission(|| {
-                AdmissionObservation::new(
-                    AdmissionOperation::Batch,
+                AdmissionObservation::failed_batch(
                     checks.len(),
-                    None,
-                    None,
-                    AdmissionOutcome::Failed,
                     ConsumptionStatus::NotConsumed,
                     elapsed,
                 )
@@ -320,51 +307,30 @@ impl<C: Clock> GcraStore<C> {
     fn check_all_inner(
         &self,
         checks: &[Check<'_, GcraPolicy>],
-    ) -> Result<Evaluation<BatchDecision>, MemoryStoreError> {
+    ) -> Result<Evaluation<BatchDecision, Vec<ShardEffect>>, MemoryStoreError> {
         validate_batch(checks, self.config.max_batch_size())?;
         if checks.is_empty() {
             return Ok(Evaluation {
                 value: BatchDecision::allowed(Vec::new()),
-                shard_effects: Vec::new(),
+                effect: Vec::new(),
             });
         }
 
-        let mut prepared = Vec::with_capacity(checks.len());
-        for (input_index, check) in checks.iter().enumerate() {
-            let counter_key = check.counter_key();
-            prepared.push(PreparedCheck::new(
-                input_index,
-                check,
-                self.shards.shard_index(&counter_key),
-            ));
-        }
-        let mut shard_indexes = prepared
+        let topology = BatchTopology::new(
+            checks
+                .iter()
+                .map(|check| self.shards.shard_index(&check.counter_key())),
+            &self.config,
+        )?;
+        let prepared = checks
             .iter()
-            .map(|check| check.shard_index)
+            .enumerate()
+            .map(|(input_index, check)| {
+                PreparedCheck::new(input_index, check, topology.shard_position(input_index))
+            })
             .collect::<Vec<_>>();
-        shard_indexes.sort_unstable();
-        shard_indexes.dedup();
-        for check in &mut prepared {
-            check.shard_position =
-                shard_indexes.partition_point(|index| *index < check.shard_index);
-        }
 
-        let mut checks_per_shard = vec![0_usize; shard_indexes.len()];
-        for check in &prepared {
-            checks_per_shard[check.shard_position] += 1;
-        }
-        for (&shard_index, &key_count) in shard_indexes.iter().zip(&checks_per_shard) {
-            let capacity = self.config.shard_capacity(shard_index);
-            if key_count > capacity {
-                return Err(MemoryStoreError::BatchExceedsShardCapacity {
-                    shard_index,
-                    key_count,
-                    capacity,
-                });
-            }
-        }
-
-        let mut locked_shards = self.shards.lock_shards(&shard_indexes)?;
+        let mut locked_shards = self.shards.lock_topology(&topology)?;
         let observed_millis = self.clock.now().as_millis();
         let now_millis = locked_shards
             .iter()
@@ -380,7 +346,7 @@ impl<C: Clock> GcraStore<C> {
             );
         }
         let mut cleanup_effects = Vec::with_capacity(locked_shards.len());
-        for ((_, shard), &check_count) in locked_shards.iter_mut().zip(&checks_per_shard) {
+        for ((_, shard), check_count) in locked_shards.iter_mut().zip(topology.check_counts()) {
             shard.record_observed_millis(now_millis);
             let requested = self
                 .config
@@ -409,7 +375,7 @@ impl<C: Clock> GcraStore<C> {
                     };
                     return Ok(Evaluation {
                         value,
-                        shard_effects: collect_shard_effects(&locked_shards, &cleanup_effects),
+                        effect: collect_shard_effects(&locked_shards, &cleanup_effects),
                     });
                 }
             };
@@ -426,7 +392,7 @@ impl<C: Clock> GcraStore<C> {
                                     .map(duration_from_millis),
                             ),
                         ),
-                        shard_effects: collect_shard_effects(&locked_shards, &cleanup_effects),
+                        effect: collect_shard_effects(&locked_shards, &cleanup_effects),
                     });
                 }
                 pending_insertions[check.shard_position] += 1;
@@ -444,7 +410,7 @@ impl<C: Clock> GcraStore<C> {
         }
         Ok(Evaluation {
             value: BatchDecision::allowed(decisions),
-            shard_effects: collect_shard_effects(&locked_shards, &cleanup_effects),
+            effect: collect_shard_effects(&locked_shards, &cleanup_effects),
         })
     }
 
@@ -472,28 +438,31 @@ impl<C: Clock> GcraStore<C> {
     }
 
     fn observe_shard_effects(&self, effects: &[ShardEffect]) {
+        for effect in effects {
+            self.observe_shard_effect(effect);
+        }
+    }
+
+    fn observe_shard_effect(&self, effect: &ShardEffect) {
         let Some(observer) = &self.observer else {
             return;
         };
-        for effect in effects {
-            observe_safely(
-                observer.as_ref(),
-                &Observation::Cleanup(CleanupObservation::new(
-                    effect.cleanup.requested,
-                    Some(usize_to_u64(effect.cleanup.removed)),
-                    effect.cleanup.elapsed,
-                    ConsumptionStatus::Consumed,
-                )),
-            );
-            observe_safely(
-                observer.as_ref(),
-                &Observation::Capacity(CapacityObservation::new(
-                    usize_to_u64(effect.used),
-                    usize_to_u64(effect.capacity),
-                    Some(effect.shard_index),
-                )),
-            );
-        }
+        observe_safely(
+            observer.as_ref(),
+            &Observation::Cleanup(CleanupObservation::confirmed(
+                effect.cleanup.requested,
+                usize_to_u64(effect.cleanup.removed),
+                effect.cleanup.elapsed,
+            )),
+        );
+        observe_safely(
+            observer.as_ref(),
+            &Observation::Capacity(CapacityObservation::new(
+                usize_to_u64(effect.used),
+                usize_to_u64(effect.capacity),
+                Some(effect.shard_index),
+            )),
+        );
     }
 
     fn observe_admission<'a>(&self, build_observation: impl FnOnce() -> AdmissionObservation<'a>) {
@@ -541,7 +510,7 @@ impl<C: Clock> Limiter for GcraStore<C> {
 mod tests {
     use std::{
         sync::{
-            Arc, Barrier, Mutex,
+            Arc, Barrier, Mutex, Weak,
             atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread,
@@ -549,9 +518,9 @@ mod tests {
     };
 
     use runlimit_core::{
-        AdmissionOutcome, BatchDecision, Check, ConsumptionStatus, Decision, Denial, DenialKind,
-        GcraPolicy, MAX_LIMIT, Observation, Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId,
-        SubjectKey,
+        AdmissionOperation, AdmissionOutcome, BatchDecision, Check, ConsumptionStatus, Decision,
+        Denial, DenialKind, GcraPolicy, MAX_LIMIT, Observation, Observer, PolicyId, QuotaDenial,
+        QuotaMode, ScopeId, SubjectKey,
     };
 
     use super::GcraStore;
@@ -630,7 +599,28 @@ mod tests {
         Capacity {
             used: u64,
             capacity: u64,
+            shard_index: Option<usize>,
         },
+    }
+
+    impl RecordedObservation {
+        fn from_observation(observation: &Observation<'_>) -> Option<Self> {
+            match observation {
+                Observation::Admission(admission) => Some(Self::Admission {
+                    outcome: admission.outcome(),
+                    consumption: admission.consumption(),
+                }),
+                Observation::Cleanup(cleanup) => Some(Self::Cleanup {
+                    removed: cleanup.removed(),
+                }),
+                Observation::Capacity(capacity) => Some(Self::Capacity {
+                    used: capacity.used(),
+                    capacity: capacity.capacity(),
+                    shard_index: capacity.shard_index(),
+                }),
+                _ => None,
+            }
+        }
     }
 
     #[derive(Default)]
@@ -651,24 +641,70 @@ mod tests {
 
     impl Observer for RecordingObserver {
         fn observe(&self, observation: &Observation<'_>) {
-            let recorded = match observation {
-                Observation::Admission(admission) => RecordedObservation::Admission {
-                    outcome: admission.outcome(),
-                    consumption: admission.consumption(),
-                },
-                Observation::Cleanup(cleanup) => RecordedObservation::Cleanup {
-                    removed: cleanup.removed(),
-                },
-                Observation::Capacity(capacity) => RecordedObservation::Capacity {
-                    used: capacity.used(),
-                    capacity: capacity.capacity(),
-                },
-                _ => return,
+            let Some(recorded) = RecordedObservation::from_observation(observation) else {
+                return;
             };
             self.observations
                 .lock()
                 .expect("recording observer mutex remains healthy")
                 .push(recorded);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RecordedAdmissionMetadata {
+        operation: AdmissionOperation,
+        has_policy_id: bool,
+        has_scope_id: bool,
+        has_policy_fingerprint: bool,
+    }
+
+    #[derive(Default)]
+    struct AdmissionMetadataObserver {
+        admissions: Mutex<Vec<RecordedAdmissionMetadata>>,
+    }
+
+    impl Observer for AdmissionMetadataObserver {
+        fn observe(&self, observation: &Observation<'_>) {
+            let Observation::Admission(admission) = observation else {
+                return;
+            };
+            self.admissions
+                .lock()
+                .unwrap()
+                .push(RecordedAdmissionMetadata {
+                    operation: admission.operation(),
+                    has_policy_id: admission.policy_id().is_some(),
+                    has_scope_id: admission.scope_id().is_some(),
+                    has_policy_fingerprint: admission.policy_fingerprint().is_some(),
+                });
+        }
+    }
+
+    struct ReentrantObserver {
+        store: Mutex<Option<Weak<GcraStore<ManualClock>>>>,
+        observations: Mutex<Vec<RecordedObservation>>,
+    }
+
+    impl Observer for ReentrantObserver {
+        fn observe(&self, observation: &Observation<'_>) {
+            if let Some(store) = self
+                .store
+                .lock()
+                .expect("reentrant observer store mutex remains healthy")
+                .as_ref()
+                .and_then(Weak::upgrade)
+            {
+                store
+                    .stats()
+                    .expect("observer runs after shard locks release");
+            }
+            if let Some(recorded) = RecordedObservation::from_observation(observation) {
+                self.observations
+                    .lock()
+                    .expect("reentrant observer observations mutex remains healthy")
+                    .push(recorded);
+            }
         }
     }
 
@@ -1036,6 +1072,27 @@ mod tests {
     }
 
     #[test]
+    fn unsatisfiable_batch_uses_shared_topology_preflight_without_mutation() {
+        let store =
+            GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
+        let policy = policy("api.unsatisfiable", 1, Duration::from_secs(1), 1);
+        let checks = [
+            Check::new(&policy, subject(1)),
+            Check::new(&policy, subject(2)),
+        ];
+
+        assert_eq!(
+            store.check_all(&checks),
+            Err(MemoryStoreError::BatchExceedsShardCapacity {
+                shard_index: 0,
+                key_count: 2,
+                capacity: 1,
+            })
+        );
+        assert_eq!(store.stats().unwrap().entries(), 0);
+    }
+
+    #[test]
     fn atomic_batches_preserve_order_and_roll_back_on_shadow_denial() {
         let store =
             GcraStore::with_clock(MemoryStoreConfig::new(8).unwrap(), ManualClock::default());
@@ -1076,6 +1133,66 @@ mod tests {
     }
 
     #[test]
+    fn batch_observers_run_after_unlock_in_sorted_shard_order() {
+        let observer = Arc::new(ReentrantObserver {
+            store: Mutex::new(None),
+            observations: Mutex::new(Vec::new()),
+        });
+        let config = MemoryStoreConfig::new(2)
+            .unwrap()
+            .with_shard_count(2)
+            .unwrap();
+        let store = Arc::new(
+            GcraStore::with_clock(config, ManualClock::default()).with_observer(observer.clone()),
+        );
+        *observer
+            .store
+            .lock()
+            .expect("reentrant observer store mutex remains healthy") =
+            Some(Arc::downgrade(&store));
+        let policy = policy("api.observed-batch", 1, Duration::from_secs(1), 1);
+        let subject_for_shard = |target| {
+            (0..=u8::MAX)
+                .map(subject)
+                .find(|subject| {
+                    let check = Check::new(&policy, *subject);
+                    store.shards.shard_index(&check.counter_key()) == target
+                })
+                .expect("the deterministic subject space reaches each configured shard")
+        };
+        let checks = [
+            Check::new(&policy, subject_for_shard(1)),
+            Check::new(&policy, subject_for_shard(0)),
+        ];
+
+        assert!(!store.check_all(&checks).unwrap().would_deny());
+        assert_eq!(
+            *observer
+                .observations
+                .lock()
+                .expect("reentrant observer observations mutex remains healthy"),
+            vec![
+                RecordedObservation::Cleanup { removed: Some(0) },
+                RecordedObservation::Capacity {
+                    used: 1,
+                    capacity: 1,
+                    shard_index: Some(0),
+                },
+                RecordedObservation::Cleanup { removed: Some(0) },
+                RecordedObservation::Capacity {
+                    used: 1,
+                    capacity: 1,
+                    shard_index: Some(1),
+                },
+                RecordedObservation::Admission {
+                    outcome: AdmissionOutcome::Allowed,
+                    consumption: ConsumptionStatus::Consumed,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn extreme_clock_values_fail_closed_without_mutation() {
         let store = GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), MaximumClock);
         let policy = policy("api.read", MAX_LIMIT, Duration::from_millis(1), 1);
@@ -1086,6 +1203,46 @@ mod tests {
             Err(MemoryStoreError::ArithmeticOverflow)
         );
         assert_eq!(store.stats().unwrap().entries(), 0);
+    }
+
+    #[test]
+    fn failed_gcra_checks_keep_policy_metadata_but_failed_batches_remain_anonymous() {
+        let observer = Arc::new(AdmissionMetadataObserver::default());
+        let store = GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), MaximumClock)
+            .with_observer(observer.clone());
+        let policy = policy(
+            "api.observed-overflow",
+            MAX_LIMIT,
+            Duration::from_millis(1),
+            1,
+        );
+        let check = Check::new(&policy, subject(1));
+
+        assert_eq!(
+            store.check(&check),
+            Err(MemoryStoreError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            store.check_all(&[check]),
+            Err(MemoryStoreError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            observer.admissions.lock().unwrap().as_slice(),
+            [
+                RecordedAdmissionMetadata {
+                    operation: AdmissionOperation::Check,
+                    has_policy_id: true,
+                    has_scope_id: true,
+                    has_policy_fingerprint: true,
+                },
+                RecordedAdmissionMetadata {
+                    operation: AdmissionOperation::Batch,
+                    has_policy_id: false,
+                    has_scope_id: false,
+                    has_policy_fingerprint: false,
+                },
+            ]
+        );
     }
 
     #[test]

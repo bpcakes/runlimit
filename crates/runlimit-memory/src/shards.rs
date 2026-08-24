@@ -207,6 +207,69 @@ impl<E> Shard<E> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BatchShard {
+    index: usize,
+    check_count: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BatchTopology {
+    shards: Vec<BatchShard>,
+    input_positions: Vec<usize>,
+}
+
+impl BatchTopology {
+    pub(crate) fn new(
+        shard_indexes: impl IntoIterator<Item = usize>,
+        config: &MemoryStoreConfig,
+    ) -> Result<Self, MemoryStoreError> {
+        let mut input_positions = shard_indexes.into_iter().collect::<Vec<_>>();
+        let mut shards = input_positions
+            .iter()
+            .copied()
+            .map(|index| BatchShard {
+                index,
+                check_count: 0,
+            })
+            .collect::<Vec<_>>();
+        shards.sort_unstable_by_key(|shard| shard.index);
+        shards.dedup_by_key(|shard| shard.index);
+
+        for shard_position in &mut input_positions {
+            let shard_index = *shard_position;
+            *shard_position = shards.partition_point(|shard| shard.index < shard_index);
+            let shard = &mut shards[*shard_position];
+            debug_assert_eq!(shard.index, shard_index);
+            shard.check_count += 1;
+        }
+
+        for shard in &shards {
+            let capacity = config.shard_capacity(shard.index);
+            if shard.check_count > capacity {
+                return Err(MemoryStoreError::BatchExceedsShardCapacity {
+                    shard_index: shard.index,
+                    key_count: shard.check_count,
+                    capacity,
+                });
+            }
+        }
+
+        Ok(Self {
+            shards,
+            input_positions,
+        })
+    }
+
+    pub(crate) fn shard_position(&self, input_index: usize) -> usize {
+        self.input_positions[input_index]
+    }
+
+    pub(crate) fn check_counts(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.shards.iter().map(|shard| shard.check_count)
+    }
+}
+
 pub(crate) struct BoundedShards<E> {
     shards: Box<[Mutex<Shard<E>>]>,
 }
@@ -256,6 +319,17 @@ impl<E> BoundedShards<E> {
         let mut locked = Vec::with_capacity(indexes.len());
         for &index in indexes {
             locked.push((index, self.lock_shard(index)?));
+        }
+        Ok(locked)
+    }
+
+    pub(crate) fn lock_topology<'a>(
+        &'a self,
+        topology: &BatchTopology,
+    ) -> Result<LockedShards<'a, E>, MemoryStoreError> {
+        let mut locked = Vec::with_capacity(topology.shards.len());
+        for shard in &topology.shards {
+            locked.push((shard.index, self.lock_shard(shard.index)?));
         }
         Ok(locked)
     }
@@ -377,7 +451,7 @@ mod tests {
 
     use runlimit_core::{Check, CounterKey, FixedWindowPolicy, PolicyId, ScopeId, SubjectKey};
 
-    use super::BoundedShards;
+    use super::{BatchShard, BatchTopology, BoundedShards};
     use crate::{MemoryStoreConfig, MemoryStoreError};
 
     #[derive(Clone, Copy)]
@@ -392,6 +466,55 @@ mod tests {
         )
         .unwrap();
         Check::new(&policy, SubjectKey::from_digest([subject_byte; 32])).counter_key()
+    }
+
+    #[test]
+    fn batch_topology_resolves_sorted_routes_and_counts_once() {
+        let config = MemoryStoreConfig::new(5)
+            .unwrap()
+            .with_shard_count(2)
+            .unwrap();
+        let topology = BatchTopology::new([1, 0, 1], &config).unwrap();
+
+        assert_eq!(
+            topology.shards,
+            vec![
+                BatchShard {
+                    index: 0,
+                    check_count: 1,
+                },
+                BatchShard {
+                    index: 1,
+                    check_count: 2,
+                },
+            ]
+        );
+        assert_eq!(topology.input_positions, vec![1, 0, 1]);
+        assert_eq!(topology.check_counts().collect::<Vec<_>>(), vec![1, 2]);
+
+        let shards = BoundedShards::<TestEntry>::new(&config);
+        let locked = shards.lock_topology(&topology).unwrap();
+        assert_eq!(
+            locked.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn batch_topology_rejects_the_first_over_capacity_shard() {
+        let config = MemoryStoreConfig::new(4)
+            .unwrap()
+            .with_shard_count(2)
+            .unwrap();
+
+        assert_eq!(
+            BatchTopology::new([1, 0, 0, 0, 1, 1], &config),
+            Err(MemoryStoreError::BatchExceedsShardCapacity {
+                shard_index: 0,
+                key_count: 3,
+                capacity: 2,
+            })
+        );
     }
 
     fn insert(shard: &mut super::Shard<TestEntry>, key: CounterKey, expires_at_millis: u128) {

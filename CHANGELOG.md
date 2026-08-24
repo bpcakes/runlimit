@@ -16,6 +16,16 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ### Changed
 
+- **Breaking:** replace the raw seven-field `AdmissionObservation::new`
+  constructor with semantic failed-check and failed-batch factories. Policy ID
+  scope, and configuration-fingerprint metadata are now derived together from
+  a validated check, while failure factories require an explicit consumption
+  status. The existing `Debug` field representation remains unchanged.
+- **Breaking:** replace the raw `CleanupObservation::new` constructor with
+  `confirmed`, `definitely_no_effect`, and `outcome_unknown` factories so a
+  confirmed removal count cannot be paired with contradictory consumption
+  certainty. Existing getters and the `Debug` field representation remain
+  unchanged.
 - **Breaking:** replace directly constructible decision and denial enum states
   with validated constructors and read-only accessors. Shadow denials now
   require `QuotaDenial`, allowed batches reject denied members, and the Serde

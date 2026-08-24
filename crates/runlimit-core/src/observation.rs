@@ -1,11 +1,12 @@
 use std::{
+    fmt,
     panic::{AssertUnwindSafe, catch_unwind},
     time::Duration,
 };
 
 use crate::{
-    BatchDecision, BatchDecisionView, Check, Decision, DecisionView, Denial, DenialKind, PolicyId,
-    RateLimitPolicy, ScopeId,
+    BatchDecision, BatchDecisionView, Check, Decision, DecisionView, Denial, DenialKind,
+    PolicyFingerprint, PolicyId, RateLimitPolicy, ScopeId,
 };
 
 /// Receives synchronous, backend-neutral operational observations.
@@ -15,8 +16,8 @@ use crate::{
 /// locks and finalizing database transactions. A panic from an observer is
 /// caught and ignored so telemetry cannot change an admission result.
 ///
-/// Observations deliberately contain no subject keys, policy fingerprints,
-/// backend error text, or other high-cardinality sensitive values.
+/// Observations deliberately contain no subject keys, backend error text, or
+/// other high-cardinality sensitive values.
 pub trait Observer: Send + Sync + 'static {
     /// Records one operational observation.
     fn observe(&self, observation: &Observation<'_>);
@@ -73,34 +74,77 @@ pub enum ConsumptionStatus {
 }
 
 /// Metadata for one completed admission operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct AdmissionObservation<'a> {
     operation: AdmissionOperation,
     batch_size: usize,
-    policy_id: Option<&'a PolicyId>,
-    scope_id: Option<&'a ScopeId>,
+    policy: Option<AdmissionPolicy<'a>>,
     outcome: AdmissionOutcome,
     consumption: ConsumptionStatus,
     elapsed: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionPolicy<'a> {
+    policy_id: &'a PolicyId,
+    scope_id: &'a ScopeId,
+    fingerprint: PolicyFingerprint,
+}
+
+impl<'a> AdmissionPolicy<'a> {
+    fn from_check<P: RateLimitPolicy + ?Sized>(check: &Check<'a, P>) -> Self {
+        Self {
+            policy_id: check.policy().id(),
+            scope_id: check.policy().scope(),
+            fingerprint: check.policy().fingerprint(),
+        }
+    }
+}
+
 impl<'a> AdmissionObservation<'a> {
-    /// Constructs admission metadata.
-    pub const fn new(
-        operation: AdmissionOperation,
-        batch_size: usize,
-        policy_id: Option<&'a PolicyId>,
-        scope_id: Option<&'a ScopeId>,
-        outcome: AdmissionOutcome,
+    /// Builds metadata for a failed single-check operation.
+    pub fn failed_check<P: RateLimitPolicy + ?Sized>(
+        check: &Check<'a, P>,
         consumption: ConsumptionStatus,
         elapsed: Duration,
     ) -> Self {
         Self {
-            operation,
+            operation: AdmissionOperation::Check,
+            batch_size: 1,
+            policy: Some(AdmissionPolicy::from_check(check)),
+            outcome: AdmissionOutcome::Failed,
+            consumption,
+            elapsed,
+        }
+    }
+
+    /// Builds metadata for a failed batch without relevant policy metadata.
+    pub const fn failed_batch(
+        batch_size: usize,
+        consumption: ConsumptionStatus,
+        elapsed: Duration,
+    ) -> Self {
+        Self {
+            operation: AdmissionOperation::Batch,
             batch_size,
-            policy_id,
-            scope_id,
-            outcome,
+            policy: None,
+            outcome: AdmissionOutcome::Failed,
+            consumption,
+            elapsed,
+        }
+    }
+
+    /// Builds metadata for a failed one-check batch with relevant policy metadata.
+    pub fn failed_batch_for_check<P: RateLimitPolicy + ?Sized>(
+        check: &Check<'a, P>,
+        consumption: ConsumptionStatus,
+        elapsed: Duration,
+    ) -> Self {
+        Self {
+            operation: AdmissionOperation::Batch,
+            batch_size: 1,
+            policy: Some(AdmissionPolicy::from_check(check)),
+            outcome: AdmissionOutcome::Failed,
             consumption,
             elapsed,
         }
@@ -157,18 +201,14 @@ impl<'a> AdmissionObservation<'a> {
         consumption: ConsumptionStatus,
         elapsed: Duration,
     ) -> Self {
-        let (policy_id, scope_id) = relevant_check.map_or((None, None), |check| {
-            (Some(check.policy().id()), Some(check.policy().scope()))
-        });
-        Self::new(
+        Self {
             operation,
             batch_size,
-            policy_id,
-            scope_id,
+            policy: relevant_check.map(AdmissionPolicy::from_check),
             outcome,
             consumption,
             elapsed,
-        )
+        }
     }
 
     /// Returns the operation kind.
@@ -183,12 +223,26 @@ impl<'a> AdmissionObservation<'a> {
 
     /// Returns a relevant policy identifier for a single or failing check.
     pub const fn policy_id(self) -> Option<&'a PolicyId> {
-        self.policy_id
+        match self.policy {
+            Some(policy) => Some(policy.policy_id),
+            None => None,
+        }
     }
 
     /// Returns a relevant scope identifier for a single or failing check.
     pub const fn scope_id(self) -> Option<&'a ScopeId> {
-        self.scope_id
+        match self.policy {
+            Some(policy) => Some(policy.scope_id),
+            None => None,
+        }
+    }
+
+    /// Returns the relevant policy's storage configuration fingerprint.
+    pub const fn policy_fingerprint(self) -> Option<PolicyFingerprint> {
+        match self.policy {
+            Some(policy) => Some(policy.fingerprint),
+            None => None,
+        }
     }
 
     /// Returns the admission outcome class.
@@ -204,6 +258,21 @@ impl<'a> AdmissionObservation<'a> {
     /// Returns wall-clock evaluation latency measured by the backend process.
     pub const fn elapsed(self) -> Duration {
         self.elapsed
+    }
+}
+
+impl fmt::Debug for AdmissionObservation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdmissionObservation")
+            .field("operation", &self.operation())
+            .field("batch_size", &self.batch_size())
+            .field("policy_id", &self.policy_id())
+            .field("scope_id", &self.scope_id())
+            .field("outcome", &self.outcome())
+            .field("consumption", &self.consumption())
+            .field("elapsed", &self.elapsed())
+            .finish()
     }
 }
 
@@ -263,30 +332,45 @@ fn batch_relevant_check<'checks, 'policy, P: RateLimitPolicy + ?Sized>(
 }
 
 /// Metadata for one bounded cleanup pass.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct CleanupObservation {
     requested: usize,
-    removed: Option<u64>,
     elapsed: Duration,
-    consumption: ConsumptionStatus,
+    outcome: CleanupOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupOutcome {
+    Confirmed(u64),
+    DefinitelyNoEffect,
+    OutcomeUnknown,
 }
 
 impl CleanupObservation {
-    /// Constructs cleanup metadata.
-    ///
-    /// `removed` is `None` when a failed database operation has an unknown
-    /// commit result. `consumption` describes the certainty of that effect.
-    pub const fn new(
-        requested: usize,
-        removed: Option<u64>,
-        elapsed: Duration,
-        consumption: ConsumptionStatus,
-    ) -> Self {
+    /// Constructs metadata for a cleanup pass with a confirmed removal count.
+    pub const fn confirmed(requested: usize, removed: u64, elapsed: Duration) -> Self {
         Self {
             requested,
-            removed,
             elapsed,
-            consumption,
+            outcome: CleanupOutcome::Confirmed(removed),
+        }
+    }
+
+    /// Constructs metadata for a cleanup operation that definitely had no effect.
+    pub const fn definitely_no_effect(requested: usize, elapsed: Duration) -> Self {
+        Self {
+            requested,
+            elapsed,
+            outcome: CleanupOutcome::DefinitelyNoEffect,
+        }
+    }
+
+    /// Constructs metadata for a failed cleanup whose effect cannot be determined.
+    pub const fn outcome_unknown(requested: usize, elapsed: Duration) -> Self {
+        Self {
+            requested,
+            elapsed,
+            outcome: CleanupOutcome::OutcomeUnknown,
         }
     }
 
@@ -297,7 +381,11 @@ impl CleanupObservation {
 
     /// Returns confirmed rows or entries removed, when known.
     pub const fn removed(self) -> Option<u64> {
-        self.removed
+        match self.outcome {
+            CleanupOutcome::Confirmed(removed) => Some(removed),
+            CleanupOutcome::DefinitelyNoEffect => Some(0),
+            CleanupOutcome::OutcomeUnknown => None,
+        }
     }
 
     /// Returns cleanup latency.
@@ -307,7 +395,23 @@ impl CleanupObservation {
 
     /// Returns certainty about the reported cleanup effect.
     pub const fn consumption(self) -> ConsumptionStatus {
-        self.consumption
+        match self.outcome {
+            CleanupOutcome::Confirmed(_) => ConsumptionStatus::Consumed,
+            CleanupOutcome::DefinitelyNoEffect => ConsumptionStatus::NotConsumed,
+            CleanupOutcome::OutcomeUnknown => ConsumptionStatus::PossiblyConsumed,
+        }
+    }
+}
+
+impl fmt::Debug for CleanupObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CleanupObservation")
+            .field("requested", &self.requested())
+            .field("removed", &self.removed())
+            .field("elapsed", &self.elapsed())
+            .field("consumption", &self.consumption())
+            .finish()
     }
 }
 
@@ -364,7 +468,10 @@ pub fn observe_safely(observer: &dyn Observer, observation: &Observation<'_>) {
 mod tests {
     use std::time::Duration;
 
-    use super::{AdmissionObservation, AdmissionOperation, AdmissionOutcome, ConsumptionStatus};
+    use super::{
+        AdmissionObservation, AdmissionOperation, AdmissionOutcome, CleanupObservation,
+        ConsumptionStatus,
+    };
     use crate::{
         BatchDecision, Check, Decision, Denial, FixedWindowPolicy, PolicyId, QuotaDenial,
         RateLimitPolicy, ScopeId, SubjectKey,
@@ -393,6 +500,10 @@ mod tests {
         assert_eq!(admission.batch_size(), batch_size);
         assert_eq!(admission.policy_id(), policy.map(RateLimitPolicy::id),);
         assert_eq!(admission.scope_id(), policy.map(RateLimitPolicy::scope),);
+        assert_eq!(
+            admission.policy_fingerprint(),
+            policy.map(RateLimitPolicy::fingerprint),
+        );
         assert_eq!(admission.outcome(), outcome);
         assert_eq!(admission.consumption(), consumption);
         assert_eq!(admission.elapsed(), elapsed);
@@ -438,6 +549,56 @@ mod tests {
                 elapsed,
             );
         }
+    }
+
+    #[test]
+    fn failure_factories_preserve_consumption_and_couple_policy_metadata() {
+        let policy = policy("api.failed");
+        let check = Check::new(&policy, SubjectKey::from_digest([1; 32]));
+        let elapsed = Duration::from_millis(7);
+
+        assert_admission(
+            AdmissionObservation::failed_check(
+                &check,
+                ConsumptionStatus::PossiblyConsumed,
+                elapsed,
+            ),
+            AdmissionOperation::Check,
+            1,
+            Some(&policy),
+            AdmissionOutcome::Failed,
+            ConsumptionStatus::PossiblyConsumed,
+            elapsed,
+        );
+        assert_admission(
+            AdmissionObservation::failed_batch(1, ConsumptionStatus::NotConsumed, elapsed),
+            AdmissionOperation::Batch,
+            1,
+            None,
+            AdmissionOutcome::Failed,
+            ConsumptionStatus::NotConsumed,
+            elapsed,
+        );
+        let failed_batch = AdmissionObservation::failed_batch_for_check(
+            &check,
+            ConsumptionStatus::NotConsumed,
+            elapsed,
+        );
+        assert_admission(
+            failed_batch,
+            AdmissionOperation::Batch,
+            1,
+            Some(&policy),
+            AdmissionOutcome::Failed,
+            ConsumptionStatus::NotConsumed,
+            elapsed,
+        );
+        assert_eq!(
+            format!("{failed_batch:?}"),
+            "AdmissionObservation { operation: Batch, batch_size: 1, policy_id: \
+             Some(PolicyId(\"api.failed\")), scope_id: Some(ScopeId(\"client\")), outcome: \
+             Failed, consumption: NotConsumed, elapsed: 7ms }"
+        );
     }
 
     #[test]
@@ -510,5 +671,40 @@ mod tests {
                 elapsed,
             );
         }
+    }
+
+    #[test]
+    fn cleanup_factories_expose_only_consistent_effect_states() {
+        let elapsed = Duration::from_millis(5);
+        let cases = [
+            (
+                CleanupObservation::confirmed(8, 3, elapsed),
+                Some(3),
+                ConsumptionStatus::Consumed,
+            ),
+            (
+                CleanupObservation::definitely_no_effect(8, elapsed),
+                Some(0),
+                ConsumptionStatus::NotConsumed,
+            ),
+            (
+                CleanupObservation::outcome_unknown(8, elapsed),
+                None,
+                ConsumptionStatus::PossiblyConsumed,
+            ),
+        ];
+
+        for (cleanup, removed, consumption) in cases {
+            assert_eq!(cleanup.requested(), 8);
+            assert_eq!(cleanup.removed(), removed);
+            assert_eq!(cleanup.elapsed(), elapsed);
+            assert_eq!(cleanup.consumption(), consumption);
+        }
+
+        assert_eq!(
+            format!("{:?}", CleanupObservation::confirmed(8, 3, elapsed)),
+            "CleanupObservation { requested: 8, removed: Some(3), elapsed: 5ms, consumption: \
+             Consumed }"
+        );
     }
 }

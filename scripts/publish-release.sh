@@ -10,10 +10,6 @@ PUBLISHABLE_CRATES=(
   "runlimit-http"
   "runlimit-axum"
 )
-FIRST_PUBLISH_CRATES=(
-  "runlimit-http"
-  "runlimit-axum"
-)
 CRATES_IO_USER_AGENT="runlimit-release-script/0.2 (https://github.com/bpcakes/runlimit)"
 CRATES_IO_TIMEOUT_SECONDS="${CRATES_IO_TIMEOUT_SECONDS:-600}"
 CRATES_IO_POLL_SECONDS="${CRATES_IO_POLL_SECONDS:-10}"
@@ -151,43 +147,6 @@ verify_local_package_provenance() {
     || die "${crate} package was built from a dirty working tree"
   [[ "$vcs_path" == "$expected_path" ]] \
     || die "${crate} package path ${vcs_path} is not ${expected_path}"
-}
-
-preflight_first_publish_crate_names() {
-  local crate
-  local spelling
-  local response_file
-  local http_code
-  local registry_name
-
-  [[ "$VERSION" == "0.2.0" ]] || return 0
-
-  for crate in "${FIRST_PUBLISH_CRATES[@]}"; do
-    for spelling in "$crate" "${crate//-/_}"; do
-      response_file="$WORK_DIR/${spelling}-name.json"
-      http_code="$(curl \
-        --silent \
-        --show-error \
-        --location \
-        --user-agent "$CRATES_IO_USER_AGENT" \
-        --output "$response_file" \
-        --write-out '%{http_code}' \
-        "https://crates.io/api/v1/crates/${spelling}")" \
-        || die "failed to query crates.io for ${spelling}"
-      case "$http_code" in
-        404) ;;
-        200)
-          [[ "$RESUME_RELEASE" == "1" ]] \
-            || die "first-publish crate name ${spelling} is not available"
-          registry_name="$(jq -er '.crate.id' "$response_file")" \
-            || die "crates.io did not identify the crate returned for ${spelling}"
-          [[ "$registry_name" == "$crate" ]] \
-            || die "${spelling} resolves to unexpected crate ${registry_name}"
-          ;;
-        *) die "unexpected crates.io response for ${spelling}: HTTP ${http_code}" ;;
-      esac
-    done
-  done
 }
 
 require_release_commit() {
@@ -342,8 +301,6 @@ cleanup() {
   rm -rf -- "$WORK_DIR"
 }
 trap cleanup EXIT HUP INT TERM
-
-preflight_first_publish_crate_names
 
 # Preflight every crate before the first irreversible upload. Existing versions
 # are accepted only for an explicitly resumed release. A valid partial release
