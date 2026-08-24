@@ -566,9 +566,6 @@ pub enum MemoryStoreError {
         /// Poisoned shard index.
         shard_index: usize,
     },
-    /// Exact GCRA arithmetic could not represent the clock-relative state.
-    #[error("GCRA arithmetic exceeded the supported exact range")]
-    ArithmeticOverflow,
 }
 
 #[cfg(test)]

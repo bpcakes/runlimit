@@ -9,6 +9,7 @@ use runlimit_core::{
     ConsumptionStatus, CounterKey, Decision, Denial, GcraPolicy, Limiter, Observation, Observer,
     QuotaDenial, QuotaMode, observe_safely, validate_batch,
 };
+use thiserror::Error;
 
 use crate::{
     Clock, MemoryStoreConfig, MemoryStoreError, MemoryStoreStats, SystemClock,
@@ -90,6 +91,18 @@ impl Shard<Entry> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ArithmeticOverflow;
+
+/// Failure from a GCRA memory-store admission operation.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum GcraStoreError {
+    /// The shared bounded memory store rejected the operation.
+    #[error(transparent)]
+    Store(#[from] MemoryStoreError),
+    /// Exact GCRA arithmetic could not represent the clock-relative state.
+    #[error("GCRA arithmetic exceeded the supported exact range")]
+    ArithmeticOverflow,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QuotaEvaluation {
@@ -195,7 +208,7 @@ impl<C: Clock> GcraStore<C> {
     ///
     /// Fails closed when the target shard is poisoned or exact arithmetic
     /// cannot represent the caller-supplied clock value.
-    pub fn check(&self, check: &Check<'_, GcraPolicy>) -> Result<Decision, MemoryStoreError> {
+    pub fn check(&self, check: &Check<'_, GcraPolicy>) -> Result<Decision, GcraStoreError> {
         let started = Instant::now();
         let result = self.check_inner(check);
         let elapsed = started.elapsed();
@@ -216,7 +229,7 @@ impl<C: Clock> GcraStore<C> {
     fn check_inner(
         &self,
         check: &Check<'_, GcraPolicy>,
-    ) -> Result<Evaluation<Decision, ShardEffect>, MemoryStoreError> {
+    ) -> Result<Evaluation<Decision, ShardEffect>, GcraStoreError> {
         let counter_key = check.counter_key();
         let shard_index = self.shards.shard_index(&counter_key);
         let prepared = PreparedCheck::new(0, check, 0);
@@ -225,7 +238,7 @@ impl<C: Clock> GcraStore<C> {
         let now_millis = observed_millis.max(shard.latest_observed_millis());
         let evaluated = shard
             .evaluate(&prepared, now_millis)
-            .map_err(|ArithmeticOverflow| MemoryStoreError::ArithmeticOverflow)?;
+            .map_err(|ArithmeticOverflow| GcraStoreError::ArithmeticOverflow)?;
         shard.record_observed_millis(now_millis);
         let cleanup_requested = self.config.max_expired_removals_per_check();
         let cleanup_started = Instant::now();
@@ -281,7 +294,7 @@ impl<C: Clock> GcraStore<C> {
     pub fn check_all(
         &self,
         checks: &[Check<'_, GcraPolicy>],
-    ) -> Result<BatchDecision, MemoryStoreError> {
+    ) -> Result<BatchDecision, GcraStoreError> {
         let started = Instant::now();
         let result = self.check_all_inner(checks);
         let elapsed = started.elapsed();
@@ -307,8 +320,8 @@ impl<C: Clock> GcraStore<C> {
     fn check_all_inner(
         &self,
         checks: &[Check<'_, GcraPolicy>],
-    ) -> Result<Evaluation<BatchDecision, Vec<ShardEffect>>, MemoryStoreError> {
-        validate_batch(checks, self.config.max_batch_size())?;
+    ) -> Result<Evaluation<BatchDecision, Vec<ShardEffect>>, GcraStoreError> {
+        validate_batch(checks, self.config.max_batch_size()).map_err(MemoryStoreError::from)?;
         if checks.is_empty() {
             return Ok(Evaluation {
                 value: BatchDecision::allowed(Vec::new()),
@@ -342,7 +355,7 @@ impl<C: Clock> GcraStore<C> {
                 locked_shards[check.shard_position]
                     .1
                     .evaluate(check, now_millis)
-                    .map_err(|ArithmeticOverflow| MemoryStoreError::ArithmeticOverflow)?,
+                    .map_err(|ArithmeticOverflow| GcraStoreError::ArithmeticOverflow)?,
             );
         }
         let mut cleanup_effects = Vec::with_capacity(locked_shards.len());
@@ -492,7 +505,7 @@ fn duration_from_millis(millis: u128) -> Duration {
 
 impl<C: Clock> Limiter for GcraStore<C> {
     type Policy = GcraPolicy;
-    type Error = MemoryStoreError;
+    type Error = GcraStoreError;
 
     async fn check(&self, check: &Check<'_, Self::Policy>) -> Result<Decision, Self::Error> {
         GcraStore::check(self, check)
@@ -523,7 +536,7 @@ mod tests {
         QuotaMode, ScopeId, SubjectKey,
     };
 
-    use super::GcraStore;
+    use super::{GcraStore, GcraStoreError};
     use crate::{Clock, MemoryStoreConfig, MemoryStoreError};
 
     fn quota(capacity: u64, retry_after: Duration) -> QuotaDenial {
@@ -1083,11 +1096,13 @@ mod tests {
 
         assert_eq!(
             store.check_all(&checks),
-            Err(MemoryStoreError::BatchExceedsShardCapacity {
-                shard_index: 0,
-                key_count: 2,
-                capacity: 1,
-            })
+            Err(GcraStoreError::Store(
+                MemoryStoreError::BatchExceedsShardCapacity {
+                    shard_index: 0,
+                    key_count: 2,
+                    capacity: 1,
+                }
+            ))
         );
         assert_eq!(store.stats().unwrap().entries(), 0);
     }
@@ -1198,10 +1213,7 @@ mod tests {
         let policy = policy("api.read", MAX_LIMIT, Duration::from_millis(1), 1);
         let check = Check::new(&policy, subject(1));
 
-        assert_eq!(
-            store.check(&check),
-            Err(MemoryStoreError::ArithmeticOverflow)
-        );
+        assert_eq!(store.check(&check), Err(GcraStoreError::ArithmeticOverflow));
         assert_eq!(store.stats().unwrap().entries(), 0);
     }
 
@@ -1218,13 +1230,10 @@ mod tests {
         );
         let check = Check::new(&policy, subject(1));
 
-        assert_eq!(
-            store.check(&check),
-            Err(MemoryStoreError::ArithmeticOverflow)
-        );
+        assert_eq!(store.check(&check), Err(GcraStoreError::ArithmeticOverflow));
         assert_eq!(
             store.check_all(&[check]),
-            Err(MemoryStoreError::ArithmeticOverflow)
+            Err(GcraStoreError::ArithmeticOverflow)
         );
         assert_eq!(
             observer.admissions.lock().unwrap().as_slice(),
@@ -1264,7 +1273,7 @@ mod tests {
         let overflowing = policy("api.overflowing", MAX_LIMIT, Duration::from_millis(1), 1);
         assert_eq!(
             store.check(&Check::new(&overflowing, subject(2))),
-            Err(MemoryStoreError::ArithmeticOverflow)
+            Err(GcraStoreError::ArithmeticOverflow)
         );
         assert_eq!(
             store.stats().unwrap().entries(),
@@ -1294,7 +1303,7 @@ mod tests {
         let later = Check::new(&overflowing, subject(2));
         assert_eq!(
             store.check_all(&[exhausted, later]),
-            Err(MemoryStoreError::ArithmeticOverflow),
+            Err(GcraStoreError::ArithmeticOverflow),
             "a later arithmetic failure must supersede an earlier quota denial"
         );
         assert_eq!(

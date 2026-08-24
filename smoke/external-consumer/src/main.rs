@@ -4,9 +4,15 @@ use runlimit_core::{
     AdmissionObservation, BatchDecisionView, Check, CleanupObservation, ConsumptionStatus,
     FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
 };
-use runlimit_memory::{MemoryStore, MemoryStoreConfig};
+use runlimit_memory::{GcraStoreError, MemoryStore, MemoryStoreConfig, MemoryStoreError};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let gcra_error = GcraStoreError::from(MemoryStoreError::PoisonedShard { shard_index: 0 });
+    assert!(matches!(
+        gcra_error,
+        GcraStoreError::Store(MemoryStoreError::PoisonedShard { shard_index: 0 })
+    ));
+
     let cleanup = CleanupObservation::outcome_unknown(100, Duration::from_millis(5));
     assert_eq!(cleanup.removed(), None);
     assert_eq!(cleanup.consumption(), ConsumptionStatus::PossiblyConsumed);

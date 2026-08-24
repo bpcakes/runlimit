@@ -38,6 +38,9 @@ The format is based on [Keep a Changelog], and this project adheres to
   conversion could panic for constructible fixed-window limit errors. Policy
   constructors continue to report the same algorithm-specific validation
   errors in the same order.
+- **Breaking:** return `GcraStoreError` from GCRA admission operations and move
+  the GCRA-only arithmetic-overflow failure out of `MemoryStoreError`. Common
+  bounded-storage failures are available through `GcraStoreError::Store`.
 - Share the bounded shard, expiration, capacity, locking, and recovery
   machinery used by the in-memory fixed-window and GCRA stores while retaining
   their separate policy algorithms and existing behavior.

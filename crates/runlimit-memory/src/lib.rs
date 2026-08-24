@@ -5,8 +5,9 @@
 //! generic-cell-rate-algorithm model for process-local use. Both stores
 //! deliberately refuse to evict live entries. When a shard is full, a new
 //! subject is denied until bounded cleanup frees space. An atomic batch that
-//! can never fit in one shard returns a structural [`MemoryStoreError`] instead
-//! of a retryable capacity denial. Both stores implement
+//! can never fit in one shard returns a structural [`MemoryStoreError`] (wrapped
+//! by [`GcraStoreError`] for GCRA admission) instead of a retryable capacity
+//! denial. Both stores implement
 //! [`runlimit_core::Limiter`] for async generic adapters while retaining their
 //! synchronous inherent check methods.
 //!
@@ -22,5 +23,5 @@ mod store;
 
 pub use clock::{Clock, SystemClock};
 pub use config::{MemoryStoreConfig, MemoryStoreConfigError};
-pub use gcra::GcraStore;
+pub use gcra::{GcraStore, GcraStoreError};
 pub use store::{MemoryStore, MemoryStoreError, MemoryStoreStats};

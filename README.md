@@ -341,8 +341,11 @@ returns the number recovered. Resetting those counters can admit requests that
 their lost state would have denied; replacing the store is a broader reset
 with the same security consequence for every shard.
 
-Treat every `MemoryStoreError` as an admission failure; it is distinct from a
-normal quota denial returned in a `Decision` or `BatchDecision`.
+Treat every `MemoryStoreError` or `GcraStoreError` as an admission failure; both
+are distinct from a normal quota denial returned in a `Decision` or
+`BatchDecision`. `GcraStoreError::Store` wraps the bounded-storage failures
+shared with `MemoryStore`, while GCRA-specific arithmetic failures remain in
+the GCRA error contract.
 
 ## PostgreSQL backend
 
