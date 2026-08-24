@@ -464,12 +464,18 @@ impl<C: Clock> Limiter for MemoryStore<C> {
     type Policy = runlimit_core::FixedWindowPolicy;
     type Error = MemoryStoreError;
 
-    async fn check(&self, check: &Check<'_>) -> Result<Decision, Self::Error> {
-        MemoryStore::check(self, check)
+    fn check(
+        &self,
+        check: &Check<'_>,
+    ) -> impl Future<Output = Result<Decision, Self::Error>> + Send {
+        std::future::ready(MemoryStore::check(self, check))
     }
 
-    async fn check_all(&self, checks: &[Check<'_>]) -> Result<BatchDecision, Self::Error> {
-        MemoryStore::check_all(self, checks)
+    fn check_all(
+        &self,
+        checks: &[Check<'_>],
+    ) -> impl Future<Output = Result<BatchDecision, Self::Error>> + Send {
+        std::future::ready(MemoryStore::check_all(self, checks))
     }
 }
 

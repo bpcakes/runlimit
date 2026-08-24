@@ -507,15 +507,18 @@ impl<C: Clock> Limiter for GcraStore<C> {
     type Policy = GcraPolicy;
     type Error = GcraStoreError;
 
-    async fn check(&self, check: &Check<'_, Self::Policy>) -> Result<Decision, Self::Error> {
-        GcraStore::check(self, check)
+    fn check(
+        &self,
+        check: &Check<'_, Self::Policy>,
+    ) -> impl Future<Output = Result<Decision, Self::Error>> + Send {
+        std::future::ready(GcraStore::check(self, check))
     }
 
-    async fn check_all(
+    fn check_all(
         &self,
         checks: &[Check<'_, Self::Policy>],
-    ) -> Result<BatchDecision, Self::Error> {
-        GcraStore::check_all(self, checks)
+    ) -> impl Future<Output = Result<BatchDecision, Self::Error>> + Send {
+        std::future::ready(GcraStore::check_all(self, checks))
     }
 }
 
