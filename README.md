@@ -18,22 +18,24 @@ by Identitypro authentication throttling.
 | `runlimit-memory` | Sharded, hard-bounded process-local storage with bounded cleanup work. |
 | `runlimit-postgres` | Replica-safe SQLx/PostgreSQL storage, migrations, and bounded maintenance. |
 
-Choose the backend needed by the application:
+The latest published release is `0.2.0`. Choose the backend needed by the
+application:
 
 ```toml
 [dependencies]
-runlimit-core = "0.2.1"
-runlimit-memory = "0.2.1"
+runlimit-core = "0.2.0"
+runlimit-memory = "0.2.0"
 # Optional Axum/Tower admission middleware:
-# runlimit-axum = "0.2.1"
+# runlimit-axum = "0.2.0"
 # Optional typed HTTP response metadata:
-# runlimit-http = "0.2.1"
+# runlimit-http = "0.2.0"
 # Or, for a shared cross-replica quota:
-# runlimit-postgres = "0.2.1"
+# runlimit-postgres = "0.2.0"
 ```
 
-During development from a source checkout, a sibling project can use path
-dependencies:
+The examples below target the current, unreleased `0.3.0` API. During
+development from a source checkout, a sibling project can use path
+dependencies to compile them:
 
 ```toml
 [dependencies]
@@ -178,7 +180,7 @@ on a backend also enables it for `runlimit-core`:
 
 ```toml
 [dependencies]
-runlimit-memory = { version = "0.2.1", features = ["serde"] }
+runlimit-memory = { version = "0.2.0", features = ["serde"] }
 ```
 
 The feature serializes validated policy and scope identifiers as strings;

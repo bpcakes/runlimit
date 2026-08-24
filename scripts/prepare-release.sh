@@ -16,7 +16,7 @@ CRATES_IO_USER_AGENT="runlimit-release-script/0.2 (https://github.com/bpcakes/ru
 
 usage() {
   echo "usage: $0 <version>" >&2
-  echo "example: $0 0.2.1" >&2
+  echo "example: $0 0.3.0" >&2
 }
 
 die() {

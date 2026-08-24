@@ -13,11 +13,15 @@ The format is based on [Keep a Changelog], and this project adheres to
   exhaustively match valid decision states without reconstructing them from
   optional accessors. Existing accessors and Serde representations remain
   unchanged.
+- Add `AdmissionObservation::from_check` and
+  `AdmissionObservation::from_batch` constructors for consistently deriving
+  backend-neutral outcome, consumption, and relevant-policy metadata from
+  completed admission decisions.
 
 ### Changed
 
 - **Breaking:** replace the raw seven-field `AdmissionObservation::new`
-  constructor with semantic failed-check and failed-batch factories. Policy ID
+  constructor with semantic failed-check and failed-batch factories. Policy ID,
   scope, and configuration-fingerprint metadata are now derived together from
   a validated check, while failure factories require an explicit consumption
   status. The existing `Debug` field representation remains unchanged.
@@ -34,18 +38,6 @@ The format is based on [Keep a Changelog], and this project adheres to
   conversion could panic for constructible fixed-window limit errors. Policy
   constructors continue to report the same algorithm-specific validation
   errors in the same order.
-
-## [0.2.1] - 2026-08-08
-
-### Added
-
-- Add `AdmissionObservation::from_check` and
-  `AdmissionObservation::from_batch` constructors for consistently deriving
-  backend-neutral outcome, consumption, and relevant-policy metadata from
-  completed admission decisions.
-
-### Changed
-
 - Share the bounded shard, expiration, capacity, locking, and recovery
   machinery used by the in-memory fixed-window and GCRA stores while retaining
   their separate policy algorithms and existing behavior.
@@ -129,7 +121,6 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/bpcakes/runlimit/compare/v0.2.1...HEAD
-[0.2.1]: https://github.com/bpcakes/runlimit/compare/v0.2.0...v0.2.1
+[Unreleased]: https://github.com/bpcakes/runlimit/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/bpcakes/runlimit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bpcakes/runlimit/releases/tag/v0.1.0
