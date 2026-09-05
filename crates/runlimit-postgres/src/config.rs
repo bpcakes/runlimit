@@ -120,7 +120,10 @@ impl PostgresConfig {
     /// Sets the deadline for database work after acquiring a connection.
     ///
     /// The fresh deadline covers transaction begin, lock waits, statements,
-    /// rollback, and commit. It is intentionally not applied to pool
+    /// rollback, and commit. Server-side timeouts are refreshed from the
+    /// remaining budget before each statement and commit, so an earlier lock
+    /// wait cannot give a later statement a fresh full-length timeout.
+    /// It is intentionally not applied to pool
     /// acquisition or schema migrations.
     ///
     /// # Errors

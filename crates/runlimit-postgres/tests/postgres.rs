@@ -2396,6 +2396,69 @@ FOR UPDATE
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn successive_lock_waits_share_the_remaining_server_deadline() {
+    let mut fixture = IsolatedSchema::for_cleanup_test(1).await;
+    let tested_pool = fixture.primary_pool.clone();
+    let blockers = fixture.additional_pool(2).await;
+    let observer = fixture.additional_pool(1).await;
+    let policy = unique_policy("successive-locks", 2, Duration::from_secs(10));
+    let subject = key(97);
+    let normal = PostgresLimiter::with_config(tested_pool.clone(), test_config());
+    normal
+        .check(&Check::new(&policy, subject))
+        .await
+        .expect("seed row");
+    let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&tested_pool)
+        .await
+        .expect("tested backend");
+    let mut logical = blockers.begin().await.expect("logical blocker");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(advisory_lock_id(&Check::new(&policy, subject)))
+        .execute(&mut *logical)
+        .await
+        .expect("hold logical lock");
+    let mut row = blockers.begin().await.expect("row blocker");
+    sqlx::query("SELECT 1 FROM runlimit_fixed_windows WHERE config_fingerprint = $1 AND subject_key = $2 FOR UPDATE")
+        .bind(policy.fingerprint().as_bytes().as_slice()).bind(subject.as_bytes().as_slice())
+        .execute(&mut *row).await.expect("hold row lock");
+    let config = PostgresConfig::new()
+        .with_operation_timeout(Duration::from_secs(1))
+        .unwrap();
+    let limiter = PostgresLimiter::with_config(tested_pool.clone(), config);
+    let owned_policy = policy.clone();
+    let request =
+        tokio::spawn(async move { limiter.check(&Check::new(&owned_policy, subject)).await });
+    wait_for_advisory_waiters(&observer, "WITH RECURSIVE acquired", 1).await;
+    // Spend most of the operation budget on the first lock. The next statement
+    // must receive only the remainder, not a fresh one-second server timeout.
+    sleep(Duration::from_millis(600)).await;
+    logical.rollback().await.expect("release logical lock");
+    let error = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("bounded check")
+        .expect("request task")
+        .expect_err("row remains locked");
+    assert!(matches!(error, CheckError::TimedOutBeforeCommit { .. }));
+    assert!(!error.may_have_consumed_quota());
+    tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')")
+                .bind(backend).fetch_one(&observer).await.expect("observe tested backend");
+            if !waiting { break; }
+            sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("the server must not keep the expired check waiting on its second lock");
+    row.rollback().await.expect("release row lock");
+    assert_eq!(
+        stored_counter_usage(&tested_pool, &policy, subject).await,
+        1
+    );
+    fixture.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn row_lock_timeout_releases_single_connection_pool_slot_without_consuming_quota() {
     let blocker_pool = test_pool(1).await;
     let tested_pool = test_pool(1).await;

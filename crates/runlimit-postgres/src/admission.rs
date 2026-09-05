@@ -4,7 +4,8 @@ use runlimit_core::{BatchDecision, Check, Decision, Denial, QuotaDenial, QuotaMo
 use sqlx::{
     Acquire, PgPool, Postgres, Row, Transaction,
     pool::PoolConnection,
-    postgres::{PgRow, types::PgInterval},
+    postgres::{PgArguments, PgQueryResult, PgRow, types::PgInterval},
+    query::Query,
     types::chrono::{DateTime, Utc},
 };
 use tokio::time::{Instant, timeout, timeout_at};
@@ -192,6 +193,64 @@ pub(crate) async fn run_check_transaction(
     }
 }
 
+/// Keeps every SQL phase on the same remaining operation budget. `PostgreSQL`
+/// timeouts are per statement/lock, so a value set once at BEGIN is stale after
+/// an earlier phase waits. No query method exposes the underlying transaction.
+struct CheckTransaction<'c> {
+    inner: Transaction<'c, Postgres>,
+    deadline: Instant,
+}
+
+impl<'c> CheckTransaction<'c> {
+    async fn begin(
+        connection: &'c mut PoolConnection<Postgres>,
+        deadline: Instant,
+    ) -> Result<Self, ConnectionOutcome<CheckError>> {
+        let inner =
+            check_before_commit(deadline, "beginning transaction", connection.begin()).await?;
+        Ok(Self { inner, deadline })
+    }
+
+    async fn prepare(
+        &mut self,
+        operation: &'static str,
+    ) -> Result<(), ConnectionOutcome<CheckError>> {
+        set_check_server_timeouts(&mut self.inner, self.deadline, operation).await
+    }
+
+    async fn execute(
+        &mut self,
+        operation: &'static str,
+        query: Query<'_, Postgres, PgArguments>,
+    ) -> Result<PgQueryResult, ConnectionOutcome<CheckError>> {
+        self.prepare(operation).await?;
+        check_before_commit(self.deadline, operation, query.execute(&mut *self.inner)).await
+    }
+
+    async fn fetch_all(
+        &mut self,
+        operation: &'static str,
+        query: Query<'_, Postgres, PgArguments>,
+    ) -> Result<Vec<PgRow>, ConnectionOutcome<CheckError>> {
+        self.prepare(operation).await?;
+        check_before_commit(self.deadline, operation, query.fetch_all(&mut *self.inner)).await
+    }
+
+    async fn fetch_one(
+        &mut self,
+        operation: &'static str,
+        query: Query<'_, Postgres, PgArguments>,
+    ) -> Result<PgRow, ConnectionOutcome<CheckError>> {
+        self.prepare(operation).await?;
+        check_before_commit(self.deadline, operation, query.fetch_one(&mut *self.inner)).await
+    }
+
+    async fn commit(mut self) -> Result<(), ConnectionOutcome<CheckError>> {
+        self.prepare("preparing commit").await?;
+        commit_check(self.deadline, self.inner).await
+    }
+}
+
 async fn run_check_transaction_inner(
     connection: &mut PoolConnection<Postgres>,
     input: &BatchSqlInput,
@@ -199,14 +258,7 @@ async fn run_check_transaction_inner(
     maximum_rows_per_shard: u32,
     deadline: Instant,
 ) -> Result<ConnectionOutcome<BatchDecision>, ConnectionOutcome<CheckError>> {
-    let mut transaction =
-        check_before_commit(deadline, "beginning transaction", connection.begin()).await?;
-    set_check_server_timeouts(
-        &mut transaction,
-        deadline,
-        "configuring transaction timeouts",
-    )
-    .await?;
+    let mut transaction = CheckTransaction::begin(connection, deadline).await?;
 
     // Advisory locks cover logical keys that do not have rows yet. Their
     // stable numeric IDs are sorted independently from exact storage keys so
@@ -214,21 +266,15 @@ async fn run_check_transaction_inner(
     // Singles deliberately use this separate statement too: a statement
     // snapshot taken before an advisory-lock wait cannot safely decide whether
     // a capacity slot is needed.
-    acquire_advisory_locks(&mut transaction, &input.advisory_lock_ids, deadline).await?;
+    acquire_advisory_locks(&mut transaction, &input.advisory_lock_ids).await?;
 
     // Existing rows may be held by cleanup or a transaction predating the
     // advisory-lock protocol. Wait for all row locks before sampling database
     // time or deciding which keys need capacity.
-    acquire_existing_row_locks(&mut transaction, input, deadline).await?;
+    acquire_existing_row_locks(&mut transaction, input).await?;
 
-    let (pending, authoritative_elapsed) = execute_batch(
-        &mut transaction,
-        input,
-        checks,
-        maximum_rows_per_shard,
-        deadline,
-    )
-    .await?;
+    let (pending, authoritative_elapsed) =
+        execute_batch(&mut transaction, input, checks, maximum_rows_per_shard).await?;
 
     match pending {
         PendingBatchOutcome::Denied { index, denial } => {
@@ -242,12 +288,12 @@ async fn run_check_transaction_inner(
                 deadline,
                 denial,
                 authoritative_elapsed,
-                transaction.rollback(),
+                transaction.inner.rollback(),
             )
             .await)
         }
         PendingBatchOutcome::Allowed(allowances) => {
-            commit_check(deadline, transaction).await?;
+            transaction.commit().await?;
             Ok(ConnectionOutcome::Reusable(BatchDecision::allowed(
                 allowances
                     .into_iter()
@@ -354,53 +400,48 @@ async fn set_check_server_timeouts(
 }
 
 async fn acquire_advisory_locks(
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut CheckTransaction<'_>,
     advisory_lock_ids: &[i64],
-    deadline: Instant,
 ) -> Result<(), ConnectionOutcome<CheckError>> {
-    check_before_commit(deadline, "acquiring logical key lock", async {
-        sqlx::query(BATCH_ADVISORY_LOCK_SQL)
-            .bind(advisory_lock_ids)
-            .execute(&mut **transaction)
-            .await
-            .map(|_| ())
-    })
-    .await
+    transaction
+        .execute(
+            "acquiring logical key lock",
+            sqlx::query(BATCH_ADVISORY_LOCK_SQL).bind(advisory_lock_ids),
+        )
+        .await
+        .map(|_| ())
 }
 
 async fn acquire_existing_row_locks(
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut CheckTransaction<'_>,
     input: &BatchSqlInput,
-    deadline: Instant,
 ) -> Result<(), ConnectionOutcome<CheckError>> {
-    check_before_commit(deadline, "acquiring counter row lock", async {
-        sqlx::query(BATCH_ROW_LOCK_SQL)
-            .bind(input.fingerprints.as_slice())
-            .bind(input.subjects.as_slice())
-            .bind(input.lock_input_positions.as_slice())
-            .execute(&mut **transaction)
-            .await
-            .map(|_| ())
-    })
-    .await
+    transaction
+        .execute(
+            "acquiring counter row lock",
+            sqlx::query(BATCH_ROW_LOCK_SQL)
+                .bind(input.fingerprints.as_slice())
+                .bind(input.subjects.as_slice())
+                .bind(input.lock_input_positions.as_slice()),
+        )
+        .await
+        .map(|_| ())
 }
 
 async fn first_capacity_denial(
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut CheckTransaction<'_>,
     input: &BatchSqlInput,
     maximum_rows_per_shard: u32,
-    deadline: Instant,
 ) -> Result<Option<(usize, PendingDenial)>, ConnectionOutcome<CheckError>> {
-    let rows = check_before_commit(
-        deadline,
-        "acquiring capacity shard lock",
-        sqlx::query(BATCH_CAPACITY_LOCK_SQL)
-            .bind(input.fingerprints.as_slice())
-            .bind(input.subjects.as_slice())
-            .bind(input.capacity_shards.as_slice())
-            .fetch_all(&mut **transaction),
-    )
-    .await?;
+    let rows = transaction
+        .fetch_all(
+            "acquiring capacity shard lock",
+            sqlx::query(BATCH_CAPACITY_LOCK_SQL)
+                .bind(input.fingerprints.as_slice())
+                .bind(input.subjects.as_slice())
+                .bind(input.capacity_shards.as_slice()),
+        )
+        .await?;
 
     let mut pending_insertions = [0_u32; CAPACITY_SHARD_COUNT];
     for row in rows {
@@ -474,15 +515,13 @@ fn authoritative_elapsed(start: DateTime<Utc>, end: DateTime<Utc>) -> Duration {
 }
 
 async fn execute_batch(
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut CheckTransaction<'_>,
     input: &BatchSqlInput,
     checks: &[Check<'_>],
     maximum_rows_per_shard: u32,
-    deadline: Instant,
 ) -> Result<(PendingBatchOutcome, Duration), ConnectionOutcome<CheckError>> {
-    let capacity_denial =
-        first_capacity_denial(transaction, input, maximum_rows_per_shard, deadline).await?;
-    let preflight = preflight_batch(transaction, input, checks, deadline).await?;
+    let capacity_denial = first_capacity_denial(transaction, input, maximum_rows_per_shard).await?;
+    let preflight = preflight_batch(transaction, input, checks).await?;
     let first_denial = match (capacity_denial, preflight.denial) {
         (Some(capacity), Some(quota)) => Some(if capacity.0 < quota.0 {
             capacity
@@ -500,7 +539,7 @@ async fn execute_batch(
         ));
     }
     let (allowances, response_now) =
-        upsert_batch(transaction, input, checks, preflight.database_now, deadline).await?;
+        upsert_batch(transaction, input, checks, preflight.database_now).await?;
     Ok((
         PendingBatchOutcome::Allowed(allowances),
         authoritative_elapsed(preflight.database_now, response_now),
@@ -508,22 +547,20 @@ async fn execute_batch(
 }
 
 async fn preflight_batch(
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut CheckTransaction<'_>,
     input: &BatchSqlInput,
     checks: &[Check<'_>],
-    deadline: Instant,
 ) -> Result<BatchPreflight, ConnectionOutcome<CheckError>> {
-    let preflight_row = check_before_commit(
-        deadline,
-        "preflighting counter batch",
-        sqlx::query(BATCH_PREFLIGHT_SQL)
-            .bind(input.fingerprints.as_slice())
-            .bind(input.subjects.as_slice())
-            .bind(input.costs.as_slice())
-            .bind(input.limits.as_slice())
-            .fetch_one(&mut **transaction),
-    )
-    .await?;
+    let preflight_row = transaction
+        .fetch_one(
+            "preflighting counter batch",
+            sqlx::query(BATCH_PREFLIGHT_SQL)
+                .bind(input.fingerprints.as_slice())
+                .bind(input.subjects.as_slice())
+                .bind(input.costs.as_slice())
+                .bind(input.limits.as_slice()),
+        )
+        .await?;
 
     let database_now: DateTime<Utc> = preflight_row
         .try_get("database_now")
@@ -580,27 +617,25 @@ async fn preflight_batch(
 }
 
 async fn upsert_batch(
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut CheckTransaction<'_>,
     input: &BatchSqlInput,
     checks: &[Check<'_>],
     database_now: DateTime<Utc>,
-    deadline: Instant,
 ) -> Result<(Vec<PendingAllowance>, DateTime<Utc>), ConnectionOutcome<CheckError>> {
-    let rows = check_before_commit(
-        deadline,
-        "updating counter batch",
-        sqlx::query(BATCH_UPSERT_SQL)
-            .bind(input.policy_ids.as_slice())
-            .bind(input.scope_ids.as_slice())
-            .bind(input.fingerprints.as_slice())
-            .bind(input.subjects.as_slice())
-            .bind(input.windows.as_slice())
-            .bind(input.costs.as_slice())
-            .bind(input.limits.as_slice())
-            .bind(database_now)
-            .fetch_all(&mut **transaction),
-    )
-    .await?;
+    let rows = transaction
+        .fetch_all(
+            "updating counter batch",
+            sqlx::query(BATCH_UPSERT_SQL)
+                .bind(input.policy_ids.as_slice())
+                .bind(input.scope_ids.as_slice())
+                .bind(input.fingerprints.as_slice())
+                .bind(input.subjects.as_slice())
+                .bind(input.windows.as_slice())
+                .bind(input.costs.as_slice())
+                .bind(input.limits.as_slice())
+                .bind(database_now),
+        )
+        .await?;
 
     if rows.is_empty() {
         return Err(reusable_check_error(CheckError::StorageInvariant(

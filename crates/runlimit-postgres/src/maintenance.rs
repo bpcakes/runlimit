@@ -109,7 +109,7 @@ async fn set_maintenance_server_timeouts(
 
 async fn commit_maintenance(
     deadline: Instant,
-    transaction: Transaction<'_, Postgres>,
+    mut transaction: Transaction<'_, Postgres>,
 ) -> Result<(), ConnectionOutcome<MaintenanceError>> {
     if Instant::now() >= deadline {
         return Err(ConnectionOutcome::Reusable(
@@ -118,6 +118,8 @@ async fn commit_maintenance(
             },
         ));
     }
+
+    set_maintenance_server_timeouts(&mut transaction, deadline, "preparing cleanup commit").await?;
 
     timeout_at(deadline, transaction.commit())
         .await
