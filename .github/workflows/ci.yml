@@ -67,29 +67,29 @@ jobs:
       - name: Install Rust toolchains
         run: |
           rustup toolchain install stable --profile minimal
-          rustup toolchain install 1.88.0 --profile minimal
+          rustup toolchain install 1.94.0 --profile minimal
       # Swatinem/rust-cache v2.9.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
       - name: Test packaged crates as an external consumer
         run: ./scripts/run-external-consumer-smoke.sh
 
   msrv:
-    name: Rust 1.88
+    name: Rust 1.94
     runs-on: ubuntu-latest
     steps:
       # actions/checkout v4.3.1
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Install minimum supported Rust
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.94.0 --profile minimal
       # Swatinem/rust-cache v2.9.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
       - name: Check default features
-        run: cargo +1.88.0 check --workspace --all-targets --locked
+        run: cargo +1.94.0 check --workspace --all-targets --locked
       - name: Check all features
-        run: cargo +1.88.0 check --workspace --all-targets --all-features --locked
+        run: cargo +1.94.0 check --workspace --all-targets --all-features --locked
       - name: Check external consumer
         run: >-
-          cargo +1.88.0 check
+          cargo +1.94.0 check
           --manifest-path smoke/external-consumer/Cargo.toml
           --locked
           --target-dir target/external-consumer

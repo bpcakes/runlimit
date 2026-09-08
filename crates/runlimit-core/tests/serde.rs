@@ -285,7 +285,7 @@ fn shadow_decisions_round_trip_but_storage_capacity_cannot_be_shadowed() {
 #[test]
 fn batch_decisions_round_trip_and_reject_denied_members_in_allowed_batches() {
     let allowed = BatchDecision::try_allowed(vec![
-        Decision::try_allowed(8, 7, Duration::from_secs(60)).unwrap(),
+        Decision::try_allowed(8, 7, Duration::from_mins(1)).unwrap(),
         Decision::try_allowed(3, 1, Duration::from_millis(750)).unwrap(),
     ])
     .unwrap();

@@ -506,7 +506,7 @@ work admitted during a time window.
 
 ## Development
 
-The minimum supported Rust version is 1.88. Before handing off changes, run:
+The minimum supported Rust version is 1.94. Before handing off changes, run:
 
 ```sh
 cargo fmt --all -- --check

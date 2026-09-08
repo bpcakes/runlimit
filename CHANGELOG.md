@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** upgrade `runlimit-postgres` to SQLx 0.9.0. Applications passing
+  SQLx pools or handling SQLx errors must also upgrade to SQLx 0.9.
+- Raise the workspace minimum supported Rust version from 1.88 to 1.94.
+
 ## [0.3.0] - 2026-08-24
 
 ### Added

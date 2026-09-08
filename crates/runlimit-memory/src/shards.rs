@@ -462,7 +462,7 @@ mod tests {
             PolicyId::new("memory.kernel").unwrap(),
             ScopeId::new("test").unwrap(),
             1,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
         .unwrap();
         Check::new(&policy, SubjectKey::from_digest([subject_byte; 32])).counter_key()

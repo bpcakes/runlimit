@@ -21,13 +21,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         PolicyId::new("auth.login")?,
         ScopeId::new("client")?,
         40,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     )?;
     let identity_policy = FixedWindowPolicy::new(
         PolicyId::new("auth.login")?,
         ScopeId::new("identity")?,
         8,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     )?;
 
     let secret = env::var("RUNLIMIT_KEY_SECRET")?;

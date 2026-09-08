@@ -807,8 +807,8 @@ mod tests {
 
     #[test]
     fn fingerprint_is_deterministic() {
-        let first = policy(8, Duration::from_secs(60)).unwrap();
-        let second = policy(8, Duration::from_secs(60)).unwrap();
+        let first = policy(8, Duration::from_mins(1)).unwrap();
+        let second = policy(8, Duration::from_mins(1)).unwrap();
 
         assert_eq!(first.fingerprint(), second.fingerprint());
         assert_eq!(first.fingerprint().as_bytes().len(), 32);
@@ -817,21 +817,21 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_with_every_storage_relevant_field() {
-        let baseline = policy(8, Duration::from_secs(60)).unwrap();
-        let different_limit = policy(9, Duration::from_secs(60)).unwrap();
+        let baseline = policy(8, Duration::from_mins(1)).unwrap();
+        let different_limit = policy(9, Duration::from_mins(1)).unwrap();
         let different_window = policy(8, Duration::from_secs(61)).unwrap();
         let different_id = FixedWindowPolicy::new(
             PolicyId::new("auth.signup").unwrap(),
             ScopeId::new("client").unwrap(),
             8,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
         .unwrap();
         let different_scope = FixedWindowPolicy::new(
             PolicyId::new("auth.login").unwrap(),
             ScopeId::new("identity").unwrap(),
             8,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
         .unwrap();
 
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn quota_mode_does_not_change_fixed_window_storage_identity() {
-        let enforced = policy(8, Duration::from_secs(60)).unwrap();
+        let enforced = policy(8, Duration::from_mins(1)).unwrap();
         let shadowed = enforced.clone().with_quota_mode(QuotaMode::Shadow);
 
         assert_eq!(enforced.fingerprint(), shadowed.fingerprint());

@@ -818,7 +818,7 @@ mod tests {
             .unwrap();
         let first = MemoryStore::with_clock(config.clone(), ManualClock::default());
         let second = MemoryStore::with_clock(config, ManualClock::default());
-        let policy = policy("auth.login", "client", 2, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", 2, Duration::from_mins(1));
         let key_hasher = KeyHasher::new([0x42; 32]).unwrap();
         let mut counts = [0_usize; SHARD_COUNT];
 
@@ -839,8 +839,8 @@ mod tests {
 
     #[test]
     fn the_entries_map_distinguishes_deliberate_prehash_collisions() {
-        let first_policy = policy("auth.login", "client", 1, Duration::from_secs(60));
-        let second_policy = policy("auth.reset", "client", 2, Duration::from_secs(60));
+        let first_policy = policy("auth.login", "client", 1, Duration::from_mins(1));
+        let second_policy = policy("auth.reset", "client", 2, Duration::from_mins(1));
         let first_subject = SubjectKey::from_digest([0_u8; 32]);
         let first_key = Check::new(&first_policy, first_subject).counter_key();
 
@@ -904,7 +904,7 @@ mod tests {
     fn debug_output_is_useful_without_exposing_counter_state() {
         let store =
             MemoryStore::with_clock(MemoryStoreConfig::new(8).unwrap(), ManualClock::default());
-        let policy = policy("auth.login", "client", 2, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", 2, Duration::from_mins(1));
         store
             .check(&Check::new(&policy, subject(0xab)))
             .expect("store is available");
@@ -924,7 +924,7 @@ mod tests {
     fn enforces_quota_and_reports_exact_retry_duration() {
         let clock = ManualClock::default();
         let store = MemoryStore::with_clock(MemoryStoreConfig::new(8).unwrap(), clock.clone());
-        let policy = policy("auth.login", "client", 2, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", 2, Duration::from_mins(1));
         let check = Check::new(&policy, subject(1));
 
         let first = store.check(&check).unwrap();
@@ -938,7 +938,7 @@ mod tests {
 
         let denied = store.check(&check).unwrap();
         assert!(!denied.is_allowed());
-        assert_eq!(denied.retry_after(), Some(Duration::from_secs(60)));
+        assert_eq!(denied.retry_after(), Some(Duration::from_mins(1)));
 
         clock.advance(Duration::from_secs(10));
         assert_eq!(
@@ -950,14 +950,14 @@ mod tests {
         let reset = store.check(&check).unwrap();
         assert!(reset.is_allowed());
         assert_eq!(reset.available(), Some(1));
-        assert_eq!(reset.replenishes_after(), Some(Duration::from_secs(60)));
+        assert_eq!(reset.replenishes_after(), Some(Duration::from_mins(1)));
     }
 
     #[test]
     fn shadow_mode_reports_quota_without_consuming_or_rejecting() {
         let clock = ManualClock::default();
         let store = MemoryStore::with_clock(MemoryStoreConfig::new(4).unwrap(), clock.clone());
-        let enforced = policy("auth.login", "client", 1, Duration::from_secs(60));
+        let enforced = policy("auth.login", "client", 1, Duration::from_mins(1));
         let shadow = enforced.clone().with_quota_mode(QuotaMode::Shadow);
         let subject = subject(7);
 
@@ -982,7 +982,7 @@ mod tests {
             Some(DenialKind::QuotaExceeded)
         );
 
-        clock.advance(Duration::from_secs(60));
+        clock.advance(Duration::from_mins(1));
         assert!(
             store
                 .check(&Check::new(&enforced, subject))
@@ -995,7 +995,7 @@ mod tests {
     fn shadow_batches_roll_back_and_capacity_denials_remain_enforced() {
         let store =
             MemoryStore::with_clock(MemoryStoreConfig::new(3).unwrap(), ManualClock::default());
-        let shadow = policy("auth.login", "client", 1, Duration::from_secs(60))
+        let shadow = policy("auth.login", "client", 1, Duration::from_mins(1))
             .with_quota_mode(QuotaMode::Shadow);
         let first = Check::new(&shadow, subject(1));
         let second = Check::new(&shadow, subject(2));
@@ -1024,8 +1024,8 @@ mod tests {
     fn mixed_shadow_and_enforced_batches_fail_before_consumption() {
         let store =
             MemoryStore::with_clock(MemoryStoreConfig::new(4).unwrap(), ManualClock::default());
-        let enforced = policy("auth.login", "client", 1, Duration::from_secs(60));
-        let shadow = policy("auth.reset", "client", 1, Duration::from_secs(60))
+        let enforced = policy("auth.login", "client", 1, Duration::from_mins(1));
+        let shadow = policy("auth.reset", "client", 1, Duration::from_mins(1))
             .with_quota_mode(QuotaMode::Shadow);
         let result = store.check_all(&[
             Check::new(&enforced, subject(1)),
@@ -1047,7 +1047,7 @@ mod tests {
         let store =
             MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default())
                 .with_observer(observer.clone());
-        let limited = policy("auth.login", "client", 1, Duration::from_secs(60));
+        let limited = policy("auth.login", "client", 1, Duration::from_mins(1));
 
         assert!(
             store
@@ -1112,7 +1112,7 @@ mod tests {
                 .with_observer(observer.clone()),
         );
         *observer.store.lock().unwrap() = Some(Arc::downgrade(&store));
-        let limited = policy("auth.login", "client", 1, Duration::from_secs(60));
+        let limited = policy("auth.login", "client", 1, Duration::from_mins(1));
         let check = Check::new(&limited, subject(1));
 
         assert!(store.check(&check).unwrap().is_allowed());
@@ -1260,8 +1260,8 @@ mod tests {
                 .unwrap(),
             ManualClock::default(),
         );
-        let strict = policy("auth.login", "client", 1, Duration::from_secs(60));
-        let relaxed = policy("auth.login", "client", 2, Duration::from_secs(60));
+        let strict = policy("auth.login", "client", 1, Duration::from_mins(1));
+        let relaxed = policy("auth.login", "client", 2, Duration::from_mins(1));
         let key = subject(1);
 
         assert!(store.check(&Check::new(&strict, key)).unwrap().is_allowed());
@@ -1283,7 +1283,7 @@ mod tests {
                 .unwrap(),
             ManualClock::default(),
         );
-        let policy = policy("auth.login", "client", 10, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", 10, Duration::from_mins(1));
 
         assert!(
             store
@@ -1293,7 +1293,7 @@ mod tests {
         );
         let denied = store.check(&Check::new(&policy, subject(2))).unwrap();
         assert!(!denied.is_allowed());
-        assert_eq!(denied.retry_after(), Some(Duration::from_secs(60)));
+        assert_eq!(denied.retry_after(), Some(Duration::from_mins(1)));
         assert_eq!(store.stats().unwrap().entries(), 1);
     }
 
@@ -1301,7 +1301,7 @@ mod tests {
     fn default_configuration_can_use_its_entire_capacity() {
         let store =
             MemoryStore::with_clock(MemoryStoreConfig::new(64).unwrap(), ManualClock::default());
-        let policy = policy("auth.login", "client", 10, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", 10, Duration::from_mins(1));
 
         for byte in 0..64 {
             assert!(
@@ -1326,7 +1326,7 @@ mod tests {
                 .unwrap(),
             ManualClock::default(),
         );
-        let policy = policy("auth.login", "client", 10, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", 10, Duration::from_mins(1));
         let shard_zero = subjects_for_shard(&store, &policy, 0, 1)[0];
         let shard_one = subjects_for_shard(&store, &policy, 1, 2);
         let checks = [
@@ -1338,9 +1338,9 @@ mod tests {
         assert_eq!(
             store.check_all(&checks),
             Ok(BatchDecision::allowed(vec![
-                Decision::allowed(10, 8, Duration::from_secs(60)),
-                Decision::allowed(10, 7, Duration::from_secs(60)),
-                Decision::allowed(10, 6, Duration::from_secs(60)),
+                Decision::allowed(10, 8, Duration::from_mins(1)),
+                Decision::allowed(10, 7, Duration::from_mins(1)),
+                Decision::allowed(10, 6, Duration::from_mins(1)),
             ]))
         );
         assert_eq!(store.shards.shard(0).lock().unwrap().used(), 1);
@@ -1356,7 +1356,7 @@ mod tests {
                 .unwrap(),
             ManualClock::default(),
         );
-        let policy = policy("auth.login", "client", 10, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", 10, Duration::from_mins(1));
         let crowded = subjects_for_shard(&store, &policy, 0, 4);
         let other = subjects_for_shard(&store, &policy, 1, 1)[0];
 
@@ -1378,7 +1378,7 @@ mod tests {
             store.check_all(&checks),
             Ok(BatchDecision::denied(
                 2,
-                Denial::storage_capacity(Some(Duration::from_secs(60))),
+                Denial::storage_capacity(Some(Duration::from_mins(1))),
             ))
         );
         assert_eq!(store.shards.shard(0).lock().unwrap().used(), 2);
@@ -1407,13 +1407,13 @@ mod tests {
                 .unwrap(),
             ManualClock::default(),
         );
-        let policy = policy("auth.login", "client", 2, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", 2, Duration::from_mins(1));
         let keys = subjects_for_shard(&store, &policy, 0, 3);
         let other = subjects_for_shard(&store, &policy, 1, 1)[0];
         let other_check = Check::new(&policy, other);
         assert_eq!(
             store.check(&other_check),
-            Ok(Decision::allowed(2, 1, Duration::from_secs(60)))
+            Ok(Decision::allowed(2, 1, Duration::from_mins(1)))
         );
         let checks = [
             other_check,
@@ -1433,7 +1433,7 @@ mod tests {
         assert_eq!(store.stats().unwrap().entries(), 1);
         assert_eq!(
             store.check(&other_check),
-            Ok(Decision::allowed(2, 0, Duration::from_secs(60)))
+            Ok(Decision::allowed(2, 0, Duration::from_mins(1)))
         );
     }
 
@@ -1629,8 +1629,8 @@ mod tests {
                 .unwrap(),
             ManualClock::default(),
         );
-        let exhausted = policy("auth.login", "client", 1, Duration::from_secs(60));
-        let untouched = policy("auth.login", "identity", 1, Duration::from_secs(60));
+        let exhausted = policy("auth.login", "client", 1, Duration::from_mins(1));
+        let untouched = policy("auth.login", "identity", 1, Duration::from_mins(1));
         let exhausted_check = Check::new(&exhausted, subject(1));
         let untouched_check = Check::new(&untouched, subject(2));
 
@@ -1653,8 +1653,8 @@ mod tests {
     fn duplicate_keys_are_rejected_before_consumption() {
         let store =
             MemoryStore::with_clock(MemoryStoreConfig::new(8).unwrap(), ManualClock::default());
-        let alpha = policy("auth.alpha", "client", 2, Duration::from_secs(60));
-        let beta = policy("auth.beta", "client", 2, Duration::from_secs(60));
+        let alpha = policy("auth.alpha", "client", 2, Duration::from_mins(1));
+        let beta = policy("auth.beta", "client", 2, Duration::from_mins(1));
         let checks = [
             Check::new(&beta, subject(1)),
             Check::new(&beta, subject(1)),
@@ -1678,7 +1678,7 @@ mod tests {
             MemoryStoreConfig::new(8).unwrap(),
             ManualClock::default(),
         ));
-        let policy = Arc::new(policy("auth.login", "client", 25, Duration::from_secs(60)));
+        let policy = Arc::new(policy("auth.login", "client", 25, Duration::from_mins(1)));
 
         let allowed = (0..100)
             .map(|_| {
@@ -1710,7 +1710,7 @@ mod tests {
             ManualClock::default(),
         );
         let limit = u64::try_from(THREAD_COUNT * CALLS_PER_THREAD).unwrap();
-        let policy = policy("auth.login", "client", limit, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", limit, Duration::from_mins(1));
         let first = subjects_for_shard(&store, &policy, 0, 1)[0];
         let second = subjects_for_shard(&store, &policy, 1, 1)[0];
         let store = Arc::new(store);
@@ -1760,7 +1760,7 @@ mod tests {
         for key in [first, second] {
             assert_eq!(
                 store.check(&Check::new(policy.as_ref(), key)),
-                Ok(Decision::denied(quota(limit, Duration::from_secs(60))))
+                Ok(Decision::denied(quota(limit, Duration::from_mins(1))))
             );
         }
     }
@@ -1775,7 +1775,7 @@ mod tests {
                 .unwrap(),
             clock.clone(),
         );
-        let policy = policy("auth.login", "client", 1, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", 1, Duration::from_mins(1));
         let exhausted = Check::new(&policy, subject(1));
         let new_key = Check::new(&policy, subject(2));
 
@@ -1812,7 +1812,7 @@ mod tests {
                 .unwrap(),
             clock.clone(),
         );
-        let policy = policy("auth.preflight", "client", 1, Duration::from_secs(60));
+        let policy = policy("auth.preflight", "client", 1, Duration::from_mins(1));
         let checks = [
             Check::new(&policy, subject(1)),
             Check::new(&policy, subject(2)),
@@ -1866,12 +1866,7 @@ mod tests {
             clock.clone(),
         )
         .with_observer(observer.clone());
-        let policy = policy(
-            "auth.observed-failure",
-            "client",
-            1,
-            Duration::from_secs(60),
-        );
+        let policy = policy("auth.observed-failure", "client", 1, Duration::from_mins(1));
         let check = Check::new(&policy, subject(1));
 
         clock.panic_once();
@@ -1923,7 +1918,7 @@ mod tests {
                 .unwrap(),
             clock.clone(),
         ));
-        let policy = policy("auth.login", "client", 1, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", 1, Duration::from_mins(1));
         let reset_subject = subjects_for_shard(&store, &policy, 0, 1)[0];
         let retained_subject = subjects_for_shard(&store, &policy, 1, 1)[0];
         let reset_check = Check::new(&policy, reset_subject);
@@ -1973,7 +1968,7 @@ mod tests {
                 .unwrap(),
             clock.clone(),
         ));
-        let policy = policy("auth.login", "client", 1, Duration::from_secs(60));
+        let policy = policy("auth.login", "client", 1, Duration::from_mins(1));
         let shard_zero = subjects_for_shard(&store, &policy, 0, 1)[0];
         let shard_one = subjects_for_shard(&store, &policy, 1, 1)[0];
         let checks = [

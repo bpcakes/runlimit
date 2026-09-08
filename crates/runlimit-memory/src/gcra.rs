@@ -979,7 +979,7 @@ mod tests {
         let policy = policy(
             "api.concurrent",
             1,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             u64::try_from(BURST).unwrap(),
         );
         let check = Check::new(&policy, subject(1));

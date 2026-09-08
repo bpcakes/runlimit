@@ -33,10 +33,10 @@ impl PostgresConfig {
     pub const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 
     /// Largest accepted pool-acquisition budget.
-    pub const MAXIMUM_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+    pub const MAXIMUM_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_mins(1);
 
     /// Largest accepted database-operation deadline.
-    pub const MAXIMUM_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+    pub const MAXIMUM_OPERATION_TIMEOUT: Duration = Duration::from_mins(1);
 
     /// Returns the conservative defaults suitable for an online admission
     /// path.

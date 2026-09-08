@@ -98,7 +98,7 @@ mod tests {
             PolicyId::new(id).unwrap(),
             ScopeId::new("client").unwrap(),
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
         .unwrap()
     }

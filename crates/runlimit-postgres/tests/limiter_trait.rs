@@ -31,7 +31,7 @@ fn policy(name: &str, limit: u64) -> FixedWindowPolicy {
         PolicyId::new(name).expect("test policy ID is valid"),
         ScopeId::new("subject").expect("test scope ID is valid"),
         limit,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     )
     .expect("test policy is valid")
 }

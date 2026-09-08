@@ -21,7 +21,7 @@ use runlimit_postgres::{
     SET_RUNLIMIT_FIXED_WINDOWS_FILLFACTOR_SQL,
 };
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, migrate::Migrate, postgres::PgPoolOptions};
+use sqlx::{AssertSqlSafe, PgPool, migrate::Migrate, postgres::PgPoolOptions};
 use tokio::{sync::Barrier, time::sleep};
 
 const TEST_DATABASE_URL: &str = "RUNLIMIT_POSTGRES_TEST_DATABASE_URL";
@@ -112,6 +112,9 @@ async fn test_pool(maximum_connections: u32) -> PgPool {
     pool
 }
 
+// Dynamic SQL below interpolates only fixture-generated schema identifiers and
+// checked-in SQL. Values continue to use bind parameters. AssertSqlSafe marks
+// these audited statements for SQLx.
 struct IsolatedSchema {
     admin_pool: PgPool,
     primary_pool: PgPool,
@@ -160,7 +163,7 @@ impl IsolatedSchema {
             .expect("system clock is after the Unix epoch")
             .as_nanos();
         let schema = format!("runlimit_{label}_{}_{}", process::id(), schema_suffix);
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&admin_pool)
             .await
             .expect("create isolated test schema");
@@ -184,7 +187,9 @@ impl IsolatedSchema {
             .after_connect(move |connection, _metadata| {
                 let search_path_sql = format!("SET search_path = {connection_schema}, pg_catalog");
                 Box::pin(async move {
-                    sqlx::query(&search_path_sql).execute(connection).await?;
+                    sqlx::query(AssertSqlSafe(search_path_sql))
+                        .execute(connection)
+                        .await?;
                     Ok(())
                 })
             })
@@ -218,10 +223,13 @@ impl IsolatedSchema {
             self.primary_pool.is_closed(),
             "primary pool must close before schema drop"
         );
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin_pool)
-            .await
-            .expect("drop isolated test schema");
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP SCHEMA {} CASCADE",
+            self.schema
+        )))
+        .execute(&self.admin_pool)
+        .await
+        .expect("drop isolated test schema");
         self.admin_pool.close().await;
         assert!(self.admin_pool.is_closed(), "admin pool must close last");
     }
@@ -539,7 +547,7 @@ FOR EACH ROW
 EXECUTE FUNCTION {schema}.sleep_during_cleanup();
 "
     );
-    sqlx::raw_sql(&trigger_sql)
+    sqlx::raw_sql(AssertSqlSafe(trigger_sql))
         .execute(setup_pool)
         .await
         .expect("create delayed admission and cleanup triggers");
@@ -553,7 +561,7 @@ async fn cleanup_uses_an_indexable_cutoff_and_skips_locked_rows() {
     let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
     let locked_policy = unique_policy("cleanup-locked-expired", 1, Duration::from_secs(1));
     let expired_policy = unique_policy("cleanup-expired", 1, Duration::from_secs(1));
-    let active_policy = unique_policy("cleanup-active", 1, Duration::from_secs(3_600));
+    let active_policy = unique_policy("cleanup-active", 1, Duration::from_hours(1));
     let locked_subject = key(151);
     let expired_subject = key(152);
     let active_subject = key(153);
@@ -564,7 +572,7 @@ async fn cleanup_uses_an_indexable_cutoff_and_skips_locked_rows() {
         .await
         .expect("make the cleanup access path deterministic");
     let plan_sql = format!("EXPLAIN (COSTS OFF) {CLEANUP_SQL}");
-    let plan = sqlx::query_scalar::<_, String>(&plan_sql)
+    let plan = sqlx::query_scalar::<_, String>(AssertSqlSafe(plan_sql))
         .bind(1_i64)
         .fetch_all(&mut *plan_transaction)
         .await
@@ -664,7 +672,7 @@ FOR EACH ROW
 EXECUTE FUNCTION {schema}.sleep_before_delete();
 "
     );
-    sqlx::raw_sql(&trigger_sql)
+    sqlx::raw_sql(AssertSqlSafe(trigger_sql))
         .execute(&setup_pool)
         .await
         .expect("create delayed cleanup trigger");
@@ -730,7 +738,7 @@ SELECT EXISTS (
 )
 "
     );
-    let row_exists: bool = sqlx::query_scalar(&row_exists_sql)
+    let row_exists: bool = sqlx::query_scalar(AssertSqlSafe(row_exists_sql))
         .bind(policy.fingerprint().as_bytes().as_slice())
         .bind(subject.as_bytes().as_slice())
         .fetch_one(&setup_pool)
@@ -750,7 +758,7 @@ async fn pool_wait_does_not_spend_admission_or_cleanup_operation_budget() {
     let setup_pool = fixture.admin_pool.clone();
     let pool = fixture.primary_pool.clone();
     let schema = fixture.schema.clone();
-    let policy = unique_policy("pool-budget-survivor", 1, Duration::from_secs(60));
+    let policy = unique_policy("pool-budget-survivor", 1, Duration::from_mins(1));
     let subject = key(155);
     create_pool_budget_delay_triggers(&setup_pool, &schema).await;
 
@@ -919,7 +927,7 @@ SELECT
 async fn migration_upgrades_the_published_0_1_table_additively() {
     let fixture = IsolatedSchema::for_migration_test(1).await;
     let pool = fixture.primary_pool.clone();
-    let existing_policy = unique_policy("migration-capacity-backfill", 2, Duration::from_secs(60));
+    let existing_policy = unique_policy("migration-capacity-backfill", 2, Duration::from_mins(1));
     let existing_subject = key(154);
     let published_create_migration = MIGRATOR
         .iter()
@@ -931,11 +939,11 @@ async fn migration_upgrades_the_published_0_1_table_additively() {
         .await
         .expect("acquire published-migration setup connection");
     connection
-        .ensure_migrations_table()
+        .ensure_migrations_table("_sqlx_migrations")
         .await
         .expect("create published migration history");
     connection
-        .apply(published_create_migration)
+        .apply("_sqlx_migrations", published_create_migration)
         .await
         .expect("apply published create migration");
     drop(connection);
@@ -1014,9 +1022,9 @@ async fn cancelling_migration_discards_its_session_lock() {
         .begin()
         .await
         .expect("begin migration metadata blocker");
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "LOCK TABLE {schema}._sqlx_migrations IN ACCESS EXCLUSIVE MODE"
-    ))
+    )))
     .execute(&mut *blocker)
     .await
     .expect("block migration metadata access");
@@ -1119,7 +1127,7 @@ ORDER BY key_columns.position
         "migrated table options do not reserve space for HOT updates: {table_options:?}"
     );
 
-    let policy = unique_policy("counter-key-metadata", 3, Duration::from_secs(60));
+    let policy = unique_policy("counter-key-metadata", 3, Duration::from_mins(1));
     let subject = key(155);
     let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
     assert!(
@@ -1158,7 +1166,7 @@ WHERE
 async fn configured_capacity_denies_only_new_keys_in_the_full_shard() {
     let fixture = IsolatedSchema::for_cleanup_test(4).await;
     let pool = fixture.primary_pool.clone();
-    let policy = unique_policy("configured-capacity", 10, Duration::from_secs(60));
+    let policy = unique_policy("configured-capacity", 10, Duration::from_mins(1));
     let shard = 17;
     let first_subject = key_in_capacity_shard(&policy, shard, 1);
     let second_subject = key_in_capacity_shard(&policy, shard, 2);
@@ -1226,7 +1234,7 @@ async fn configured_capacity_denies_only_new_keys_in_the_full_shard() {
 async fn expired_rows_hold_capacity_until_cleanup_commits() {
     let fixture = IsolatedSchema::for_cleanup_test(3).await;
     let pool = fixture.primary_pool.clone();
-    let policy = unique_policy("expired-capacity", 10, Duration::from_secs(60));
+    let policy = unique_policy("expired-capacity", 10, Duration::from_mins(1));
     let shard = 23;
     let expired_subject = key_in_capacity_shard(&policy, shard, 1);
     let replacement_subject = key_in_capacity_shard(&policy, shard, 2);
@@ -1272,7 +1280,7 @@ async fn expired_rows_hold_capacity_until_cleanup_commits() {
 async fn capacity_denied_batch_rolls_back_and_remains_enforced_in_shadow_mode() {
     let fixture = IsolatedSchema::for_cleanup_test(3).await;
     let pool = fixture.primary_pool.clone();
-    let policy = unique_policy("batch-capacity", 10, Duration::from_secs(60))
+    let policy = unique_policy("batch-capacity", 10, Duration::from_mins(1))
         .with_quota_mode(QuotaMode::Shadow);
     let shard = 29;
     let first_subject = key_in_capacity_shard(&policy, shard, 1);
@@ -1313,8 +1321,8 @@ async fn capacity_denied_batch_rolls_back_and_remains_enforced_in_shadow_mode() 
 async fn shadow_quota_denial_is_reported_without_consuming_more_quota() {
     let fixture = IsolatedSchema::for_cleanup_test(2).await;
     let pool = fixture.primary_pool.clone();
-    let policy = unique_policy("shadow-quota", 1, Duration::from_secs(60))
-        .with_quota_mode(QuotaMode::Shadow);
+    let policy =
+        unique_policy("shadow-quota", 1, Duration::from_mins(1)).with_quota_mode(QuotaMode::Shadow);
     let subject = key_in_capacity_shard(&policy, 30, 1);
     let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
 
@@ -1341,7 +1349,7 @@ async fn shadow_quota_denial_is_reported_without_consuming_more_quota() {
 async fn database_trigger_hard_cap_blocks_old_writer_insertions() {
     let fixture = IsolatedSchema::for_cleanup_test(2).await;
     let pool = fixture.primary_pool.clone();
-    let policy = unique_policy("trigger-hard-cap", 10, Duration::from_secs(60));
+    let policy = unique_policy("trigger-hard-cap", 10, Duration::from_mins(1));
     let shard = 31;
     let subject = key_in_capacity_shard(&policy, shard, 1);
     let mut transaction = pool.begin().await.expect("begin old-writer transaction");
@@ -1403,7 +1411,7 @@ VALUES ($1, $2, $3, $4, pg_catalog.clock_timestamp(),
 async fn database_trigger_rejects_storage_key_updates_without_ledger_drift() {
     let fixture = IsolatedSchema::for_cleanup_test(2).await;
     let pool = fixture.primary_pool.clone();
-    let policy = unique_policy("immutable-storage-key", 10, Duration::from_secs(60));
+    let policy = unique_policy("immutable-storage-key", 10, Duration::from_mins(1));
     let original_shard = 33;
     let replacement_shard = 34;
     let original_subject = key_in_capacity_shard(&policy, original_shard, 1);
@@ -1473,7 +1481,7 @@ async fn failed_insert_rolls_back_capacity_trigger_accounting() {
     let setup_pool = fixture.admin_pool.clone();
     let pool = fixture.primary_pool.clone();
     let schema = fixture.schema.clone();
-    let policy = unique_policy("capacity-rollback", 10, Duration::from_secs(60));
+    let policy = unique_policy("capacity-rollback", 10, Duration::from_mins(1));
     let shard = 37;
     let subject = key_in_capacity_shard(&policy, shard, 1);
     let failure_sql = format!(
@@ -1493,7 +1501,7 @@ FOR EACH STATEMENT
 EXECUTE FUNCTION {schema}.fail_after_capacity_accounting();
 "
     );
-    sqlx::raw_sql(&failure_sql)
+    sqlx::raw_sql(AssertSqlSafe(failure_sql))
         .execute(&setup_pool)
         .await
         .expect("install post-accounting failure trigger");
@@ -1507,15 +1515,15 @@ EXECUTE FUNCTION {schema}.fail_after_capacity_accounting();
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
     assert!(!counter_exists(&pool, &policy, subject).await);
 
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "DROP TRIGGER zz_fail_after_capacity_accounting ON {schema}.runlimit_fixed_windows"
-    ))
+    )))
     .execute(&setup_pool)
     .await
     .expect("drop post-accounting failure trigger");
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "DROP FUNCTION {schema}.fail_after_capacity_accounting()"
-    ))
+    )))
     .execute(&setup_pool)
     .await
     .expect("drop post-accounting failure function");
@@ -1544,7 +1552,7 @@ async fn concurrent_replicas_never_exceed_configured_shard_capacity() {
     let policy = Arc::new(unique_policy(
         "concurrent-capacity",
         10,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     ));
     let shard = 41;
     let config = test_config()
@@ -1828,7 +1836,7 @@ async fn search_path_clock_shadow_cannot_hijack_admission_or_cleanup_time() {
     let setup_pool = fixture.admin_pool.clone();
     let table_pool = fixture.primary_pool.clone();
     let schema = fixture.schema.clone();
-    let policy = unique_policy("clock-shadow", 1, Duration::from_secs(3_600));
+    let policy = unique_policy("clock-shadow", 1, Duration::from_hours(1));
     let subject = key(10);
     let check = Check::new(&policy, subject);
     let setup_limiter = PostgresLimiter::with_config(table_pool.clone(), test_config());
@@ -1838,7 +1846,7 @@ async fn search_path_clock_shadow_cannot_hijack_admission_or_cleanup_time() {
         .expect("initialize an active window");
     assert!(first.is_allowed());
 
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         r"
 CREATE FUNCTION {schema}.clock_timestamp()
 RETURNS TIMESTAMPTZ
@@ -1848,7 +1856,7 @@ AS $function$
     SELECT TIMESTAMPTZ '2100-01-01 00:00:00+00'
 $function$
 "
-    ))
+    )))
     .execute(&setup_pool)
     .await
     .expect("create malicious clock shadow");

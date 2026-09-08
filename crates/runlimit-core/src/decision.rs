@@ -918,8 +918,8 @@ mod tests {
 
     #[test]
     fn batch_of_one_converts_to_a_single_decision() {
-        let allowed = allowed(8, 7, Duration::from_secs(60));
-        let denied = quota(8, Duration::from_secs(60));
+        let allowed = allowed(8, 7, Duration::from_mins(1));
+        let denied = quota(8, Duration::from_mins(1));
 
         assert_eq!(
             BatchDecision::try_allowed(vec![allowed])
@@ -935,8 +935,8 @@ mod tests {
 
     #[test]
     fn malformed_batch_of_one_is_rejected() {
-        let decision = allowed(8, 7, Duration::from_secs(60));
-        let denial = quota(8, Duration::from_secs(60));
+        let decision = allowed(8, 7, Duration::from_mins(1));
+        let denial = quota(8, Duration::from_mins(1));
 
         assert!(
             BatchDecision::try_allowed(Vec::new())
@@ -981,7 +981,7 @@ mod tests {
 
     #[test]
     fn decision_views_discriminate_every_legacy_accessor_shape() {
-        let allowed = allowed(8, 7, Duration::from_secs(60));
+        let allowed = allowed(8, 7, Duration::from_mins(1));
         assert_eq!(
             allowed.view(),
             DecisionView::Allowed {
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     fn batch_views_preserve_allowed_order_and_denial_indices() {
-        let first = allowed(8, 7, Duration::from_secs(60));
+        let first = allowed(8, 7, Duration::from_mins(1));
         let second = allowed(4, 2, Duration::from_secs(30));
         let allowed_batch = BatchDecision::allowed(vec![first, second]);
         assert_eq!(

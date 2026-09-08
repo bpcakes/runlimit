@@ -102,7 +102,7 @@ fn policy() -> FixedWindowPolicy {
         PolicyId::new("auth.login").unwrap(),
         ScopeId::new("client").unwrap(),
         8,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     )
     .unwrap()
 }
@@ -120,7 +120,7 @@ fn response(status: StatusCode) -> Response {
 
 #[tokio::test]
 async fn layer_composes_with_an_axum_router() {
-    let decision = Decision::allowed(8, 7, Duration::from_secs(60));
+    let decision = Decision::allowed(8, 7, Duration::from_mins(1));
     let layer = RateLimitLayer::new(
         StubLimiter::returning(decision),
         policy(),
@@ -147,7 +147,7 @@ async fn layer_composes_with_an_axum_router() {
 
 #[tokio::test]
 async fn allowed_request_proceeds_with_decision_extension() {
-    let decision = Decision::allowed(8, 7, Duration::from_secs(60));
+    let decision = Decision::allowed(8, 7, Duration::from_mins(1));
     let limiter = StubLimiter::returning(decision);
     let inner_calls = Arc::new(AtomicUsize::new(0));
     let inner_calls_for_service = Arc::clone(&inner_calls);
@@ -242,7 +242,7 @@ async fn key_and_backend_failures_are_owned_by_the_mapper() {
     let unused_inner = service_fn(|_request: Request<Body>| {
         ready(Ok::<_, Infallible>(response(StatusCode::NO_CONTENT)))
     });
-    let limiter = StubLimiter::returning(Decision::allowed(8, 7, Duration::from_secs(60)));
+    let limiter = StubLimiter::returning(Decision::allowed(8, 7, Duration::from_mins(1)));
     let calls = Arc::clone(&limiter.calls);
     let key_layer = RateLimitLayer::new(
         limiter,
@@ -286,7 +286,7 @@ async fn key_and_backend_failures_are_owned_by_the_mapper() {
 #[tokio::test]
 async fn forwarding_headers_have_no_effect_unless_the_extractor_uses_them() {
     let fixed_subject = subject(5);
-    let limiter = StubLimiter::returning(Decision::allowed(8, 7, Duration::from_secs(60)));
+    let limiter = StubLimiter::returning(Decision::allowed(8, 7, Duration::from_mins(1)));
     let observed_subjects = Arc::clone(&limiter.subjects);
     let ignoring_layer = RateLimitLayer::new(
         limiter,
@@ -318,7 +318,7 @@ async fn forwarding_headers_have_no_effect_unless_the_extractor_uses_them() {
     );
 
     let header_subject = subject(6);
-    let limiter = StubLimiter::returning(Decision::allowed(8, 7, Duration::from_secs(60)));
+    let limiter = StubLimiter::returning(Decision::allowed(8, 7, Duration::from_mins(1)));
     let observed_subjects = Arc::clone(&limiter.subjects);
     let using_layer = RateLimitLayer::new(
         limiter,
@@ -379,7 +379,7 @@ async fn readiness_is_forwarded_and_the_response_future_is_send() {
         calls: Arc::clone(&calls),
     };
     let layer = RateLimitLayer::new(
-        StubLimiter::returning(Decision::allowed(8, 7, Duration::from_secs(60))),
+        StubLimiter::returning(Decision::allowed(8, 7, Duration::from_mins(1))),
         policy(),
         |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, Infallible>(subject(7)),
         |_rejection| panic!("unexpected rejection"),
@@ -489,7 +489,7 @@ async fn caller_can_choose_rejection_response_body() {
 fn debug_output_is_useful_without_formatting_callback_state() {
     let secret = String::from("raw-identity-secret");
     let layer = RateLimitLayer::new(
-        StubLimiter::returning(Decision::allowed(8, 7, Duration::from_secs(60))),
+        StubLimiter::returning(Decision::allowed(8, 7, Duration::from_mins(1))),
         policy(),
         move |_request: &Request<Body>, _policy: &FixedWindowPolicy| {
             let _ = &secret;

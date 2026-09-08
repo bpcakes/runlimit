@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SMOKE_SOURCE_DIR="$ROOT_DIR/smoke/external-consumer"
-MSRV_TOOLCHAIN="${MSRV_TOOLCHAIN:-1.88.0}"
+MSRV_TOOLCHAIN="${MSRV_TOOLCHAIN:-1.94.0}"
 CRATES=(
   "runlimit-core"
   "runlimit-memory"

@@ -10,7 +10,7 @@ PUBLISHABLE_CRATES=(
   "runlimit-http"
   "runlimit-axum"
 )
-MSRV_TOOLCHAIN="${MSRV_TOOLCHAIN:-1.88.0}"
+MSRV_TOOLCHAIN="${MSRV_TOOLCHAIN:-1.94.0}"
 STABLE_TOOLCHAIN="${STABLE_TOOLCHAIN:-stable}"
 CRATES_IO_USER_AGENT="runlimit-release-script/0.2 (https://github.com/bpcakes/runlimit)"
 

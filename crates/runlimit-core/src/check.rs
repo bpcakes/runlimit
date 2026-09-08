@@ -119,7 +119,7 @@ mod tests {
             PolicyId::new("auth.login").unwrap(),
             ScopeId::new("client").unwrap(),
             8,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
         .unwrap()
     }

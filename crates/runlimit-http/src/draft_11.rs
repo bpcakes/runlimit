@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn encodes_exact_draft_11_golden_fields() {
-        let policy = fixed_policy(100, Duration::from_secs(60));
+        let policy = fixed_policy(100, Duration::from_mins(1));
         let policy_field = quota_policy("search", &policy).unwrap();
         let service_field = service_limit(
             "search",
@@ -275,7 +275,7 @@ mod tests {
             PolicyId::new("api.upload").unwrap(),
             ScopeId::new("account").unwrap(),
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             4,
         )
         .unwrap();

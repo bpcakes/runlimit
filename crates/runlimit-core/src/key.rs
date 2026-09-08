@@ -166,7 +166,7 @@ mod tests {
             PolicyId::new(id).unwrap(),
             ScopeId::new(scope).unwrap(),
             8,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
         .unwrap()
     }

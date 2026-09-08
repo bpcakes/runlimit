@@ -274,7 +274,7 @@ impl PostgresLimiter {
         migrator.set_ignore_missing(true);
 
         let result = migrator
-            .run_direct(&mut **guarded_connection.connection())
+            .run_direct(None, &mut **guarded_connection.connection(), false)
             .await;
         if result.is_ok() {
             guarded_connection.reuse();
@@ -556,7 +556,7 @@ mod tests {
             PolicyId::new(id).expect("valid policy identifier"),
             ScopeId::new(scope).expect("valid scope identifier"),
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
         .expect("valid policy")
     }
@@ -950,7 +950,7 @@ mod tests {
             defaults.with_pool_acquire_timeout(Duration::from_secs(61)),
             Err(PostgresConfigError::PoolAcquireTimeoutTooLong {
                 actual: Duration::from_secs(61),
-                maximum: Duration::from_secs(60),
+                maximum: Duration::from_mins(1),
             })
         );
         assert_eq!(
@@ -961,7 +961,7 @@ mod tests {
             defaults.with_operation_timeout(Duration::from_secs(61)),
             Err(PostgresConfigError::OperationTimeoutTooLong {
                 actual: Duration::from_secs(61),
-                maximum: Duration::from_secs(60),
+                maximum: Duration::from_mins(1),
             })
         );
     }

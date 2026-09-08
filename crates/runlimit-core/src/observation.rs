@@ -482,7 +482,7 @@ mod tests {
             PolicyId::new(id).unwrap(),
             ScopeId::new("client").unwrap(),
             3,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
         .unwrap()
     }
@@ -519,7 +519,7 @@ mod tests {
 
         for (decision, outcome, consumption) in [
             (
-                Decision::try_allowed(3, 2, Duration::from_secs(60)).unwrap(),
+                Decision::try_allowed(3, 2, Duration::from_mins(1)).unwrap(),
                 AdmissionOutcome::Allowed,
                 ConsumptionStatus::Consumed,
             ),
@@ -610,7 +610,7 @@ mod tests {
             Check::new(&second, SubjectKey::from_digest([2; 32])),
         ];
         let elapsed = Duration::from_millis(11);
-        let allowed = Decision::try_allowed(3, 2, Duration::from_secs(60)).unwrap();
+        let allowed = Decision::try_allowed(3, 2, Duration::from_mins(1)).unwrap();
         let quota_denial = QuotaDenial::try_new(3, Duration::from_secs(1)).unwrap();
         let capacity_denial = Denial::storage_capacity(None);
 
