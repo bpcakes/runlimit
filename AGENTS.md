@@ -31,7 +31,12 @@ deployments.
 - A policy configuration fingerprint is part of every storage key. Changing
   any storage-relevant configuration never reinterprets an existing counter.
 - Enforced and shadow-denied checks do not consume quota. Storage-capacity
-  denials are always enforced.
+  denials are always enforced, and the decision types enforce this: only a
+  validated `QuotaDenial` can be shadowed.
+- Decision metadata is validated where it is constructed, never where it is
+  serialized. Every constructible `Decision`, `Denial`, and `BatchDecision`
+  is reportable and serializable; serialization must not reject their metadata,
+  and new invariants belong in their constructors.
 - Multi-check operations are all-or-nothing and preserve the caller's input
   order in returned decisions.
 - Retry durations are measured from the backend's authoritative evaluation

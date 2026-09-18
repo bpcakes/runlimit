@@ -117,6 +117,46 @@ cargo check \
   --target-dir target/external-consumer
 ```
 
+## Decision model
+
+`Decision::view()` returns an exhaustive `DecisionView`, with metadata for
+each outcome:
+
+```rust
+use runlimit_core::{Decision, DecisionView};
+
+fn describe(decision: &Decision) -> String {
+    match decision.view() {
+        DecisionView::Allowed {
+            capacity,
+            available,
+            ..
+        } => {
+            format!("admitted; {available} of {capacity} left")
+        }
+        DecisionView::ShadowDenied { denial } => format!(
+            "admitted; quota of {} would have denied for {:?}",
+            denial.capacity(),
+            denial.retry_after(),
+        ),
+        DecisionView::Denied { denial } => match denial.quota() {
+            Some(quota) => format!("rejected; retry after {:?}", quota.retry_after()),
+            None => "rejected; backend capacity".to_owned(),
+        },
+    }
+}
+```
+
+This example is exercised in `crates/runlimit-core/tests/readme_decision_model.rs`.
+
+Decision constructors validate capacity and available quota. Only a validated
+`QuotaDenial` can be shadowed, and allowed batches reject denied members.
+Serialization does not perform further metadata validation.
+
+Use `permits_request()` for admission and `would_deny()` for observability.
+`is_allowed()` also permits shadow denials, so it does not guarantee allowance
+metadata; match `DecisionView::Allowed` when that metadata is needed.
+
 ## Generic backend API
 
 Async application adapters can be generic over `runlimit_core::Limiter` and
@@ -142,6 +182,9 @@ The inherent `MemoryStore::check` and `MemoryStore::check_all` APIs remain
 synchronous. In generic code the trait methods are selected automatically. To
 request the async trait method from a concrete memory store, use a fully
 qualified call such as `Limiter::check(&store, &check).await`.
+
+Trait calls evaluate and consume quota only when their returned future is
+first polled. Creating and dropping an unpolled future leaves quota unchanged.
 
 ## Axum admission middleware
 

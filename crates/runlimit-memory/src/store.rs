@@ -464,18 +464,15 @@ impl<C: Clock> Limiter for MemoryStore<C> {
     type Policy = runlimit_core::FixedWindowPolicy;
     type Error = MemoryStoreError;
 
-    fn check(
-        &self,
-        check: &Check<'_>,
-    ) -> impl Future<Output = Result<Decision, Self::Error>> + Send {
-        std::future::ready(MemoryStore::check(self, check))
+    // The async body defers the synchronous check until the first poll.
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn check(&self, check: &Check<'_>) -> Result<Decision, Self::Error> {
+        MemoryStore::check(self, check)
     }
 
-    fn check_all(
-        &self,
-        checks: &[Check<'_>],
-    ) -> impl Future<Output = Result<BatchDecision, Self::Error>> + Send {
-        std::future::ready(MemoryStore::check_all(self, checks))
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn check_all(&self, checks: &[Check<'_>]) -> Result<BatchDecision, Self::Error> {
+        MemoryStore::check_all(self, checks)
     }
 }
 

@@ -13,6 +13,15 @@ The format is based on [Keep a Changelog], and this project adheres to
   SQLx pools or handling SQLx errors must also upgrade to SQLx 0.9.
 - Raise the workspace minimum supported Rust version from 1.88 to 1.94.
 
+### Fixed
+
+- Defer `MemoryStore` and `GcraStore` async `Limiter` checks until their
+  futures are first polled. Creating and dropping an unpolled single or batch
+  check no longer consumes quota. **Breaking:** the futures returned by these
+  backends' `Limiter::check` and `Limiter::check_all` methods no longer implement
+  `Unpin`. Callers that require `Unpin` must pin these futures first, for example
+  with `std::pin::pin!` or `Box::pin`; ordinary `.await` calls are unaffected.
+
 ## [0.3.0] - 2026-08-24
 
 ### Added

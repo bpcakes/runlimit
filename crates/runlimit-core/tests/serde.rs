@@ -202,6 +202,17 @@ fn decisions_and_denials_have_exact_tagged_wire_shapes() {
 fn decision_deserialization_rejects_impossible_metadata() {
     assert!(
         serde_json::from_value::<Decision>(json!({
+            "outcome": "denied",
+            "denial": {
+                "reason": "quota_exceeded",
+                "capacity": 0,
+                "retry_after": {"secs": 1, "nanos": 0}
+            }
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<Decision>(json!({
             "outcome": "allowed",
             "capacity": 8,
             "available": 9,
@@ -283,6 +294,37 @@ fn shadow_decisions_round_trip_but_storage_capacity_cannot_be_shadowed() {
 }
 
 #[test]
+fn shadow_batches_round_trip_but_storage_capacity_cannot_be_shadowed() {
+    let batch =
+        BatchDecision::shadow_denied(2, QuotaDenial::try_new(8, Duration::from_secs(1)).unwrap());
+    let value = serde_json::to_value(&batch).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "outcome": "shadow_denied",
+            "index": 2,
+            "denial": {
+                "reason": "quota_exceeded",
+                "capacity": 8,
+                "retry_after": {"secs": 1, "nanos": 0}
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<BatchDecision>(value).unwrap(),
+        batch
+    );
+    assert!(
+        serde_json::from_value::<BatchDecision>(json!({
+            "outcome": "shadow_denied",
+            "index": 0,
+            "denial": {"reason": "storage_capacity", "retry_after": null}
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn batch_decisions_round_trip_and_reject_denied_members_in_allowed_batches() {
     let allowed = BatchDecision::try_allowed(vec![
         Decision::try_allowed(8, 7, Duration::from_mins(1)).unwrap(),
@@ -311,20 +353,23 @@ fn batch_decisions_round_trip_and_reject_denied_members_in_allowed_batches() {
         })
     );
 
-    assert!(
-        serde_json::from_value::<BatchDecision>(json!({
-            "outcome": "allowed",
-            "decisions": [{
-                "outcome": "denied",
-                "denial": {
-                    "reason": "quota_exceeded",
-                    "capacity": 8,
-                    "retry_after": {"secs": 1, "nanos": 0}
-                }
-            }]
-        }))
-        .is_err()
-    );
+    for outcome in ["denied", "shadow_denied"] {
+        assert!(
+            serde_json::from_value::<BatchDecision>(json!({
+                "outcome": "allowed",
+                "decisions": [{
+                    "outcome": outcome,
+                    "denial": {
+                        "reason": "quota_exceeded",
+                        "capacity": 8,
+                        "retry_after": {"secs": 1, "nanos": 0}
+                    }
+                }]
+            }))
+            .is_err(),
+            "an allowed batch must reject a {outcome} member"
+        );
+    }
     assert!(
         BatchDecision::try_allowed(vec![Decision::denied(
             QuotaDenial::try_new(8, Duration::from_secs(1)).unwrap()

@@ -962,6 +962,17 @@ mod tests {
     }
 
     #[test]
+    fn allowed_batch_rejects_shadow_denied_member() {
+        let shadow = Decision::shadow_denied(quota(8, Duration::from_secs(30)));
+        assert!(shadow.permits_request());
+
+        assert_eq!(
+            BatchDecision::try_allowed(vec![allowed(8, 7, Duration::from_mins(1)), shadow]),
+            Err(DecisionError::DeniedDecisionInAllowedBatch { index: 1 })
+        );
+    }
+
+    #[test]
     fn shadow_denial_permits_the_request_without_claiming_consumption() {
         let denial = quota(8, Duration::from_secs(30));
         let decision = Decision::shadow_denied(denial);
