@@ -535,8 +535,8 @@ mod tests {
 
     use runlimit_core::{
         AdmissionOperation, AdmissionOutcome, BatchDecision, Check, ConsumptionStatus, Decision,
-        Denial, DenialKind, GcraPolicy, MAX_LIMIT, Observation, Observer, PolicyId, QuotaDenial,
-        QuotaMode, ScopeId, SubjectKey,
+        DenialKind, GcraPolicy, MAX_LIMIT, Observation, Observer, PolicyId, QuotaDenial, QuotaMode,
+        ScopeId, SubjectKey,
     };
 
     use super::{GcraStore, GcraStoreError};
@@ -1055,7 +1055,7 @@ mod tests {
         let result = store.check_all(&[earlier, exhausted]).unwrap();
         assert_eq!(result.denied_index(), Some(1));
         assert_eq!(
-            result.denial().map(Denial::kind),
+            result.denial().map(|denial| denial.kind()),
             Some(DenialKind::QuotaExceeded)
         );
         assert!(
@@ -1078,7 +1078,7 @@ mod tests {
         let result = store.check_all(&[earlier, new_key]).unwrap();
         assert_eq!(result.denied_index(), Some(1));
         assert_eq!(
-            result.denial().map(Denial::kind),
+            result.denial().map(|denial| denial.kind()),
             Some(DenialKind::StorageCapacity)
         );
         assert!(
@@ -1145,7 +1145,7 @@ mod tests {
         let decision = store.check(&Check::new(&shadow, subject(2))).unwrap();
         assert!(decision.is_enforced_denial());
         assert_eq!(
-            decision.denial().map(Denial::kind),
+            decision.denial().map(|denial| denial.kind()),
             Some(DenialKind::StorageCapacity)
         );
     }

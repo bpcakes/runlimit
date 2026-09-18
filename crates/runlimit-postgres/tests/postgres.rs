@@ -1202,7 +1202,7 @@ async fn configured_capacity_denies_only_new_keys_in_the_full_shard() {
 
     assert!(first.is_allowed());
     assert!(second.is_allowed());
-    assert_eq!(denied.denial(), Some(&Denial::storage_capacity(None)));
+    assert_eq!(denied.denial(), Some(Denial::storage_capacity(None)));
     assert!(existing.is_allowed());
     assert!(other.is_allowed());
     assert_eq!(
@@ -1250,7 +1250,7 @@ async fn expired_rows_hold_capacity_until_cleanup_commits() {
         .check(&Check::new(&policy, replacement_subject))
         .await
         .expect("an expired stored row still occupies capacity");
-    assert_eq!(full.denial(), Some(&Denial::storage_capacity(None)));
+    assert_eq!(full.denial(), Some(Denial::storage_capacity(None)));
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 1);
 
     assert_eq!(
@@ -1590,7 +1590,7 @@ async fn concurrent_replicas_never_exceed_configured_shard_capacity() {
         if decision.is_allowed() {
             allowed += 1;
         } else {
-            assert_eq!(decision.denial(), Some(&Denial::storage_capacity(None)));
+            assert_eq!(decision.denial(), Some(Denial::storage_capacity(None)));
             capacity_denied += 1;
         }
     }
@@ -1646,7 +1646,7 @@ async fn single_quota_denial_and_anchored_reset() {
     let denied = limiter.check(&check).await.expect("denial is a decision");
     assert!(denied.is_denied());
     assert_eq!(
-        denied.denial().map(Denial::kind),
+        denied.denial().map(|denial| denial.kind()),
         Some(DenialKind::QuotaExceeded)
     );
     let retry_after = denied.retry_after().expect("quota denial has retry time");

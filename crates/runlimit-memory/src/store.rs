@@ -968,14 +968,14 @@ mod tests {
         assert!(shadow_denial.permits_request());
         assert!(shadow_denial.is_shadow_denied());
         assert_eq!(
-            shadow_denial.denial().map(Denial::kind),
+            shadow_denial.denial().map(|denial| denial.kind()),
             Some(DenialKind::QuotaExceeded)
         );
 
         let enforced_denial = store.check(&Check::new(&enforced, subject)).unwrap();
         assert!(enforced_denial.is_enforced_denial());
         assert_eq!(
-            enforced_denial.denial().map(Denial::kind),
+            enforced_denial.denial().map(|denial| denial.kind()),
             Some(DenialKind::QuotaExceeded)
         );
 
@@ -1012,7 +1012,7 @@ mod tests {
         let capacity = full_store.check(&second).unwrap();
         assert!(capacity.is_enforced_denial());
         assert_eq!(
-            capacity.denial().map(Denial::kind),
+            capacity.denial().map(|denial| denial.kind()),
             Some(DenialKind::StorageCapacity)
         );
     }

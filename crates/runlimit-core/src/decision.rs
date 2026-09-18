@@ -190,7 +190,7 @@ struct Allowance {
 enum Outcome {
     Allowed(Allowance),
     Denied(Denial),
-    ShadowDenied(Denial),
+    ShadowDenied(QuotaDenial),
 }
 
 /// A read-only, discriminated view of a [`Decision`].
@@ -300,7 +300,7 @@ impl Decision {
     /// Constructs a shadow quota denial.
     pub const fn shadow_denied(denial: QuotaDenial) -> Self {
         Self {
-            outcome: Outcome::ShadowDenied(Denial::quota_exceeded(denial)),
+            outcome: Outcome::ShadowDenied(denial),
         }
     }
 
@@ -313,12 +313,7 @@ impl Decision {
                 replenishes_after: allowance.replenishes_after,
             },
             Outcome::Denied(denial) => DecisionView::Denied { denial },
-            Outcome::ShadowDenied(denial) => match denial.reason {
-                DenialReason::QuotaExceeded(denial) => DecisionView::ShadowDenied { denial },
-                DenialReason::StorageCapacity { .. } => {
-                    unreachable!("storage-capacity denials cannot be shadowed")
-                }
-            },
+            Outcome::ShadowDenied(denial) => DecisionView::ShadowDenied { denial: *denial },
         }
     }
 
@@ -362,7 +357,8 @@ impl Decision {
     pub const fn capacity(&self) -> Option<u64> {
         match self.outcome {
             Outcome::Allowed(allowance) => Some(allowance.capacity),
-            Outcome::Denied(denial) | Outcome::ShadowDenied(denial) => denial.capacity(),
+            Outcome::Denied(denial) => denial.capacity(),
+            Outcome::ShadowDenied(denial) => Some(denial.capacity()),
         }
     }
 
@@ -387,23 +383,25 @@ impl Decision {
     pub const fn retry_after(&self) -> Option<Duration> {
         match self.outcome {
             Outcome::Allowed(_) => None,
-            Outcome::Denied(denial) | Outcome::ShadowDenied(denial) => denial.retry_after(),
+            Outcome::Denied(denial) => denial.retry_after(),
+            Outcome::ShadowDenied(denial) => Some(denial.retry_after()),
         }
     }
 
     /// Returns a whole-second `Retry-After` value rounded up, if known.
     pub const fn retry_after_seconds(&self) -> Option<u64> {
-        match self.outcome {
-            Outcome::Allowed(_) => None,
-            Outcome::Denied(denial) | Outcome::ShadowDenied(denial) => denial.retry_after_seconds(),
+        match self.retry_after() {
+            Some(duration) => Some(ceil_seconds(duration)),
+            None => None,
         }
     }
 
     /// Returns denial details for a denied check.
-    pub const fn denial(&self) -> Option<&Denial> {
-        match &self.outcome {
+    pub const fn denial(&self) -> Option<Denial> {
+        match self.outcome {
             Outcome::Allowed(_) => None,
-            Outcome::Denied(denial) | Outcome::ShadowDenied(denial) => Some(denial),
+            Outcome::Denied(denial) => Some(denial),
+            Outcome::ShadowDenied(denial) => Some(Denial::quota_exceeded(denial)),
         }
     }
 
@@ -411,7 +409,8 @@ impl Decision {
     pub const fn quota_denial(&self) -> Option<QuotaDenial> {
         match self.outcome {
             Outcome::Allowed(_) => None,
-            Outcome::Denied(denial) | Outcome::ShadowDenied(denial) => denial.quota(),
+            Outcome::Denied(denial) => denial.quota(),
+            Outcome::ShadowDenied(denial) => Some(denial),
         }
     }
 
@@ -436,7 +435,7 @@ pub struct BatchDecision {
 enum BatchOutcome {
     Allowed(Vec<Decision>),
     Denied { index: usize, denial: Denial },
-    ShadowDenied { index: usize, denial: Denial },
+    ShadowDenied { index: usize, denial: QuotaDenial },
 }
 
 /// A read-only, discriminated view of a [`BatchDecision`].
@@ -507,10 +506,7 @@ impl BatchDecision {
     /// Constructs a shadow batch denial.
     pub const fn shadow_denied(index: usize, denial: QuotaDenial) -> Self {
         Self {
-            outcome: BatchOutcome::ShadowDenied {
-                index,
-                denial: Denial::quota_exceeded(denial),
-            },
+            outcome: BatchOutcome::ShadowDenied { index, denial },
         }
     }
 
@@ -522,14 +518,9 @@ impl BatchDecision {
                 index: *index,
                 denial,
             },
-            BatchOutcome::ShadowDenied { index, denial } => match denial.reason {
-                DenialReason::QuotaExceeded(denial) => BatchDecisionView::ShadowDenied {
-                    index: *index,
-                    denial,
-                },
-                DenialReason::StorageCapacity { .. } => {
-                    unreachable!("storage-capacity denials cannot be shadowed")
-                }
+            BatchOutcome::ShadowDenied { index, denial } => BatchDecisionView::ShadowDenied {
+                index: *index,
+                denial: *denial,
             },
         }
     }
@@ -585,12 +576,11 @@ impl BatchDecision {
     }
 
     /// Returns denial details for an enforced or shadow denial.
-    pub const fn denial(&self) -> Option<&Denial> {
-        match &self.outcome {
+    pub const fn denial(&self) -> Option<Denial> {
+        match self.outcome {
             BatchOutcome::Allowed(_) => None,
-            BatchOutcome::Denied { denial, .. } | BatchOutcome::ShadowDenied { denial, .. } => {
-                Some(denial)
-            }
+            BatchOutcome::Denied { denial, .. } => Some(denial),
+            BatchOutcome::ShadowDenied { denial, .. } => Some(Denial::quota_exceeded(denial)),
         }
     }
 
@@ -598,9 +588,8 @@ impl BatchDecision {
     pub const fn quota_denial(&self) -> Option<QuotaDenial> {
         match self.outcome {
             BatchOutcome::Allowed(_) => None,
-            BatchOutcome::Denied { denial, .. } | BatchOutcome::ShadowDenied { denial, .. } => {
-                denial.quota()
-            }
+            BatchOutcome::Denied { denial, .. } => denial.quota(),
+            BatchOutcome::ShadowDenied { denial, .. } => Some(denial),
         }
     }
 
@@ -619,12 +608,7 @@ impl BatchDecision {
                 Ok(decisions[0])
             }
             BatchOutcome::Denied { index: 0, denial } => Ok(Decision::denied(denial)),
-            BatchOutcome::ShadowDenied { index: 0, denial } => match denial.quota() {
-                Some(denial) => Ok(Decision::shadow_denied(denial)),
-                None => Err(Self {
-                    outcome: BatchOutcome::ShadowDenied { index: 0, denial },
-                }),
-            },
+            BatchOutcome::ShadowDenied { index: 0, denial } => Ok(Decision::shadow_denied(denial)),
             outcome => Err(Self { outcome }),
         }
     }
@@ -707,7 +691,7 @@ enum DecisionRef<'a> {
         denial: &'a Denial,
     },
     ShadowDenied {
-        denial: &'a Denial,
+        denial: Denial,
     },
 }
 
@@ -741,7 +725,9 @@ impl serde::Serialize for Decision {
                 replenishes_after: allowance.replenishes_after,
             },
             Outcome::Denied(denial) => DecisionRef::Denied { denial },
-            Outcome::ShadowDenied(denial) => DecisionRef::ShadowDenied { denial },
+            Outcome::ShadowDenied(denial) => DecisionRef::ShadowDenied {
+                denial: Denial::quota_exceeded(*denial),
+            },
         };
         serde::Serialize::serialize(&wire, serializer)
     }
@@ -776,7 +762,7 @@ impl<'de> serde::Deserialize<'de> for Decision {
 enum BatchDecisionRef<'a> {
     Allowed { decisions: &'a [Decision] },
     Denied { index: usize, denial: &'a Denial },
-    ShadowDenied { index: usize, denial: &'a Denial },
+    ShadowDenied { index: usize, denial: Denial },
 }
 
 #[cfg(feature = "serde")]
@@ -802,7 +788,7 @@ impl serde::Serialize for BatchDecision {
             },
             BatchOutcome::ShadowDenied { index, denial } => BatchDecisionRef::ShadowDenied {
                 index: *index,
-                denial,
+                denial: Denial::quota_exceeded(*denial),
             },
         };
         serde::Serialize::serialize(&wire, serializer)
@@ -883,7 +869,7 @@ mod tests {
         assert_eq!(decision.replenishes_after(), None);
         assert_eq!(decision.retry_after(), Some(Duration::from_millis(1_001)));
         assert_eq!(decision.retry_after_seconds(), Some(2));
-        assert_eq!(decision.denial(), Some(&denial));
+        assert_eq!(decision.denial(), Some(denial));
         assert_eq!(denial.kind(), DenialKind::QuotaExceeded);
         assert_eq!(denial.quota(), Some(quota));
     }
@@ -914,6 +900,7 @@ mod tests {
         assert_eq!(denial.retry_after_seconds(), None);
         assert_eq!(decision.capacity(), None);
         assert_eq!(decision.retry_after(), None);
+        assert_eq!(decision.retry_after_seconds(), None);
     }
 
     #[test]
@@ -974,7 +961,7 @@ mod tests {
 
     #[test]
     fn shadow_denial_permits_the_request_without_claiming_consumption() {
-        let denial = quota(8, Duration::from_secs(30));
+        let denial = quota(8, Duration::from_millis(30_001));
         let decision = Decision::shadow_denied(denial);
 
         assert!(decision.is_allowed());
@@ -983,7 +970,11 @@ mod tests {
         assert!(decision.would_deny());
         assert!(decision.is_shadow_denied());
         assert_eq!(decision.available(), None);
-        assert_eq!(decision.retry_after(), Some(Duration::from_secs(30)));
+        assert_eq!(decision.capacity(), Some(8));
+        assert_eq!(decision.retry_after(), Some(Duration::from_millis(30_001)));
+        assert_eq!(decision.retry_after_seconds(), Some(31));
+        assert_eq!(decision.denial(), Some(Denial::quota_exceeded(denial)));
+        assert_eq!(decision.quota_denial(), Some(denial));
         assert_eq!(
             BatchDecision::shadow_denied(0, denial).try_into_single_decision(),
             Ok(decision)
@@ -1007,7 +998,7 @@ mod tests {
         assert_eq!(
             denied.view(),
             DecisionView::Denied {
-                denial: denied.denial().unwrap(),
+                denial: &denied.denial().unwrap(),
             }
         );
 
@@ -1015,7 +1006,7 @@ mod tests {
         assert_eq!(
             capacity.view(),
             DecisionView::Denied {
-                denial: capacity.denial().unwrap(),
+                denial: &capacity.denial().unwrap(),
             }
         );
 
@@ -1046,11 +1037,12 @@ mod tests {
             denied.view(),
             BatchDecisionView::Denied {
                 index: denied.denied_index().unwrap(),
-                denial: denied.denial().unwrap(),
+                denial: &denied.denial().unwrap(),
             }
         );
 
         let shadow = BatchDecision::shadow_denied(2, quota);
+        assert_eq!(shadow.denial(), Some(Denial::quota_exceeded(quota)));
         assert_eq!(
             shadow.view(),
             BatchDecisionView::ShadowDenied {
@@ -1058,6 +1050,7 @@ mod tests {
                 denial: shadow.quota_denial().unwrap(),
             }
         );
+        assert_eq!(shadow.clone().try_into_single_decision(), Err(shadow));
     }
 
     #[test]

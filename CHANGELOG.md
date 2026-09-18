@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ### Changed
 
+- **Breaking:** `Decision::denial()` and `BatchDecision::denial()` now return
+  `Option<Denial>` by value instead of `Option<&Denial>`. Shadow outcomes store
+  `QuotaDenial` directly, making shadowed storage-capacity denials
+  unrepresentable internally. The Serde wire representation remains unchanged.
 - **Breaking:** upgrade `runlimit-postgres` to SQLx 0.9.0. Applications passing
   SQLx pools or handling SQLx errors must also upgrade to SQLx 0.9.
 - Raise the workspace minimum supported Rust version from 1.88 to 1.94.
