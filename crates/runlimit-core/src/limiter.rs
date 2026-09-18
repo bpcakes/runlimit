@@ -23,6 +23,9 @@ pub trait Limiter: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
     /// Evaluates and, when allowed, consumes one check.
+    ///
+    /// Implementations must not evaluate the check or consume quota until the
+    /// returned future is first polled.
     fn check(
         &self,
         check: &Check<'_, Self::Policy>,
@@ -32,6 +35,9 @@ pub trait Limiter: Send + Sync {
     ///
     /// If any check is denied, no check consumes quota. Allowed decisions
     /// preserve the caller's input order.
+    ///
+    /// Implementations must not evaluate the checks or consume quota until the
+    /// returned future is first polled.
     fn check_all(
         &self,
         checks: &[Check<'_, Self::Policy>],
