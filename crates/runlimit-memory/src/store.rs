@@ -460,17 +460,17 @@ fn remaining_quota(limit: u64, used: u64) -> u64 {
     limit.saturating_sub(used)
 }
 
+// Both async bodies contain no `.await`: they exist to defer the synchronous
+// check until the first poll, which the `Limiter` contract requires.
+#[allow(clippy::unused_async_trait_impl)]
 impl<C: Clock> Limiter for MemoryStore<C> {
     type Policy = runlimit_core::FixedWindowPolicy;
     type Error = MemoryStoreError;
 
-    // The async body defers the synchronous check until the first poll.
-    #[allow(clippy::unused_async_trait_impl)]
     async fn check(&self, check: &Check<'_>) -> Result<Decision, Self::Error> {
         MemoryStore::check(self, check)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn check_all(&self, checks: &[Check<'_>]) -> Result<BatchDecision, Self::Error> {
         MemoryStore::check_all(self, checks)
     }

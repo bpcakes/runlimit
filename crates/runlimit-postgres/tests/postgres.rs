@@ -11,8 +11,9 @@ use std::{
 
 use runlimit_core::{
     AdmissionOutcome, BatchDecision, BatchDecisionView, Check, ConsumptionStatus, Decision,
-    DecisionView, Denial, DenialView, FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS,
-    Observation, Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
+    DecisionView, Denial, DenialView, FixedWindowPolicy, Limiter, MAX_LIMIT, MAX_WINDOW,
+    MAX_WINDOW_MILLIS, Observation, Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId,
+    SubjectKey,
 };
 use runlimit_memory::{Clock, MemoryStore, MemoryStoreConfig};
 use runlimit_postgres::{
@@ -2015,6 +2016,55 @@ WHERE
         );
     }
     assert_eq!(deleted_rows, 1);
+}
+
+/// The `Limiter` contract requires that an unpolled future performs no work.
+/// This is the PostgreSQL counterpart of the memory crate's laziness tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn unpolled_limiter_futures_consume_no_quota() {
+    let pool = test_pool(2).await;
+    let observer = Arc::new(RecordingObserver::default());
+    let limiter =
+        PostgresLimiter::with_config(pool.clone(), test_config()).with_observer(observer.clone());
+    let policy = unique_policy("lazy-limiter", 1, Duration::from_mins(1));
+    let subject = key(12);
+    let check = Check::new(&policy, subject);
+    let checks = [check];
+
+    // Go through the trait, not the inherent methods, because the contract
+    // under test belongs to `Limiter`.
+    drop(Limiter::check(&limiter, &check));
+    drop(Limiter::check_all(&limiter, &checks));
+
+    assert!(
+        !counter_exists(&pool, &policy, subject).await,
+        "dropping unpolled futures must not create a counter row"
+    );
+    assert!(
+        observer.admissions.lock().unwrap().is_empty(),
+        "dropping unpolled futures must not emit admission observations"
+    );
+
+    let first = Limiter::check(&limiter, &check)
+        .await
+        .expect("the first polled check succeeds");
+    assert_eq!(
+        available(&first),
+        0,
+        "the first polled check consumes the only quota unit, proving the unpolled futures consumed nothing"
+    );
+    assert_eq!(stored_counter_usage(&pool, &policy, subject).await, 1);
+
+    let batch = Limiter::check_all(&limiter, &checks)
+        .await
+        .expect("the polled batch is a decision");
+    assert!(matches!(
+        batch.view(),
+        BatchDecisionView::Denied { index: 0, .. }
+    ));
+    assert_eq!(observer.admissions.lock().unwrap().len(), 2);
+    assert_eq!(delete_counter(&pool, &policy, subject).await, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

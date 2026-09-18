@@ -46,6 +46,10 @@ deployments.
   like `RetryAfter` rather than in documentation.
 - Multi-check operations are all-or-nothing and preserve the caller's input
   order in returned decisions.
+- `Limiter::check` and `Limiter::check_all` futures do no work before their
+  first poll. The type system cannot express this, so every backend keeps a
+  regression test that drops an unpolled future and proves nothing was
+  evaluated or consumed.
 - Retry durations are measured from the backend's authoritative evaluation
   time and round up when converted to whole-second headers. PostgreSQL measures
   elapsed evaluation time with its database clock and may conservatively

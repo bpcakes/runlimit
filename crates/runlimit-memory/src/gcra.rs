@@ -503,17 +503,17 @@ fn duration_from_millis(millis: u128) -> Duration {
     )
 }
 
+// Both async bodies contain no `.await`: they exist to defer the synchronous
+// check until the first poll, which the `Limiter` contract requires.
+#[allow(clippy::unused_async_trait_impl)]
 impl<C: Clock> Limiter for GcraStore<C> {
     type Policy = GcraPolicy;
     type Error = GcraStoreError;
 
-    // The async body defers the synchronous check until the first poll.
-    #[allow(clippy::unused_async_trait_impl)]
     async fn check(&self, check: &Check<'_, Self::Policy>) -> Result<Decision, Self::Error> {
         GcraStore::check(self, check)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn check_all(
         &self,
         checks: &[Check<'_, Self::Policy>],
