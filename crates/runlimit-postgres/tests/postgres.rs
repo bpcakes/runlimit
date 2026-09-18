@@ -10,9 +10,9 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionOutcome, BatchDecision, Check, ConsumptionStatus, Decision, Denial, DenialKind,
-    FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, Observation, Observer, PolicyId,
-    QuotaDenial, QuotaMode, ScopeId, SubjectKey,
+    AdmissionOutcome, BatchDecision, BatchDecisionView, Check, ConsumptionStatus, Decision,
+    DecisionView, Denial, DenialView, FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS,
+    Observation, Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
 };
 use runlimit_memory::{Clock, MemoryStore, MemoryStoreConfig};
 use runlimit_postgres::{
@@ -38,6 +38,33 @@ const PUBLISHED_CREATE_MIGRATION_SHA384: [u8; 48] = [
     0xe7, 0x4b, 0xf9, 0xc6, 0x30, 0x22, 0xd2, 0x51, 0xae, 0xb3, 0xd5, 0x80, 0x67, 0xe9, 0x80, 0xec,
 ];
 static NEXT_POLICY: AtomicU64 = AtomicU64::new(0);
+
+fn available(decision: &Decision) -> u64 {
+    match decision.view() {
+        DecisionView::Allowed { available, .. } => available,
+        DecisionView::Denied { .. } | DecisionView::ShadowDenied { .. } => {
+            panic!("expected an allowed decision, got {decision:?}")
+        }
+    }
+}
+
+/// Describes an outcome without its backend-measured durations.
+fn shape(decision: &Decision) -> String {
+    match decision.view() {
+        DecisionView::Allowed {
+            capacity,
+            available,
+            ..
+        } => format!("allowed {available} of {capacity}"),
+        DecisionView::Denied {
+            denial: DenialView::QuotaExceeded(quota),
+        } => format!("quota denied at {}", quota.capacity()),
+        DecisionView::Denied {
+            denial: DenialView::StorageCapacity { .. },
+        } => "capacity denied".to_owned(),
+        DecisionView::ShadowDenied { denial } => format!("shadow denied at {}", denial.capacity()),
+    }
+}
 
 #[derive(Default)]
 struct RecordingObserver {
@@ -792,7 +819,7 @@ async fn pool_wait_does_not_spend_admission_or_cleanup_operation_budget() {
         .expect("admission task does not panic")
         .expect("admission receives a fresh operation budget after pool wait");
     assert!(decision.permits_request());
-    assert_eq!(decision.available(), Some(0));
+    assert_eq!(available(&decision), 0);
 
     sqlx::query(
         r"
@@ -1202,7 +1229,7 @@ async fn configured_capacity_denies_only_new_keys_in_the_full_shard() {
 
     assert!(first.permits_request());
     assert!(second.permits_request());
-    assert_eq!(denied.denial(), Some(Denial::storage_capacity(None)));
+    assert_eq!(denied, Decision::denied(Denial::storage_capacity(None)));
     assert!(existing.permits_request());
     assert!(other.permits_request());
     assert_eq!(
@@ -1250,7 +1277,7 @@ async fn expired_rows_hold_capacity_until_cleanup_commits() {
         .check(&Check::new(&policy, replacement_subject))
         .await
         .expect("an expired stored row still occupies capacity");
-    assert_eq!(full.denial(), Some(Denial::storage_capacity(None)));
+    assert_eq!(full, Decision::denied(Denial::storage_capacity(None)));
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 1);
 
     assert_eq!(
@@ -1590,7 +1617,7 @@ async fn concurrent_replicas_never_exceed_configured_shard_capacity() {
         if decision.permits_request() {
             allowed += 1;
         } else {
-            assert_eq!(decision.denial(), Some(Denial::storage_capacity(None)));
+            assert_eq!(decision, Decision::denied(Denial::storage_capacity(None)));
             capacity_denied += 1;
         }
     }
@@ -1632,24 +1659,24 @@ async fn single_quota_denial_and_anchored_reset() {
 
     let first = limiter.check(&check).await.expect("first check succeeds");
     assert!(first.permits_request());
-    assert_eq!(first.available(), Some(1));
-    assert!(
-        first
-            .replenishes_after()
-            .is_some_and(|reset| !reset.is_zero())
-    );
+    assert_eq!(available(&first), 1);
+    assert!(matches!(
+        first.view(),
+        DecisionView::Allowed { replenishes_after, .. } if !replenishes_after.is_zero()
+    ));
 
     let second = limiter.check(&check).await.expect("second check succeeds");
     assert!(second.permits_request());
-    assert_eq!(second.available(), Some(0));
+    assert_eq!(available(&second), 0);
 
     let denied = limiter.check(&check).await.expect("denial is a decision");
-    assert!(denied.is_enforced_denial());
-    assert_eq!(
-        denied.denial().map(|denial| denial.kind()),
-        Some(DenialKind::QuotaExceeded)
-    );
-    let retry_after = denied.retry_after().expect("quota denial has retry time");
+    let DecisionView::Denied {
+        denial: DenialView::QuotaExceeded(quota),
+    } = denied.view()
+    else {
+        panic!("expected a quota denial, got {denied:?}")
+    };
+    let retry_after = quota.retry_after().duration();
     assert!(!retry_after.is_zero());
     assert!(retry_after <= policy.window());
 
@@ -1659,7 +1686,7 @@ async fn single_quota_denial_and_anchored_reset() {
         .await
         .expect("check after expiry succeeds");
     assert!(reset.permits_request());
-    assert_eq!(reset.available(), Some(1));
+    assert_eq!(available(&reset), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1699,16 +1726,25 @@ WHERE
     drop(limiter);
     pool.close().await;
 
-    assert!(allowed.permits_request());
-    assert_eq!(allowed.capacity(), Some(MAX_LIMIT));
-    assert_eq!(allowed.available(), Some(0));
+    assert!(matches!(
+        allowed.view(),
+        DecisionView::Allowed {
+            capacity: MAX_LIMIT,
+            available: 0,
+            ..
+        }
+    ));
     assert_eq!(stored_used, i64::MAX);
     assert_eq!(
         u64::try_from(stored_window_millis).unwrap(),
         MAX_WINDOW_MILLIS
     );
-    assert!(denied.is_enforced_denial());
-    assert_eq!(denied.capacity(), Some(MAX_LIMIT));
+    assert!(matches!(
+        denied.view(),
+        DecisionView::Denied {
+            denial: DenialView::QuotaExceeded(quota),
+        } if quota.capacity() == MAX_LIMIT
+    ));
     assert_eq!(deleted_rows, 1);
 }
 
@@ -1734,14 +1770,16 @@ async fn denied_batch_rolls_back_every_counter() {
         .check_all(&[first_check, saturated_check])
         .await
         .expect("denied batch is a decision");
-    assert!(batch.is_enforced_denial());
-    assert_eq!(batch.denied_index(), Some(1));
+    assert!(matches!(
+        batch.view(),
+        BatchDecisionView::Denied { index: 1, .. }
+    ));
 
     let after_rollback = limiter
         .check(&first_check)
         .await
         .expect("counter remains usable");
-    assert_eq!(after_rollback.available(), Some(1));
+    assert_eq!(available(&after_rollback), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1824,8 +1862,10 @@ ON runlimit_fixed_windows
         Err(CheckError::DefinitelyNotConsumed(_))
     ));
     let batch = batch.expect("later failing statement must not replace a known denial");
-    assert!(batch.is_enforced_denial());
-    assert_eq!(batch.denied_index(), Some(0));
+    assert!(matches!(
+        batch.view(),
+        BatchDecisionView::Denied { index: 0, .. }
+    ));
     assert_eq!(deleted_rows, 1);
 }
 
@@ -1946,15 +1986,9 @@ WHERE
             step.name
         );
         assert_eq!(
-            memory_decision.capacity(),
-            postgres_decision.capacity(),
-            "backends disagreed on the limit at the '{}' transition",
-            step.name
-        );
-        assert_eq!(
-            memory_decision.available(),
-            postgres_decision.available(),
-            "backends disagreed on remaining quota at the '{}' transition",
+            shape(&memory_decision),
+            shape(&postgres_decision),
+            "backends disagreed on the outcome at the '{}' transition",
             step.name
         );
         assert_eq!(
@@ -1962,10 +1996,18 @@ WHERE
             "memory returned the wrong '{}' transition",
             step.name
         );
-        let postgres_duration = postgres_decision
-            .replenishes_after()
-            .or_else(|| postgres_decision.retry_after())
-            .expect("fixed-window decision contains a duration");
+        let postgres_duration = match postgres_decision.view() {
+            DecisionView::Allowed {
+                replenishes_after, ..
+            } => replenishes_after,
+            DecisionView::Denied {
+                denial: DenialView::QuotaExceeded(quota),
+            }
+            | DecisionView::ShadowDenied { denial: quota } => quota.retry_after().duration(),
+            DecisionView::Denied {
+                denial: DenialView::StorageCapacity { .. },
+            } => panic!("the transition sequence never exhausts storage capacity"),
+        };
         assert!(
             postgres_duration <= policy.window(),
             "PostgreSQL returned an overlong duration at the '{}' transition",
@@ -2050,12 +2092,16 @@ ORDER BY input.input_position
         .expect("fresh counters must all be allowed");
     assert_eq!(decisions.len(), checks.len());
     for (decision, check) in decisions.iter().zip(&checks) {
-        assert!(decision.permits_request());
-        assert_eq!(decision.capacity(), Some(check.policy().limit()));
-        assert_eq!(
-            decision.available(),
-            Some(check.policy().limit() - check.cost())
-        );
+        let DecisionView::Allowed {
+            capacity,
+            available,
+            ..
+        } = decision.view()
+        else {
+            panic!("fresh counters must all be allowed, got {decision:?}")
+        };
+        assert_eq!(capacity, check.policy().limit());
+        assert_eq!(available, check.policy().limit() - check.cost());
     }
 
     assert_eq!(stored_usage.len(), checks.len());
@@ -2165,8 +2211,10 @@ async fn opposite_order_batches_across_pools_do_not_deadlock_or_over_admit() {
     assert_eq!(u64::try_from(stored_a).unwrap(), ROUNDS * 2);
     assert_eq!(u64::try_from(stored_b).unwrap(), ROUNDS * 2);
     let after_capacity = after_capacity.expect("post-capacity batch is a decision");
-    assert!(after_capacity.is_enforced_denial());
-    assert_eq!(after_capacity.denied_index(), Some(0));
+    assert!(matches!(
+        after_capacity.view(),
+        BatchDecisionView::Denied { index: 0, .. }
+    ));
     assert_eq!(deleted_a, 1);
     assert_eq!(deleted_b, 1);
 }
@@ -2338,7 +2386,10 @@ async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
     let target_deleted = delete_counter(&pool, &target_policy, target_subject).await;
     let companion_deleted = delete_counter(&pool, &companion_policy, companion_subject).await;
 
-    assert_eq!(batch.allowed_decisions().map(<[Decision]>::len), Some(2));
+    assert!(matches!(
+        batch.view(),
+        BatchDecisionView::Allowed { decisions } if decisions.len() == 2
+    ));
     assert!(single.is_enforced_denial());
     assert_eq!(target_stored, 1);
     assert_eq!(companion_stored, 1);
@@ -2403,7 +2454,7 @@ FOR UPDATE
         decision.permits_request(),
         "a clock sampled before the row-lock wait would deny against the expired window"
     );
-    assert_eq!(decision.available(), Some(0));
+    assert_eq!(available(&decision), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2483,7 +2534,7 @@ async fn row_lock_timeout_releases_single_connection_pool_slot_without_consuming
         .check(&check)
         .await
         .expect("first check succeeds");
-    assert_eq!(first.available(), Some(1));
+    assert_eq!(available(&first), 1);
 
     let mut blocker = blocker_pool
         .begin()
@@ -2548,7 +2599,7 @@ FOR UPDATE
         .await
         .expect("counter remains usable");
     assert!(after_timeout.permits_request());
-    assert_eq!(after_timeout.available(), Some(0));
+    assert_eq!(available(&after_timeout), 0);
 
     let deleted_rows = delete_counter(&blocker_pool, &policy, subject).await;
     drop(short_limiter);

@@ -2,7 +2,7 @@ use std::{env, error::Error, time::Duration};
 
 use runlimit_core::{
     AdmissionObservation, BatchDecisionView, Check, CleanupObservation, ConsumptionStatus,
-    FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
+    DenialView, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
 };
 use runlimit_memory::{GcraStoreError, MemoryStore, MemoryStoreConfig, MemoryStoreError};
 
@@ -60,12 +60,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             assert_eq!(decisions.len(), checks.len());
             println!("request admitted");
         }
-        BatchDecisionView::Denied { index, denial } => match denial.retry_after_seconds() {
-            Some(seconds) => {
-                println!("check {index} denied; retry after {seconds} seconds");
-            }
-            None => println!("check {index} denied; retry time unavailable"),
-        },
+        BatchDecisionView::Denied {
+            index,
+            denial: DenialView::QuotaExceeded(quota),
+        } => {
+            let seconds = quota.retry_after().seconds();
+            println!("check {index} denied; retry after {seconds} seconds");
+        }
+        BatchDecisionView::Denied {
+            index,
+            denial: DenialView::StorageCapacity { .. },
+        } => println!("check {index} denied; backend storage is full"),
         BatchDecisionView::ShadowDenied { index, .. } => {
             println!("request admitted after check {index} was shadow denied");
         }

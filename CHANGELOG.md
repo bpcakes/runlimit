@@ -12,9 +12,25 @@ The format is based on [Keep a Changelog], and this project adheres to
 - **Breaking:** remove `Decision::is_allowed()` and `Decision::is_denied()`.
   Use `permits_request()` and `is_enforced_denial()` respectively. Match
   `DecisionView::Allowed` when allowance metadata is needed.
-- **Breaking:** `Decision::denial()` and `BatchDecision::denial()` now return
-  `Option<Denial>` by value instead of `Option<&Denial>`. Shadow outcomes store
-  `QuotaDenial` directly, making shadowed storage-capacity denials
+- **Breaking:** add `DenialView` and `Denial::view()`. `DecisionView::Denied`
+  and `BatchDecisionView::Denied` carry a `DenialView` by value, and
+  `DecisionView` no longer has a lifetime. Every denial reason is a named match
+  arm, so a future reason fails to compile in every consumer instead of landing
+  in a fallback branch.
+- **Breaking:** add `RetryAfter`. `QuotaDenial::retry_after()` returns it and
+  `DenialView::StorageCapacity` carries an optional one. `RetryAfter::seconds()`
+  replaces the removed `retry_after_seconds()` accessors and rounds up for
+  `Retry-After` headers; `RetryAfter::duration()` keeps the exact measurement.
+- **Breaking:** remove `DenialKind` and the reason-agnostic accessors
+  `Denial::kind()`, `quota()`, `capacity()`, `retry_after()`, and
+  `retry_after_seconds()`. Match `Denial::view()` instead.
+- **Breaking:** remove the optional accessors `Decision::capacity()`,
+  `available()`, `replenishes_after()`, `retry_after()`,
+  `retry_after_seconds()`, `denial()`, and `quota_denial()`, and
+  `BatchDecision::allowed_decisions()`, `denied_index()`, `denial()`, and
+  `quota_denial()`. Match `DecisionView` and `BatchDecisionView` instead;
+  `try_into_allowed()` and `try_into_single_decision()` remain. Shadow outcomes
+  store `QuotaDenial` directly, making shadowed storage-capacity denials
   unrepresentable internally. The Serde wire representation remains unchanged.
 - **Breaking:** upgrade `runlimit-postgres` to SQLx 0.9.0. Applications passing
   SQLx pools or handling SQLx errors must also upgrade to SQLx 0.9.

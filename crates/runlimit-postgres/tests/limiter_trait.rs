@@ -3,8 +3,8 @@
 use std::{fmt::Debug, time::Duration};
 
 use runlimit_core::{
-    BatchDecision, BatchError, Check, Decision, FixedWindowPolicy, Limiter, PolicyId, ScopeId,
-    SubjectKey,
+    BatchDecision, BatchError, Check, Decision, DecisionView, FixedWindowPolicy, Limiter, PolicyId,
+    ScopeId, SubjectKey,
 };
 use runlimit_memory::{MemoryStore, MemoryStoreConfig, MemoryStoreError};
 use runlimit_postgres::{CheckError, PostgresLimiter};
@@ -113,8 +113,20 @@ async fn generic_batch_preserves_caller_order() {
     let decisions = expect_allowed(check_batch(&memory, &checks).await);
 
     assert_eq!(decisions.len(), 2);
-    assert_eq!(decisions[0].capacity(), Some(11));
-    assert_eq!(decisions[0].available(), Some(8));
-    assert_eq!(decisions[1].capacity(), Some(7));
-    assert_eq!(decisions[1].available(), Some(5));
+    assert!(matches!(
+        decisions[0].view(),
+        DecisionView::Allowed {
+            capacity: 11,
+            available: 8,
+            ..
+        }
+    ));
+    assert!(matches!(
+        decisions[1].view(),
+        DecisionView::Allowed {
+            capacity: 7,
+            available: 5,
+            ..
+        }
+    ));
 }

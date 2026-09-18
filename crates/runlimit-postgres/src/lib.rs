@@ -547,8 +547,9 @@ mod tests {
 
     use super::*;
     use runlimit_core::{
-        AdmissionOperation, AdmissionOutcome, ConsumptionStatus, FixedWindowPolicy, MAX_LIMIT,
-        MAX_WINDOW, MAX_WINDOW_MILLIS, PolicyId, QuotaDenial, ScopeId, SubjectKey,
+        AdmissionOperation, AdmissionOutcome, BatchDecisionView, ConsumptionStatus, Denial,
+        DenialView, FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, PolicyId,
+        QuotaDenial, ScopeId, SubjectKey,
     };
 
     fn policy(id: &str, scope: &str) -> FixedWindowPolicy {
@@ -838,11 +839,13 @@ mod tests {
         .finish(Duration::from_millis(80));
 
         assert_eq!(
-            allowed.replenishes_after(),
-            Some(Duration::from_millis(170))
+            allowed,
+            Decision::allowed(10, 4, Duration::from_millis(170))
         );
-        assert_eq!(denied.retry_after(), Some(Duration::from_millis(70)));
-        assert_eq!(denied.retry_after_seconds(), Some(1));
+        assert_eq!(
+            denied,
+            Denial::quota_exceeded(QuotaDenial::new(10, Duration::from_millis(70)))
+        );
     }
 
     #[tokio::test]
@@ -866,10 +869,12 @@ mod tests {
         let ConnectionOutcome::MustClose(decision) = outcome else {
             panic!("rollback failure must close the connection")
         };
-        assert_eq!(decision.denied_index(), Some(2));
         assert_eq!(
-            decision.quota_denial(),
-            Some(QuotaDenial::try_new(10, Duration::from_millis(130)).unwrap())
+            decision.view(),
+            BatchDecisionView::Denied {
+                index: 2,
+                denial: DenialView::QuotaExceeded(QuotaDenial::new(10, Duration::from_millis(130))),
+            }
         );
     }
 
@@ -892,8 +897,13 @@ mod tests {
         let ConnectionOutcome::MustClose(decision) = outcome else {
             panic!("rollback deadline must close the connection")
         };
-        assert_eq!(decision.denied_index(), Some(0));
-        assert_eq!(decision.quota_denial().map(QuotaDenial::capacity), Some(1));
+        assert!(matches!(
+            decision.view(),
+            BatchDecisionView::Denied {
+                index: 0,
+                denial: DenialView::QuotaExceeded(quota),
+            } if quota.capacity() == 1
+        ));
     }
 
     #[tokio::test]
@@ -915,9 +925,10 @@ mod tests {
         let ConnectionOutcome::Reusable(decision) = outcome else {
             panic!("successful rollback must reuse the connection")
         };
-        assert!(decision.is_shadow_denied());
-        assert_eq!(decision.denied_index(), Some(0));
-        assert_eq!(decision.quota_denial().map(QuotaDenial::capacity), Some(1));
+        assert!(matches!(
+            decision.view(),
+            BatchDecisionView::ShadowDenied { index: 0, denial } if denial.capacity() == 1
+        ));
     }
 
     #[test]

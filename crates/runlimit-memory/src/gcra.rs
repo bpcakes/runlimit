@@ -534,9 +534,9 @@ mod tests {
     };
 
     use runlimit_core::{
-        AdmissionOperation, AdmissionOutcome, BatchDecision, Check, ConsumptionStatus, Decision,
-        DenialKind, GcraPolicy, MAX_LIMIT, Observation, Observer, PolicyId, QuotaDenial, QuotaMode,
-        ScopeId, SubjectKey,
+        AdmissionOperation, AdmissionOutcome, BatchDecision, BatchDecisionView, Check,
+        ConsumptionStatus, Decision, DecisionView, DenialView, GcraPolicy, MAX_LIMIT, Observation,
+        Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
     };
 
     use super::{GcraStore, GcraStoreError};
@@ -1013,9 +1013,12 @@ mod tests {
             decisions
                 .iter()
                 .filter(|decision| {
-                    decision
-                        .denial()
-                        .is_some_and(|denial| denial.kind() == DenialKind::QuotaExceeded)
+                    matches!(
+                        decision.view(),
+                        DecisionView::Denied {
+                            denial: DenialView::QuotaExceeded(_),
+                        }
+                    )
                 })
                 .count(),
             ATTEMPTS - BURST
@@ -1053,11 +1056,13 @@ mod tests {
         assert!(store.check(&exhausted).unwrap().permits_request());
 
         let result = store.check_all(&[earlier, exhausted]).unwrap();
-        assert_eq!(result.denied_index(), Some(1));
-        assert_eq!(
-            result.denial().map(|denial| denial.kind()),
-            Some(DenialKind::QuotaExceeded)
-        );
+        assert!(matches!(
+            result.view(),
+            BatchDecisionView::Denied {
+                index: 1,
+                denial: DenialView::QuotaExceeded(_),
+            }
+        ));
         assert!(
             store.check(&earlier).unwrap().permits_request(),
             "a quota-denied batch must not consume an earlier member"
@@ -1076,11 +1081,13 @@ mod tests {
         assert!(store.check(&occupying).unwrap().permits_request());
 
         let result = store.check_all(&[earlier, new_key]).unwrap();
-        assert_eq!(result.denied_index(), Some(1));
-        assert_eq!(
-            result.denial().map(|denial| denial.kind()),
-            Some(DenialKind::StorageCapacity)
-        );
+        assert!(matches!(
+            result.view(),
+            BatchDecisionView::Denied {
+                index: 1,
+                denial: DenialView::StorageCapacity { .. },
+            }
+        ));
         assert!(
             store.check(&earlier).unwrap().permits_request(),
             "a capacity-denied batch must not consume an earlier member"
@@ -1121,8 +1128,10 @@ mod tests {
 
         assert!(store.check(&first).unwrap().permits_request());
         let result = store.check_all(&[first, second]).unwrap();
-        assert!(result.is_shadow_denied());
-        assert_eq!(result.denied_index(), Some(0));
+        assert!(matches!(
+            result.view(),
+            BatchDecisionView::ShadowDenied { index: 0, .. }
+        ));
         assert!(
             store.check(&second).unwrap().permits_request(),
             "a shadow-denied batch must not consume any member"
@@ -1143,11 +1152,12 @@ mod tests {
                 .permits_request()
         );
         let decision = store.check(&Check::new(&shadow, subject(2))).unwrap();
-        assert!(decision.is_enforced_denial());
-        assert_eq!(
-            decision.denial().map(|denial| denial.kind()),
-            Some(DenialKind::StorageCapacity)
-        );
+        assert!(matches!(
+            decision.view(),
+            DecisionView::Denied {
+                denial: DenialView::StorageCapacity { .. },
+            }
+        ));
     }
 
     #[test]

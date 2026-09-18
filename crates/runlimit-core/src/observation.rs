@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{
-    BatchDecision, BatchDecisionView, Check, Decision, DecisionView, Denial, DenialKind,
-    PolicyFingerprint, PolicyId, RateLimitPolicy, ScopeId,
+    BatchDecision, BatchDecisionView, Check, Decision, DecisionView, DenialView, PolicyFingerprint,
+    PolicyId, RateLimitPolicy, ScopeId,
 };
 
 /// Receives synchronous, backend-neutral operational observations.
@@ -305,13 +305,13 @@ fn classify_batch(decision: &BatchDecision, empty: bool) -> (AdmissionOutcome, C
     }
 }
 
-const fn classify_denial(denial: &Denial) -> (AdmissionOutcome, ConsumptionStatus) {
-    match denial.kind() {
-        DenialKind::QuotaExceeded => (
+const fn classify_denial(denial: DenialView) -> (AdmissionOutcome, ConsumptionStatus) {
+    match denial {
+        DenialView::QuotaExceeded(_) => (
             AdmissionOutcome::QuotaDenied,
             ConsumptionStatus::NotConsumed,
         ),
-        DenialKind::StorageCapacity => (
+        DenialView::StorageCapacity { .. } => (
             AdmissionOutcome::CapacityDenied,
             ConsumptionStatus::NotConsumed,
         ),

@@ -37,6 +37,13 @@ deployments.
   serialized. Every constructible `Decision`, `Denial`, and `BatchDecision`
   is reportable and serializable; serialization must not reject their metadata,
   and new invariants belong in their constructors.
+- The public API is designed for AI-agent consumers. `DecisionView`,
+  `BatchDecisionView`, and `DenialView` are exhaustive and never
+  `#[non_exhaustive]`, so a new outcome or reason is a compile error in every
+  consumer rather than a fallback arm. Do not add accessors that answer for
+  several outcomes at once with an `Option`; expose new metadata on the view
+  variant it belongs to, and encode header rules such as rounding up in types
+  like `RetryAfter` rather than in documentation.
 - Multi-check operations are all-or-nothing and preserve the caller's input
   order in returned decisions.
 - Retry durations are measured from the backend's authoritative evaluation

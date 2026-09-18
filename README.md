@@ -53,7 +53,7 @@ If either quota is unavailable, neither counter is consumed.
 use std::{env, error::Error, time::Duration};
 
 use runlimit_core::{
-    BatchDecisionView, Check, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
+    BatchDecisionView, Check, DenialView, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
 };
 use runlimit_memory::{MemoryStore, MemoryStoreConfig};
 
@@ -92,12 +92,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             assert_eq!(decisions.len(), checks.len());
             println!("request admitted");
         }
-        BatchDecisionView::Denied { index, denial } => match denial.retry_after_seconds() {
-            Some(seconds) => {
-                println!("check {index} denied; retry after {seconds} seconds");
-            }
-            None => println!("check {index} denied; retry time unavailable"),
-        },
+        BatchDecisionView::Denied {
+            index,
+            denial: DenialView::QuotaExceeded(quota),
+        } => {
+            let seconds = quota.retry_after().seconds();
+            println!("check {index} denied; retry after {seconds} seconds");
+        }
+        BatchDecisionView::Denied {
+            index,
+            denial: DenialView::StorageCapacity { .. },
+        } => println!("check {index} denied; backend storage is full"),
         BatchDecisionView::ShadowDenied { index, .. } => {
             println!("request admitted after check {index} was shadow denied");
         }
@@ -119,11 +124,12 @@ cargo check \
 
 ## Decision model
 
-`Decision::view()` returns an exhaustive `DecisionView`, with metadata for
-each outcome:
+`Decision::view()` returns an exhaustive `DecisionView`. An enforced denial
+carries an exhaustive `DenialView` naming its reason, so every outcome and
+every reason is a named match arm and none of them hides behind an `Option`:
 
 ```rust
-use runlimit_core::{Decision, DecisionView};
+use runlimit_core::{Decision, DecisionView, DenialView};
 
 fn describe(decision: &Decision) -> String {
     match decision.view() {
@@ -135,13 +141,18 @@ fn describe(decision: &Decision) -> String {
             format!("admitted; {available} of {capacity} left")
         }
         DecisionView::ShadowDenied { denial } => format!(
-            "admitted; quota of {} would have denied for {:?}",
+            "admitted; quota of {} would have denied for {}s",
             denial.capacity(),
-            denial.retry_after(),
+            denial.retry_after().seconds(),
         ),
-        DecisionView::Denied { denial } => match denial.quota() {
-            Some(quota) => format!("rejected; retry after {:?}", quota.retry_after()),
-            None => "rejected; backend capacity".to_owned(),
+        DecisionView::Denied {
+            denial: DenialView::QuotaExceeded(quota),
+        } => format!("rejected; retry after {}s", quota.retry_after().seconds()),
+        DecisionView::Denied {
+            denial: DenialView::StorageCapacity { retry_after },
+        } => match retry_after {
+            Some(retry_after) => format!("rejected; backend full for {}s", retry_after.seconds()),
+            None => "rejected; backend full".to_owned(),
         },
     }
 }
@@ -153,8 +164,15 @@ Decision constructors validate capacity and available quota. Only a validated
 `QuotaDenial` can be shadowed, and allowed batches reject denied members.
 Serialization does not perform further metadata validation.
 
+Retry durations are `RetryAfter` values. `RetryAfter::seconds()` rounds up to
+the whole seconds an HTTP `Retry-After` header needs, and
+`RetryAfter::duration()` keeps the exact backend measurement. A quota denial
+always has one; a storage-capacity denial reports one only when the backend
+knows its earliest expiry.
+
 Use `permits_request()` for admission and `would_deny()` for observability.
-Match `DecisionView::Allowed` when allowance metadata is needed.
+Match `DecisionView::Allowed` when allowance metadata is needed; there are no
+optional accessors that answer for every outcome at once.
 
 ## Generic backend API
 
@@ -256,7 +274,7 @@ as calendar minutes.
   exact at evaluation time. PostgreSQL measures elapsed evaluation time with
   its authoritative database clock and can conservatively overstate the
   remaining time at the caller by commit and transport latency. Use
-  `retry_after_seconds()` for an HTTP `Retry-After` value rounded up to the next
+  `RetryAfter::seconds()` for an HTTP `Retry-After` value rounded up to the next
   whole second.
 
 The memory and PostgreSQL backends intentionally implement these same

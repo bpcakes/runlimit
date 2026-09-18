@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
-use runlimit_core::{Decision, DecisionView, RateLimitPolicy};
+use runlimit_core::{Decision, DecisionView, DenialView, RateLimitPolicy};
 use thiserror::Error;
 
 /// Largest integer representable by an RFC 9651 Structured Field.
@@ -82,15 +82,17 @@ pub fn service_limit(name: &str, decision: &Decision) -> Result<HeaderField, Enc
             available,
             replenishes_after,
             ..
-        } => (available, replenishes_after),
-        DecisionView::Denied { denial } => match denial.quota() {
-            Some(denial) => (0, denial.retry_after()),
-            None => return Err(EncodingError::UnsupportedDecision),
-        },
-        DecisionView::ShadowDenied { denial } => (0, denial.retry_after()),
+        } => (available, ceil_seconds(replenishes_after)),
+        DecisionView::Denied {
+            denial: DenialView::QuotaExceeded(denial),
+        }
+        | DecisionView::ShadowDenied { denial } => (0, denial.retry_after().seconds()),
+        DecisionView::Denied {
+            denial: DenialView::StorageCapacity { .. },
+        } => return Err(EncodingError::UnsupportedDecision),
     };
     let available = structured_integer(available)?;
-    let effective_window = structured_integer(ceil_seconds(effective_window))?;
+    let effective_window = structured_integer(effective_window)?;
     let value = header_value(format!("{name};r={available};t={effective_window}"))?;
 
     Ok((HeaderName::from_static("ratelimit"), value))

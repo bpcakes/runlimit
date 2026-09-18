@@ -7,7 +7,9 @@ use std::{
     time::Duration,
 };
 
-use runlimit_core::{Check, FixedWindowPolicy, GcraPolicy, Limiter, PolicyId, ScopeId, SubjectKey};
+use runlimit_core::{
+    Check, DecisionView, FixedWindowPolicy, GcraPolicy, Limiter, PolicyId, ScopeId, SubjectKey,
+};
 use runlimit_memory::{Clock, GcraStore, MemoryStore, MemoryStoreConfig};
 
 struct FrozenClock;
@@ -41,8 +43,10 @@ fn assert_lazy<L: Limiter>(limiter: &L, check: &Check<'_, L::Policy>, batch: boo
     } else {
         poll_ready(limiter.check(check)).unwrap()
     };
-    assert_eq!(first.available(), Some(0));
-    assert!(first.permits_request());
+    assert!(matches!(
+        first.view(),
+        DecisionView::Allowed { available: 0, .. }
+    ));
     assert!(
         poll_ready(limiter.check(check))
             .unwrap()

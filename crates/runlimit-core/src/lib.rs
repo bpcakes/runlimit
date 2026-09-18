@@ -28,8 +28,8 @@ pub use batch::{BatchError, validate_batch};
 pub use check::{Check, CheckError};
 pub use counter::CounterKey;
 pub use decision::{
-    BatchDecision, BatchDecisionView, Decision, DecisionError, DecisionView, Denial, DenialKind,
-    QuotaDenial,
+    BatchDecision, BatchDecisionView, Decision, DecisionError, DecisionView, Denial, DenialView,
+    QuotaDenial, RetryAfter,
 };
 pub use identifier::{IdentifierError, MAX_IDENTIFIER_LENGTH, PolicyId, ScopeId};
 pub use key::{KeyHasher, KeyHasherError, SubjectKey};
