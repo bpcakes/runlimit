@@ -858,11 +858,11 @@ mod tests {
         let first_check = Check::new(&first_policy, first_subject);
         let second_check = Check::new(&second_policy, second_subject);
 
-        assert!(store.check(&first_check).unwrap().is_allowed());
-        assert!(store.check(&second_check).unwrap().is_allowed());
+        assert!(store.check(&first_check).unwrap().permits_request());
+        assert!(store.check(&second_check).unwrap().permits_request());
         assert_eq!(store.stats().unwrap().entries(), 2);
-        assert!(store.check(&first_check).unwrap().is_denied());
-        assert!(store.check(&second_check).unwrap().is_allowed());
+        assert!(store.check(&first_check).unwrap().is_enforced_denial());
+        assert!(store.check(&second_check).unwrap().permits_request());
     }
 
     #[test]
@@ -925,16 +925,16 @@ mod tests {
         let check = Check::new(&policy, subject(1));
 
         let first = store.check(&check).unwrap();
-        assert!(first.is_allowed());
+        assert!(first.permits_request());
         assert_eq!(first.available(), Some(1));
         assert_eq!(first.retry_after(), None);
 
         let second = store.check(&check).unwrap();
-        assert!(second.is_allowed());
+        assert!(second.permits_request());
         assert_eq!(second.available(), Some(0));
 
         let denied = store.check(&check).unwrap();
-        assert!(!denied.is_allowed());
+        assert!(!denied.permits_request());
         assert_eq!(denied.retry_after(), Some(Duration::from_mins(1)));
 
         clock.advance(Duration::from_secs(10));
@@ -945,7 +945,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(50));
         let reset = store.check(&check).unwrap();
-        assert!(reset.is_allowed());
+        assert!(reset.permits_request());
         assert_eq!(reset.available(), Some(1));
         assert_eq!(reset.replenishes_after(), Some(Duration::from_mins(1)));
     }
@@ -962,7 +962,7 @@ mod tests {
             store
                 .check(&Check::new(&shadow, subject))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
         let shadow_denial = store.check(&Check::new(&shadow, subject)).unwrap();
         assert!(shadow_denial.permits_request());
@@ -984,7 +984,7 @@ mod tests {
             store
                 .check(&Check::new(&enforced, subject))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
     }
 
@@ -997,18 +997,18 @@ mod tests {
         let first = Check::new(&shadow, subject(1));
         let second = Check::new(&shadow, subject(2));
 
-        assert!(store.check(&first).unwrap().is_allowed());
+        assert!(store.check(&first).unwrap().permits_request());
         let result = store.check_all(&[first, second]).unwrap();
         assert!(result.is_shadow_denied());
         assert_eq!(result.denied_index(), Some(0));
         assert!(
-            store.check(&second).unwrap().is_allowed(),
+            store.check(&second).unwrap().permits_request(),
             "a shadow-denied atomic batch must not consume another check"
         );
 
         let full_store =
             MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
-        assert!(full_store.check(&first).unwrap().is_allowed());
+        assert!(full_store.check(&first).unwrap().permits_request());
         let capacity = full_store.check(&second).unwrap();
         assert!(capacity.is_enforced_denial());
         assert_eq!(
@@ -1050,19 +1050,19 @@ mod tests {
             store
                 .check(&Check::new(&limited, subject(1)))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
         assert!(
             store
                 .check(&Check::new(&limited, subject(1)))
                 .unwrap()
-                .is_denied()
+                .is_enforced_denial()
         );
         assert!(
             store
                 .check(&Check::new(&limited, subject(2)))
                 .unwrap()
-                .is_denied()
+                .is_enforced_denial()
         );
 
         let observations = observer.observations.lock().unwrap().clone();
@@ -1112,14 +1112,14 @@ mod tests {
         let limited = policy("auth.login", "client", 1, Duration::from_mins(1));
         let check = Check::new(&limited, subject(1));
 
-        assert!(store.check(&check).unwrap().is_allowed());
+        assert!(store.check(&check).unwrap().permits_request());
         assert_eq!(observer.calls.load(Ordering::Relaxed), 3);
 
         let panicking_store =
             MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default())
                 .with_observer(Arc::new(PanickingObserver));
-        assert!(panicking_store.check(&check).unwrap().is_allowed());
-        assert!(panicking_store.check(&check).unwrap().is_denied());
+        assert!(panicking_store.check(&check).unwrap().permits_request());
+        assert!(panicking_store.check(&check).unwrap().is_enforced_denial());
     }
 
     #[test]
@@ -1229,22 +1229,22 @@ mod tests {
         let check = Check::with_cost(&policy, subject(1), MAX_LIMIT).unwrap();
 
         let first = store.check(&check).unwrap();
-        assert!(first.is_allowed());
+        assert!(first.permits_request());
         assert_eq!(first.available(), Some(0));
         assert_eq!(first.replenishes_after(), Some(MAX_WINDOW));
 
         let denied = store.check(&check).unwrap();
-        assert!(denied.is_denied());
+        assert!(denied.is_enforced_denial());
         assert_eq!(denied.retry_after(), Some(MAX_WINDOW));
 
         clock.advance(u128::from(MAX_WINDOW_MILLIS - 1));
         let nearly_reset = store.check(&check).unwrap();
-        assert!(nearly_reset.is_denied());
+        assert!(nearly_reset.is_enforced_denial());
         assert_eq!(nearly_reset.retry_after(), Some(Duration::from_millis(1)));
 
         clock.advance(1);
         let reset = store.check(&check).unwrap();
-        assert!(reset.is_allowed());
+        assert!(reset.permits_request());
         assert_eq!(reset.replenishes_after(), Some(MAX_WINDOW));
     }
 
@@ -1261,12 +1261,17 @@ mod tests {
         let relaxed = policy("auth.login", "client", 2, Duration::from_mins(1));
         let key = subject(1);
 
-        assert!(store.check(&Check::new(&strict, key)).unwrap().is_allowed());
+        assert!(
+            store
+                .check(&Check::new(&strict, key))
+                .unwrap()
+                .permits_request()
+        );
         assert!(
             store
                 .check(&Check::new(&relaxed, key))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
         assert_eq!(store.stats().unwrap().entries(), 2);
     }
@@ -1286,10 +1291,10 @@ mod tests {
             store
                 .check(&Check::new(&policy, subject(1)))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
         let denied = store.check(&Check::new(&policy, subject(2))).unwrap();
-        assert!(!denied.is_allowed());
+        assert!(!denied.permits_request());
         assert_eq!(denied.retry_after(), Some(Duration::from_mins(1)));
         assert_eq!(store.stats().unwrap().entries(), 1);
     }
@@ -1305,12 +1310,12 @@ mod tests {
                 store
                     .check(&Check::new(&policy, subject(byte)))
                     .unwrap()
-                    .is_allowed()
+                    .permits_request()
             );
         }
 
         let denied = store.check(&Check::new(&policy, subject(64))).unwrap();
-        assert!(denied.is_denied());
+        assert!(denied.is_enforced_denial());
         assert_eq!(store.stats().unwrap().entries(), 64);
     }
 
@@ -1362,7 +1367,7 @@ mod tests {
                 store
                     .check(&Check::new(&policy, *key))
                     .unwrap()
-                    .is_allowed()
+                    .permits_request()
             );
         }
         let checks = [
@@ -1385,13 +1390,13 @@ mod tests {
             store
                 .check(&Check::new(&policy, crowded[2]))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
         assert!(
             store
                 .check(&Check::new(&policy, other))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
     }
 
@@ -1451,7 +1456,7 @@ mod tests {
                 store
                     .check(&Check::new(&policy, subject(byte)))
                     .unwrap()
-                    .is_allowed()
+                    .permits_request()
             );
         }
         clock.advance(Duration::from_secs(1));
@@ -1460,7 +1465,7 @@ mod tests {
             store
                 .check(&Check::new(&policy, subject(4)))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
         assert_eq!(store.stats().unwrap().entries(), 3);
 
@@ -1468,7 +1473,7 @@ mod tests {
             store
                 .check(&Check::new(&policy, subject(5)))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
         assert_eq!(store.stats().unwrap().entries(), 3);
     }
@@ -1494,7 +1499,7 @@ mod tests {
                 store
                     .check(&Check::new(&policy, *key))
                     .unwrap()
-                    .is_allowed()
+                    .permits_request()
             );
         }
         clock.advance(Duration::from_secs(1));
@@ -1541,7 +1546,7 @@ mod tests {
                 store
                     .check(&Check::new(&policy, subject(byte)))
                     .unwrap()
-                    .is_allowed()
+                    .permits_request()
             );
         }
         clock.advance(Duration::from_secs(1));
@@ -1566,7 +1571,7 @@ mod tests {
         let check = Check::new(&policy, subject(1));
 
         for _ in 0..1_000 {
-            assert!(store.check(&check).unwrap().is_allowed());
+            assert!(store.check(&check).unwrap().permits_request());
             clock.advance(Duration::from_millis(1));
         }
 
@@ -1592,9 +1597,9 @@ mod tests {
             let earlier = Check::new(&policy, subject(1));
             let target = Check::new(&policy, subject(2));
 
-            assert!(store.check(&earlier).unwrap().is_allowed());
+            assert!(store.check(&earlier).unwrap().permits_request());
             clock.advance(Duration::from_millis(1));
-            assert!(store.check(&target).unwrap().is_allowed());
+            assert!(store.check(&target).unwrap().permits_request());
             clock.advance(Duration::from_millis(2));
 
             let decision = if use_batch {
@@ -1631,7 +1636,7 @@ mod tests {
         let exhausted_check = Check::new(&exhausted, subject(1));
         let untouched_check = Check::new(&untouched, subject(2));
 
-        assert!(store.check(&exhausted_check).unwrap().is_allowed());
+        assert!(store.check(&exhausted_check).unwrap().permits_request());
         let result = store
             .check_all(&[exhausted_check, untouched_check])
             .unwrap();
@@ -1642,7 +1647,7 @@ mod tests {
             store
                 .check(&Check::new(&untouched, subject(2)))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
     }
 
@@ -1685,7 +1690,7 @@ mod tests {
                     store
                         .check(&Check::new(&policy, subject(1)))
                         .unwrap()
-                        .is_allowed()
+                        .permits_request()
                 })
             })
             .map(|thread| usize::from(thread.join().unwrap()))
@@ -1776,7 +1781,7 @@ mod tests {
         let exhausted = Check::new(&policy, subject(1));
         let new_key = Check::new(&policy, subject(2));
 
-        assert!(store.check(&exhausted).unwrap().is_allowed());
+        assert!(store.check(&exhausted).unwrap().permits_request());
         clock.panic_once();
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = store.check(&new_key);
@@ -1921,8 +1926,8 @@ mod tests {
         let reset_check = Check::new(&policy, reset_subject);
         let retained_check = Check::new(&policy, retained_subject);
 
-        assert!(store.check(&reset_check).unwrap().is_allowed());
-        assert!(store.check(&retained_check).unwrap().is_allowed());
+        assert!(store.check(&reset_check).unwrap().permits_request());
+        assert!(store.check(&retained_check).unwrap().permits_request());
         clock.panic_once();
         let panicked_store = Arc::clone(&store);
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -1934,7 +1939,7 @@ mod tests {
             store.check(&reset_check),
             Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
         );
-        assert!(store.check(&retained_check).unwrap().is_denied());
+        assert!(store.check(&retained_check).unwrap().is_enforced_denial());
         assert!(format!("{store:?}").contains("poisoned_shards: 1"));
 
         assert_eq!(store.recover_poisoned(), 1);
@@ -1945,11 +1950,11 @@ mod tests {
         );
         assert_eq!(store.stats().unwrap().entries(), 1);
         assert!(
-            store.check(&reset_check).unwrap().is_allowed(),
+            store.check(&reset_check).unwrap().permits_request(),
             "the recovered shard starts with empty quota state"
         );
         assert!(
-            store.check(&retained_check).unwrap().is_denied(),
+            store.check(&retained_check).unwrap().is_enforced_denial(),
             "healthy-shard quota state must survive recovery"
         );
         assert!(format!("{store:?}").contains("poisoned_shards: 0"));

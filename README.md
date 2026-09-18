@@ -154,8 +154,7 @@ Decision constructors validate capacity and available quota. Only a validated
 Serialization does not perform further metadata validation.
 
 Use `permits_request()` for admission and `would_deny()` for observability.
-`is_allowed()` also permits shadow denials, so it does not guarantee allowance
-metadata; match `DecisionView::Allowed` when that metadata is needed.
+Match `DecisionView::Allowed` when allowance metadata is needed.
 
 ## Generic backend API
 

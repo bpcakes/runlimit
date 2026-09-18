@@ -65,7 +65,7 @@ async fn one_generic_function_swaps_between_backends() {
         check_one(&memory, &single_check)
             .await
             .unwrap()
-            .is_allowed()
+            .permits_request()
     );
     assert_eq!(
         check_batch(&memory, &[]).await,

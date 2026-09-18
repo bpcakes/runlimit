@@ -321,16 +321,6 @@ impl Decision {
     ///
     /// This includes both consumed allowed decisions and quota denials from a
     /// shadow policy.
-    pub const fn is_allowed(&self) -> bool {
-        self.permits_request()
-    }
-
-    /// Returns whether the application must reject the operation.
-    pub const fn is_denied(&self) -> bool {
-        self.is_enforced_denial()
-    }
-
-    /// Returns whether the application may proceed.
     pub const fn permits_request(&self) -> bool {
         !matches!(self.outcome, Outcome::Denied(_))
     }
@@ -845,8 +835,8 @@ mod tests {
     fn allowed_decision_exposes_available_and_replenishment() {
         let decision = allowed(8, 7, Duration::from_millis(59_999));
 
-        assert!(decision.is_allowed());
-        assert!(!decision.is_denied());
+        assert!(decision.permits_request());
+        assert!(!decision.is_enforced_denial());
         assert_eq!(decision.capacity(), Some(8));
         assert_eq!(decision.available(), Some(7));
         assert_eq!(
@@ -863,7 +853,7 @@ mod tests {
         let denial = Denial::quota_exceeded(quota);
         let decision = Decision::denied(denial);
 
-        assert!(decision.is_denied());
+        assert!(decision.is_enforced_denial());
         assert_eq!(decision.capacity(), Some(8));
         assert_eq!(decision.available(), None);
         assert_eq!(decision.replenishes_after(), None);
@@ -964,9 +954,8 @@ mod tests {
         let denial = quota(8, Duration::from_millis(30_001));
         let decision = Decision::shadow_denied(denial);
 
-        assert!(decision.is_allowed());
-        assert!(!decision.is_denied());
         assert!(decision.permits_request());
+        assert!(!decision.is_enforced_denial());
         assert!(decision.would_deny());
         assert!(decision.is_shadow_denied());
         assert_eq!(decision.available(), None);

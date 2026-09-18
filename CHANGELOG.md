@@ -9,6 +9,9 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ### Changed
 
+- **Breaking:** remove `Decision::is_allowed()` and `Decision::is_denied()`.
+  Use `permits_request()` and `is_enforced_denial()` respectively. Match
+  `DecisionView::Allowed` when allowance metadata is needed.
 - **Breaking:** `Decision::denial()` and `BatchDecision::denial()` now return
   `Option<Denial>` by value instead of `Option<&Denial>`. Shadow outcomes store
   `QuotaDenial` directly, making shadowed storage-capacity denials

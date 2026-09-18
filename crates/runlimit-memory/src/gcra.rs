@@ -926,7 +926,7 @@ mod tests {
         let policy = policy("api.write", 1, Duration::from_secs(1), 1);
         let check = Check::new(&policy, subject(1));
 
-        assert!(store.check(&check).unwrap().is_allowed());
+        assert!(store.check(&check).unwrap().permits_request());
         clock.set(Duration::from_secs(1));
         assert_eq!(
             store.check(&check),
@@ -949,14 +949,14 @@ mod tests {
                 store
                     .check(&Check::new(&policy, subject(byte)))
                     .unwrap()
-                    .is_allowed()
+                    .permits_request()
             );
         }
         assert!(
             store
                 .check(&Check::new(&policy, subject(4)))
                 .unwrap()
-                .is_denied()
+                .is_enforced_denial()
         );
 
         clock.advance(Duration::from_millis(10));
@@ -964,7 +964,7 @@ mod tests {
             store
                 .check(&Check::new(&policy, subject(4)))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
         assert_eq!(store.stats().unwrap().entries(), 3);
     }
@@ -1050,7 +1050,7 @@ mod tests {
         let policy = policy("api.quota-rollback", 1, Duration::from_millis(100), 1);
         let exhausted = Check::new(&policy, subject(1));
         let earlier = Check::new(&policy, subject(2));
-        assert!(store.check(&exhausted).unwrap().is_allowed());
+        assert!(store.check(&exhausted).unwrap().permits_request());
 
         let result = store.check_all(&[earlier, exhausted]).unwrap();
         assert_eq!(result.denied_index(), Some(1));
@@ -1059,7 +1059,7 @@ mod tests {
             Some(DenialKind::QuotaExceeded)
         );
         assert!(
-            store.check(&earlier).unwrap().is_allowed(),
+            store.check(&earlier).unwrap().permits_request(),
             "a quota-denied batch must not consume an earlier member"
         );
     }
@@ -1072,8 +1072,8 @@ mod tests {
         let earlier = Check::new(&policy, subject(1));
         let occupying = Check::new(&policy, subject(2));
         let new_key = Check::new(&policy, subject(3));
-        assert!(store.check(&earlier).unwrap().is_allowed());
-        assert!(store.check(&occupying).unwrap().is_allowed());
+        assert!(store.check(&earlier).unwrap().permits_request());
+        assert!(store.check(&occupying).unwrap().permits_request());
 
         let result = store.check_all(&[earlier, new_key]).unwrap();
         assert_eq!(result.denied_index(), Some(1));
@@ -1082,7 +1082,7 @@ mod tests {
             Some(DenialKind::StorageCapacity)
         );
         assert!(
-            store.check(&earlier).unwrap().is_allowed(),
+            store.check(&earlier).unwrap().permits_request(),
             "a capacity-denied batch must not consume an earlier member"
         );
     }
@@ -1119,12 +1119,12 @@ mod tests {
         let first = Check::new(&shadow, subject(1));
         let second = Check::new(&shadow, subject(2));
 
-        assert!(store.check(&first).unwrap().is_allowed());
+        assert!(store.check(&first).unwrap().permits_request());
         let result = store.check_all(&[first, second]).unwrap();
         assert!(result.is_shadow_denied());
         assert_eq!(result.denied_index(), Some(0));
         assert!(
-            store.check(&second).unwrap().is_allowed(),
+            store.check(&second).unwrap().permits_request(),
             "a shadow-denied batch must not consume any member"
         );
     }
@@ -1140,7 +1140,7 @@ mod tests {
             store
                 .check(&Check::new(&shadow, subject(1)))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
         let decision = store.check(&Check::new(&shadow, subject(2))).unwrap();
         assert!(decision.is_enforced_denial());
@@ -1268,7 +1268,7 @@ mod tests {
             store
                 .check(&Check::new(&ordinary, subject(1)))
                 .unwrap()
-                .is_allowed()
+                .permits_request()
         );
         observer.take();
 
@@ -1299,7 +1299,7 @@ mod tests {
             .with_observer(observer.clone());
         let limited = policy("api.limited", 1, Duration::from_millis(1), 1);
         let exhausted = Check::new(&limited, subject(1));
-        assert!(store.check(&exhausted).unwrap().is_allowed());
+        assert!(store.check(&exhausted).unwrap().permits_request());
         observer.take();
 
         let overflowing = policy("api.overflowing", MAX_LIMIT, Duration::from_millis(1), 1);

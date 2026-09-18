@@ -791,7 +791,7 @@ async fn pool_wait_does_not_spend_admission_or_cleanup_operation_budget() {
         .await
         .expect("admission task does not panic")
         .expect("admission receives a fresh operation budget after pool wait");
-    assert!(decision.is_allowed());
+    assert!(decision.permits_request());
     assert_eq!(decision.available(), Some(0));
 
     sqlx::query(
@@ -1135,7 +1135,7 @@ ORDER BY key_columns.position
             .check(&Check::new(&policy, subject))
             .await
             .expect("admit metadata test check")
-            .is_allowed()
+            .permits_request()
     );
     let metadata = sqlx::query_as::<_, (String, String)>(
         r"
@@ -1200,11 +1200,11 @@ async fn configured_capacity_denies_only_new_keys_in_the_full_shard() {
         .await
         .expect("another shard retains capacity");
 
-    assert!(first.is_allowed());
-    assert!(second.is_allowed());
+    assert!(first.permits_request());
+    assert!(second.permits_request());
     assert_eq!(denied.denial(), Some(Denial::storage_capacity(None)));
-    assert!(existing.is_allowed());
-    assert!(other.is_allowed());
+    assert!(existing.permits_request());
+    assert!(other.permits_request());
     assert_eq!(
         observer.admissions.lock().unwrap().as_slice(),
         [
@@ -1267,7 +1267,7 @@ async fn expired_rows_hold_capacity_until_cleanup_commits() {
         .check(&Check::new(&policy, replacement_subject))
         .await
         .expect("cleanup releases the shard slot");
-    assert!(replacement.is_allowed());
+    assert!(replacement.permits_request());
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 1);
     assert_eq!(delete_counter(&pool, &policy, replacement_subject).await, 1);
 
@@ -1309,7 +1309,7 @@ async fn capacity_denied_batch_rolls_back_and_remains_enforced_in_shadow_mode() 
         .check(&Check::new(&policy, first_subject))
         .await
         .expect("rolled-back capacity remains available");
-    assert!(admitted.is_allowed());
+    assert!(admitted.permits_request());
     assert_eq!(delete_counter(&pool, &policy, first_subject).await, 1);
 
     drop(limiter);
@@ -1334,7 +1334,7 @@ async fn shadow_quota_denial_is_reported_without_consuming_more_quota() {
         .check(&Check::new(&policy, subject))
         .await
         .expect("shadow quota exhaustion is a decision");
-    assert!(allowed.is_allowed());
+    assert!(allowed.permits_request());
     assert!(shadow_denial.is_shadow_denied());
     assert!(shadow_denial.permits_request());
     assert_eq!(stored_counter_usage(&pool, &policy, subject).await, 1);
@@ -1422,7 +1422,7 @@ async fn database_trigger_rejects_storage_key_updates_without_ledger_drift() {
         .check(&Check::new(&policy, original_subject))
         .await
         .expect("create the original counter");
-    assert!(admitted.is_allowed());
+    assert!(admitted.permits_request());
     assert_eq!(
         capacity_row_count(&pool, i16::from(original_shard)).await,
         1
@@ -1532,7 +1532,7 @@ EXECUTE FUNCTION {schema}.fail_after_capacity_accounting();
         .check(&Check::new(&policy, subject))
         .await
         .expect("rolled-back trigger accounting releases the slot");
-    assert!(admitted.is_allowed());
+    assert!(admitted.permits_request());
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 1);
     assert_eq!(delete_counter(&pool, &policy, subject).await, 1);
 
@@ -1587,7 +1587,7 @@ async fn concurrent_replicas_never_exceed_configured_shard_capacity() {
     for task in tasks {
         let (_subject, result) = task.await.expect("capacity task does not panic");
         let decision = result.expect("capacity contention returns a decision");
-        if decision.is_allowed() {
+        if decision.permits_request() {
             allowed += 1;
         } else {
             assert_eq!(decision.denial(), Some(Denial::storage_capacity(None)));
@@ -1631,7 +1631,7 @@ async fn single_quota_denial_and_anchored_reset() {
     let check = Check::new(&policy, key(1));
 
     let first = limiter.check(&check).await.expect("first check succeeds");
-    assert!(first.is_allowed());
+    assert!(first.permits_request());
     assert_eq!(first.available(), Some(1));
     assert!(
         first
@@ -1640,11 +1640,11 @@ async fn single_quota_denial_and_anchored_reset() {
     );
 
     let second = limiter.check(&check).await.expect("second check succeeds");
-    assert!(second.is_allowed());
+    assert!(second.permits_request());
     assert_eq!(second.available(), Some(0));
 
     let denied = limiter.check(&check).await.expect("denial is a decision");
-    assert!(denied.is_denied());
+    assert!(denied.is_enforced_denial());
     assert_eq!(
         denied.denial().map(|denial| denial.kind()),
         Some(DenialKind::QuotaExceeded)
@@ -1658,7 +1658,7 @@ async fn single_quota_denial_and_anchored_reset() {
         .check(&check)
         .await
         .expect("check after expiry succeeds");
-    assert!(reset.is_allowed());
+    assert!(reset.permits_request());
     assert_eq!(reset.available(), Some(1));
 }
 
@@ -1699,7 +1699,7 @@ WHERE
     drop(limiter);
     pool.close().await;
 
-    assert!(allowed.is_allowed());
+    assert!(allowed.permits_request());
     assert_eq!(allowed.capacity(), Some(MAX_LIMIT));
     assert_eq!(allowed.available(), Some(0));
     assert_eq!(stored_used, i64::MAX);
@@ -1707,7 +1707,7 @@ WHERE
         u64::try_from(stored_window_millis).unwrap(),
         MAX_WINDOW_MILLIS
     );
-    assert!(denied.is_denied());
+    assert!(denied.is_enforced_denial());
     assert_eq!(denied.capacity(), Some(MAX_LIMIT));
     assert_eq!(deleted_rows, 1);
 }
@@ -1727,7 +1727,7 @@ async fn denied_batch_rolls_back_every_counter() {
             .check(&saturated_check)
             .await
             .expect("initial saturation succeeds")
-            .is_allowed()
+            .permits_request()
     );
 
     let batch = limiter
@@ -1760,7 +1760,7 @@ async fn earliest_denial_skips_a_later_failing_statement() {
         .check(&denied_check)
         .await
         .expect("saturating check succeeds");
-    assert!(saturated.is_allowed());
+    assert!(saturated.permits_request());
 
     sqlx::query(
         r"
@@ -1844,7 +1844,7 @@ async fn search_path_clock_shadow_cannot_hijack_admission_or_cleanup_time() {
         .check(&check)
         .await
         .expect("initialize an active window");
-    assert!(first.is_allowed());
+    assert!(first.permits_request());
 
     sqlx::query(AssertSqlSafe(format!(
         r"
@@ -1880,7 +1880,7 @@ $function$
     fixture.teardown().await;
 
     assert!(
-        denied.is_denied(),
+        denied.is_enforced_denial(),
         "a search_path-resolved future clock would incorrectly renew the active window"
     );
     assert_eq!(
@@ -1940,8 +1940,8 @@ WHERE
     let observations = observations.expect("both backends replay the transition sequence");
     for (step, memory_decision, postgres_decision) in observations {
         assert_eq!(
-            memory_decision.is_allowed(),
-            postgres_decision.is_allowed(),
+            memory_decision.permits_request(),
+            postgres_decision.permits_request(),
             "backends disagreed on admission at the '{}' transition",
             step.name
         );
@@ -2050,7 +2050,7 @@ ORDER BY input.input_position
         .expect("fresh counters must all be allowed");
     assert_eq!(decisions.len(), checks.len());
     for (decision, check) in decisions.iter().zip(&checks) {
-        assert!(decision.is_allowed());
+        assert!(decision.permits_request());
         assert_eq!(decision.capacity(), Some(check.policy().limit()));
         assert_eq!(
             decision.available(),
@@ -2155,7 +2155,11 @@ async fn opposite_order_batches_across_pools_do_not_deadlock_or_over_admit() {
                 .try_into_allowed()
                 .expect("capacity permits every contending batch");
             assert_eq!(decisions.len(), 2);
-            assert!(decisions.iter().all(runlimit_core::Decision::is_allowed));
+            assert!(
+                decisions
+                    .iter()
+                    .all(runlimit_core::Decision::permits_request)
+            );
         }
     }
     assert_eq!(u64::try_from(stored_a).unwrap(), ROUNDS * 2);
@@ -2198,7 +2202,7 @@ async fn concurrent_pools_never_over_admit() {
                 .check(&Check::new(&policy, key(4)))
                 .await
                 .expect("concurrent check completes")
-                .is_allowed()
+                .permits_request()
         }));
     }
 
@@ -2258,8 +2262,8 @@ async fn concurrent_fresh_single_checks_advance_the_waiters_snapshot() {
             .await
             .expect("fresh-key check task does not panic")
             .expect("snapshot fallback returns a decision");
-        allowed += usize::from(decision.is_allowed());
-        denied += usize::from(decision.is_denied());
+        allowed += usize::from(decision.permits_request());
+        denied += usize::from(decision.is_enforced_denial());
     }
     let stored = stored_counter_usage(&pool, &policy, subject).await;
     let deleted = delete_counter(&pool, &policy, subject).await;
@@ -2335,7 +2339,7 @@ async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
     let companion_deleted = delete_counter(&pool, &companion_policy, companion_subject).await;
 
     assert_eq!(batch.allowed_decisions().map(<[Decision]>::len), Some(2));
-    assert!(single.is_denied());
+    assert!(single.is_enforced_denial());
     assert_eq!(target_stored, 1);
     assert_eq!(companion_stored, 1);
     assert_eq!(target_deleted, 1);
@@ -2358,7 +2362,7 @@ async fn contended_check_samples_time_after_row_lock() {
         .check(&Check::new(&policy, subject))
         .await
         .expect("first check succeeds");
-    assert!(first.is_allowed());
+    assert!(first.permits_request());
 
     let mut blocker = pool.begin().await.expect("begin blocker transaction");
     sqlx::query(
@@ -2396,7 +2400,7 @@ FOR UPDATE
         .expect("waiting task does not panic")
         .expect("waiting check succeeds");
     assert!(
-        decision.is_allowed(),
+        decision.permits_request(),
         "a clock sampled before the row-lock wait would deny against the expired window"
     );
     assert_eq!(decision.available(), Some(0));
@@ -2543,7 +2547,7 @@ FOR UPDATE
         .check(&check)
         .await
         .expect("counter remains usable");
-    assert!(after_timeout.is_allowed());
+    assert!(after_timeout.permits_request());
     assert_eq!(after_timeout.available(), Some(0));
 
     let deleted_rows = delete_counter(&blocker_pool, &policy, subject).await;
