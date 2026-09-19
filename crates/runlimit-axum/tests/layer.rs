@@ -15,7 +15,7 @@ use std::{
 };
 
 use axum::{
-    Router,
+    Extension, Router,
     body::{Body, to_bytes},
     extract::Request,
     http::{HeaderValue, StatusCode},
@@ -24,10 +24,10 @@ use axum::{
 };
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use runlimit_axum::{RateLimitLayer, RateLimitRejection, RejectionKind};
+use runlimit_axum::{Admission, Admissions, RateLimitLayer, RateLimitRejection, RejectionKind};
 use runlimit_core::{
-    BatchDecision, Check, Decision, FixedWindowPolicy, Limiter, PolicyId, QuotaDenial, ScopeId,
-    SubjectKey,
+    Admitted, AdmittedView, Allowance, BatchDecision, Check, Decision, Denial, FixedWindowPolicy,
+    Limiter, PolicyId, QuotaDenial, ScopeId, SubjectKey,
 };
 use tower::{Layer, Service, ServiceExt, service_fn};
 
@@ -98,13 +98,21 @@ impl Limiter for StubLimiter {
 }
 
 fn policy() -> FixedWindowPolicy {
+    policy_for_scope("client", 8)
+}
+
+fn policy_for_scope(scope: &str, limit: u64) -> FixedWindowPolicy {
     FixedWindowPolicy::new(
         PolicyId::new("auth.login").unwrap(),
-        ScopeId::new("client").unwrap(),
-        8,
+        ScopeId::new(scope).unwrap(),
+        limit,
         Duration::from_mins(1),
     )
     .unwrap()
+}
+
+fn allowed(capacity: u64, available: u64) -> Decision {
+    Decision::allowed(Allowance::new(capacity, available, Duration::from_mins(1)))
 }
 
 fn subject(byte: u8) -> SubjectKey {
@@ -118,22 +126,47 @@ fn response(status: StatusCode) -> Response {
         .unwrap()
 }
 
+/// Maps every rejection category without a wildcard arm.
+fn map_rejection(rejection: &RateLimitRejection<&'static str, StubError>) -> Response {
+    match rejection {
+        RateLimitRejection::Key(_) => response(StatusCode::BAD_REQUEST),
+        RateLimitRejection::Denied(_) => response(StatusCode::TOO_MANY_REQUESTS),
+        RateLimitRejection::Backend(StubError) => response(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+fn expect_single_admission(admissions: &Admissions, policy: &FixedWindowPolicy) -> Admitted {
+    assert_eq!(admissions.len(), 1);
+    let admission = admissions
+        .get(policy)
+        .expect("the evaluated policy has an admission");
+    assert_eq!(admission.policy_id(), policy.id());
+    assert_eq!(admission.scope_id(), policy.scope());
+    assert_eq!(admission.policy_fingerprint(), policy.fingerprint());
+    admission.decision()
+}
+
 #[tokio::test]
 async fn layer_composes_with_an_axum_router() {
-    let decision = Decision::allowed(8, 7, Duration::from_mins(1));
+    let decision = allowed(8, 7);
     let layer = RateLimitLayer::new(
         StubLimiter::returning(decision),
         policy(),
-        |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, Infallible>(subject(0)),
-        |_rejection| response(StatusCode::TOO_MANY_REQUESTS),
+        |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, &'static str>(subject(0)),
+        |rejection| map_rejection(&rejection),
     );
     let app = Router::new()
         .route(
             "/",
-            get(move |request: Request<Body>| async move {
-                assert_eq!(request.extensions().get::<Decision>(), Some(&decision));
-                StatusCode::NO_CONTENT
-            }),
+            get(
+                move |Extension(admissions): Extension<Admissions>| async move {
+                    assert_eq!(
+                        expect_single_admission(&admissions, &policy()),
+                        Admitted::allowed(Allowance::new(8, 7, Duration::from_mins(1)))
+                    );
+                    StatusCode::NO_CONTENT
+                },
+            ),
         )
         .layer(layer);
 
@@ -146,16 +179,24 @@ async fn layer_composes_with_an_axum_router() {
 }
 
 #[tokio::test]
-async fn allowed_request_proceeds_with_decision_extension() {
-    let decision = Decision::allowed(8, 7, Duration::from_mins(1));
-    let limiter = StubLimiter::returning(decision);
+async fn allowed_request_proceeds_with_an_admission_extension() {
+    let limiter = StubLimiter::returning(allowed(8, 7));
     let inner_calls = Arc::new(AtomicUsize::new(0));
     let inner_calls_for_service = Arc::clone(&inner_calls);
     let inner = service_fn(move |request: Request<Body>| {
         let inner_calls = Arc::clone(&inner_calls_for_service);
         async move {
             inner_calls.fetch_add(1, Ordering::Relaxed);
-            assert_eq!(request.extensions().get::<Decision>(), Some(&decision));
+            let admissions = request
+                .extensions()
+                .get::<Admissions>()
+                .expect("an admitted request carries its admissions");
+            assert!(matches!(
+                expect_single_admission(admissions, &policy()).view(),
+                AdmittedView::Allowed { allowance }
+                    if allowance.capacity() == 8 && allowance.available() == 7
+            ));
+            assert!(request.extensions().get::<Decision>().is_none());
             Ok::<_, Infallible>(response(StatusCode::NO_CONTENT))
         }
     });
@@ -181,8 +222,8 @@ async fn allowed_request_proceeds_with_decision_extension() {
 
 #[tokio::test]
 async fn enforced_denial_is_mapped_and_short_circuits_inner_service() {
-    let decision = Decision::denied(QuotaDenial::new(8, Duration::from_secs(17)));
-    let limiter = StubLimiter::returning(decision);
+    let denial = QuotaDenial::new(8, Duration::from_secs(17));
+    let limiter = StubLimiter::returning(Decision::denied(denial));
     let inner_calls = Arc::new(AtomicUsize::new(0));
     let inner_calls_for_service = Arc::clone(&inner_calls);
     let inner = service_fn(move |_request: Request<Body>| {
@@ -196,8 +237,13 @@ async fn enforced_denial_is_mapped_and_short_circuits_inner_service() {
         move |rejection: RateLimitRejection<Infallible, StubError>| {
             assert_eq!(rejection.kind(), RejectionKind::Denied);
             match rejection {
-                RateLimitRejection::Denied(mapped) => assert_eq!(mapped, decision),
-                _ => panic!("unexpected rejection kind"),
+                RateLimitRejection::Key(never) => match never {},
+                RateLimitRejection::Denied(mapped) => {
+                    assert_eq!(mapped, Denial::quota_exceeded(denial));
+                }
+                RateLimitRejection::Backend(StubError) => {
+                    panic!("a denied request must not be reported as a backend failure")
+                }
             }
             response(StatusCode::TOO_MANY_REQUESTS)
         },
@@ -214,11 +260,18 @@ async fn enforced_denial_is_mapped_and_short_circuits_inner_service() {
 }
 
 #[tokio::test]
-async fn shadow_denial_proceeds_with_decision_extension() {
-    let decision = Decision::shadow_denied(QuotaDenial::new(8, Duration::from_secs(17)));
-    let limiter = StubLimiter::returning(decision);
+async fn shadow_denial_proceeds_with_an_admission_extension() {
+    let denial = QuotaDenial::new(8, Duration::from_secs(17));
+    let limiter = StubLimiter::returning(Decision::shadow_denied(denial));
     let inner = service_fn(move |request: Request<Body>| async move {
-        assert_eq!(request.extensions().get::<Decision>(), Some(&decision));
+        let admissions = request
+            .extensions()
+            .get::<Admissions>()
+            .expect("a shadow-denied request carries its admissions");
+        assert_eq!(
+            expect_single_admission(admissions, &policy()),
+            Admitted::shadow_denied(denial)
+        );
         Ok::<_, Infallible>(response(StatusCode::ACCEPTED))
     });
     let layer = RateLimitLayer::new(
@@ -238,11 +291,159 @@ async fn shadow_denial_proceeds_with_decision_extension() {
 }
 
 #[tokio::test]
+async fn stacked_layers_record_every_admission_in_evaluation_order() {
+    let client_policy = policy_for_scope("client", 40);
+    let identity_policy = policy_for_scope("identity", 8);
+    let client_layer = RateLimitLayer::new(
+        StubLimiter::returning(allowed(40, 39)),
+        client_policy.clone(),
+        |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, &'static str>(subject(11)),
+        |rejection| map_rejection(&rejection),
+    );
+    let shadow_denial = QuotaDenial::new(8, Duration::from_secs(3));
+    let identity_layer = RateLimitLayer::new(
+        StubLimiter::returning(Decision::shadow_denied(shadow_denial)),
+        identity_policy.clone(),
+        |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, &'static str>(subject(12)),
+        |rejection| map_rejection(&rejection),
+    );
+    let unrelated_policy = policy_for_scope("client", 41);
+    let inner = service_fn(move |request: Request<Body>| {
+        let client_policy = client_policy.clone();
+        let identity_policy = identity_policy.clone();
+        let unrelated_policy = unrelated_policy.clone();
+        async move {
+            let admissions = request
+                .extensions()
+                .get::<Admissions>()
+                .expect("stacked layers share one admissions extension");
+            let recorded = admissions
+                .iter()
+                .map(|admission| (admission.scope_id().as_str(), admission.decision()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                recorded,
+                vec![
+                    (
+                        "client",
+                        Admitted::allowed(Allowance::new(40, 39, Duration::from_mins(1)))
+                    ),
+                    ("identity", Admitted::shadow_denied(shadow_denial)),
+                ]
+            );
+            assert_eq!(
+                admissions.get(&client_policy).map(Admission::decision),
+                Some(Admitted::allowed(Allowance::new(
+                    40,
+                    39,
+                    Duration::from_mins(1)
+                )))
+            );
+            assert_eq!(
+                admissions.get(&identity_policy).map(Admission::decision),
+                Some(Admitted::shadow_denied(shadow_denial))
+            );
+            assert!(
+                admissions.get(&unrelated_policy).is_none(),
+                "a policy with a different fingerprint has no admission"
+            );
+            assert_eq!(admissions.into_iter().count(), 2);
+            Ok::<_, Infallible>(response(StatusCode::NO_CONTENT))
+        }
+    });
+
+    // The client gate wraps the identity gate, so it is evaluated first.
+    let result = client_layer
+        .layer(identity_layer.layer(inner))
+        .oneshot(Request::new(Body::empty()))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn identical_policy_layers_keep_both_admissions_and_lookup_the_outermost() {
+    let policy = policy_for_scope("shared", 8);
+    let outer_admitted = Admitted::allowed(Allowance::new(8, 7, Duration::from_mins(1)));
+    let inner_denial = QuotaDenial::new(8, Duration::from_secs(3));
+    let inner_admitted = Admitted::shadow_denied(inner_denial);
+    let outer = RateLimitLayer::new(
+        StubLimiter::returning(Decision::from(outer_admitted)),
+        policy.clone(),
+        |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, &'static str>(subject(17)),
+        |rejection| map_rejection(&rejection),
+    );
+    let inner_layer = RateLimitLayer::new(
+        StubLimiter::returning(Decision::from(inner_admitted)),
+        policy.clone(),
+        |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, &'static str>(subject(18)),
+        |rejection| map_rejection(&rejection),
+    );
+    let inner = service_fn(move |request: Request<Body>| {
+        let policy = policy.clone();
+        async move {
+            let admissions = request
+                .extensions()
+                .get::<Admissions>()
+                .expect("identical-policy layers share one admissions extension");
+            let recorded = admissions
+                .iter()
+                .map(Admission::decision)
+                .collect::<Vec<_>>();
+
+            assert_eq!(recorded, vec![outer_admitted, inner_admitted]);
+            assert_eq!(
+                admissions.get(&policy).map(Admission::decision),
+                Some(outer_admitted),
+                "lookup returns the first, outermost matching admission"
+            );
+            Ok::<_, Infallible>(response(StatusCode::NO_CONTENT))
+        }
+    });
+
+    let result = outer
+        .layer(inner_layer.layer(inner))
+        .oneshot(Request::new(Body::empty()))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn inner_layer_denial_rejects_a_request_the_outer_layer_admitted() {
+    let outer = RateLimitLayer::new(
+        StubLimiter::returning(allowed(40, 39)),
+        policy_for_scope("client", 40),
+        |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, &'static str>(subject(13)),
+        |_rejection| panic!("the outer layer admits every request"),
+    );
+    let inner_layer = RateLimitLayer::new(
+        StubLimiter::returning(Decision::denied(Denial::storage_capacity(None))),
+        policy_for_scope("identity", 8),
+        |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, &'static str>(subject(14)),
+        |rejection| map_rejection(&rejection),
+    );
+    let inner = service_fn(|_request: Request<Body>| {
+        ready(Ok::<_, Infallible>(response(StatusCode::NO_CONTENT)))
+    });
+
+    let result = outer
+        .layer(inner_layer.layer(inner))
+        .oneshot(Request::new(Body::empty()))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
 async fn key_and_backend_failures_are_owned_by_the_mapper() {
     let unused_inner = service_fn(|_request: Request<Body>| {
         ready(Ok::<_, Infallible>(response(StatusCode::NO_CONTENT)))
     });
-    let limiter = StubLimiter::returning(Decision::allowed(8, 7, Duration::from_mins(1)));
+    let limiter = StubLimiter::returning(allowed(8, 7));
     let calls = Arc::clone(&limiter.calls);
     let key_layer = RateLimitLayer::new(
         limiter,
@@ -254,7 +455,10 @@ async fn key_and_backend_failures_are_owned_by_the_mapper() {
             RateLimitRejection::Key("missing trusted client address") => {
                 response(StatusCode::BAD_REQUEST)
             }
-            _ => panic!("unexpected rejection kind"),
+            RateLimitRejection::Key(other) => panic!("unexpected key error {other:?}"),
+            RateLimitRejection::Denied(_) | RateLimitRejection::Backend(StubError) => {
+                panic!("a key failure must not reach the limiter")
+            }
         },
     );
 
@@ -271,8 +475,9 @@ async fn key_and_backend_failures_are_owned_by_the_mapper() {
         policy(),
         |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, Infallible>(subject(4)),
         |rejection| match rejection {
+            RateLimitRejection::Key(never) => match never {},
+            RateLimitRejection::Denied(_) => panic!("a backend failure is not a denial"),
             RateLimitRejection::Backend(StubError) => response(StatusCode::SERVICE_UNAVAILABLE),
-            _ => panic!("unexpected rejection kind"),
         },
     );
     let backend_response = backend_layer
@@ -286,7 +491,7 @@ async fn key_and_backend_failures_are_owned_by_the_mapper() {
 #[tokio::test]
 async fn forwarding_headers_have_no_effect_unless_the_extractor_uses_them() {
     let fixed_subject = subject(5);
-    let limiter = StubLimiter::returning(Decision::allowed(8, 7, Duration::from_mins(1)));
+    let limiter = StubLimiter::returning(allowed(8, 7));
     let observed_subjects = Arc::clone(&limiter.subjects);
     let ignoring_layer = RateLimitLayer::new(
         limiter,
@@ -318,7 +523,7 @@ async fn forwarding_headers_have_no_effect_unless_the_extractor_uses_them() {
     );
 
     let header_subject = subject(6);
-    let limiter = StubLimiter::returning(Decision::allowed(8, 7, Duration::from_mins(1)));
+    let limiter = StubLimiter::returning(allowed(8, 7));
     let observed_subjects = Arc::clone(&limiter.subjects);
     let using_layer = RateLimitLayer::new(
         limiter,
@@ -379,7 +584,7 @@ async fn readiness_is_forwarded_and_the_response_future_is_send() {
         calls: Arc::clone(&calls),
     };
     let layer = RateLimitLayer::new(
-        StubLimiter::returning(Decision::allowed(8, 7, Duration::from_mins(1))),
+        StubLimiter::returning(allowed(8, 7)),
         policy(),
         |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, Infallible>(subject(7)),
         |_rejection| panic!("unexpected rejection"),
@@ -489,7 +694,7 @@ async fn caller_can_choose_rejection_response_body() {
 fn debug_output_is_useful_without_formatting_callback_state() {
     let secret = String::from("raw-identity-secret");
     let layer = RateLimitLayer::new(
-        StubLimiter::returning(Decision::allowed(8, 7, Duration::from_mins(1))),
+        StubLimiter::returning(allowed(8, 7)),
         policy(),
         move |_request: &Request<Body>, _policy: &FixedWindowPolicy| {
             let _ = &secret;
@@ -506,6 +711,28 @@ fn debug_output_is_useful_without_formatting_callback_state() {
     assert!(debug.contains("auth.login"));
     assert!(debug.contains("<redacted>"));
     assert!(!debug.contains("raw-identity-secret"));
+}
+
+#[test]
+fn admissions_can_be_assembled_for_handler_tests() {
+    let policy = policy();
+    let admitted = Admitted::allowed(Allowance::new(8, 7, Duration::from_mins(1)));
+    let mut admissions = Admissions::new();
+    assert!(admissions.is_empty());
+    assert!(admissions.get(&policy).is_none());
+
+    admissions.push(Admission::new(&policy, admitted));
+
+    assert_eq!(
+        admissions,
+        Admissions::from(Admission::new(&policy, admitted))
+    );
+    assert_eq!(admissions.len(), 1);
+    assert_eq!(
+        admissions.get(&policy).map(Admission::decision),
+        Some(admitted)
+    );
+    assert!(format!("{admissions:?}").contains("auth.login"));
 }
 
 fn assert_send<T: Send>(_value: &T) {}

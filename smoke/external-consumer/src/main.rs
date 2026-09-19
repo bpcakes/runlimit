@@ -56,13 +56,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let decision = limiter.check_all(&checks)?;
     match decision.view() {
-        BatchDecisionView::Allowed { decisions } => {
-            assert_eq!(decisions.len(), checks.len());
+        BatchDecisionView::Allowed { allowances } => {
+            assert_eq!(allowances.len(), checks.len());
             println!("request admitted");
         }
         BatchDecisionView::Denied {
             index,
             denial: DenialView::QuotaExceeded(quota),
+            ..
         } => {
             let seconds = quota.retry_after().seconds();
             println!("check {index} denied; retry after {seconds} seconds");
@@ -70,6 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         BatchDecisionView::Denied {
             index,
             denial: DenialView::StorageCapacity { .. },
+            ..
         } => println!("check {index} denied; backend storage is full"),
         BatchDecisionView::ShadowDenied { index, .. } => {
             println!("request admitted after check {index} was shadow denied");

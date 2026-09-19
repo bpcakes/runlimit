@@ -5,7 +5,7 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionObservation, BatchDecision, BatchError, CapacityObservation, Check,
+    AdmissionObservation, Allowance, BatchDecision, BatchError, CapacityObservation, Check,
     CleanupObservation, ConsumptionStatus, CounterKey, Decision, Denial, Limiter, Observation,
     Observer, QuotaDenial, observe_safely, validate_batch,
 };
@@ -37,7 +37,7 @@ impl Shard<Entry> {
         })
     }
 
-    fn consume(&mut self, check: &PreparedCheck, now_millis: u128) -> Decision {
+    fn consume(&mut self, check: &PreparedCheck, now_millis: u128) -> Allowance {
         let expires_at_millis = now_millis + u128::from(check.window_millis);
         if let Some((entry, active_expires_at_millis)) =
             self.active_entry(check.counter_key, now_millis)
@@ -51,7 +51,7 @@ impl Shard<Entry> {
                 entry.used = entry.used.saturating_add(check.cost);
             })
             .expect("the active entry was present");
-            return Decision::allowed(
+            return Allowance::new(
                 check.limit,
                 remaining.saturating_sub(check.cost),
                 duration_from_millis(active_expires_at_millis.saturating_sub(now_millis)),
@@ -63,7 +63,7 @@ impl Shard<Entry> {
             Entry { used: check.cost },
             expires_at_millis,
         );
-        Decision::allowed(
+        Allowance::new(
             check.limit,
             remaining_quota(check.limit, check.cost),
             duration_from_millis(expires_at_millis.saturating_sub(now_millis)),
@@ -264,7 +264,7 @@ impl<C: Clock> MemoryStore<C> {
                     .map(duration_from_millis),
             ))
         } else {
-            shard.consume(&prepared, now_millis)
+            Decision::allowed(shard.consume(&prepared, now_millis))
         };
 
         Ok(Evaluation {
@@ -375,9 +375,9 @@ impl<C: Clock> MemoryStore<C> {
                 let value = if checks[check.input_index].policy().quota_mode()
                     == runlimit_core::QuotaMode::Shadow
                 {
-                    BatchDecision::shadow_denied(check.input_index, denial)
+                    BatchDecision::shadow_denied(check.input_index, checks.len(), denial)
                 } else {
-                    BatchDecision::denied(check.input_index, denial)
+                    BatchDecision::denied(check.input_index, checks.len(), denial)
                 };
                 return Ok(Evaluation {
                     value,
@@ -391,6 +391,7 @@ impl<C: Clock> MemoryStore<C> {
                     return Ok(Evaluation {
                         value: BatchDecision::denied(
                             check.input_index,
+                            checks.len(),
                             Denial::storage_capacity(
                                 shard
                                     .capacity_retry_after_millis(now_millis)
@@ -404,14 +405,14 @@ impl<C: Clock> MemoryStore<C> {
             }
         }
 
-        let mut decisions = Vec::with_capacity(prepared.len());
+        let mut allowances = Vec::with_capacity(prepared.len());
         for check in &prepared {
             let shard = &mut locked_shards[check.shard_position].1;
-            decisions.push(shard.consume(check, now_millis));
+            allowances.push(shard.consume(check, now_millis));
         }
 
         Ok(Evaluation {
-            value: BatchDecision::allowed(decisions),
+            value: BatchDecision::allowed(allowances),
             effect: collect_shard_effects(&locked_shards, &cleanup_effects),
         })
     }
@@ -584,10 +585,10 @@ mod tests {
     };
 
     use runlimit_core::{
-        AdmissionOperation, AdmissionOutcome, BatchDecision, BatchDecisionView, BatchError, Check,
-        ConsumptionStatus, Decision, DecisionView, Denial, DenialView, FixedWindowPolicy,
-        KeyHasher, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, Observation, Observer, PolicyId,
-        QuotaDenial, QuotaMode, ScopeId, SubjectKey,
+        AdmissionOperation, AdmissionOutcome, Allowance, BatchDecision, BatchDecisionView,
+        BatchError, Check, ConsumptionStatus, Decision, DecisionView, Denial, DenialView,
+        FixedWindowPolicy, KeyHasher, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, Observation,
+        Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
     };
 
     use super::{Entry, MemoryStore, MemoryStoreError, remaining_quota};
@@ -696,7 +697,6 @@ mod tests {
                     capacity.capacity(),
                     capacity.headroom(),
                 ),
-                _ => return,
             };
             self.observations.lock().unwrap().push(owned);
         }
@@ -861,7 +861,7 @@ mod tests {
         assert!(store.check(&first_check).unwrap().permits_request());
         assert!(store.check(&second_check).unwrap().permits_request());
         assert_eq!(store.stats().unwrap().entries(), 2);
-        assert!(store.check(&first_check).unwrap().is_enforced_denial());
+        assert!(!store.check(&first_check).unwrap().permits_request());
         assert!(store.check(&second_check).unwrap().permits_request());
     }
 
@@ -925,10 +925,16 @@ mod tests {
         let check = Check::new(&policy, subject(1));
 
         let first = store.check(&check).unwrap();
-        assert_eq!(first, Decision::allowed(2, 1, Duration::from_mins(1)));
+        assert_eq!(
+            first,
+            Decision::allowed(Allowance::new(2, 1, Duration::from_mins(1)))
+        );
 
         let second = store.check(&check).unwrap();
-        assert_eq!(second, Decision::allowed(2, 0, Duration::from_mins(1)));
+        assert_eq!(
+            second,
+            Decision::allowed(Allowance::new(2, 0, Duration::from_mins(1)))
+        );
 
         let denied = store.check(&check).unwrap();
         assert!(!denied.permits_request());
@@ -945,7 +951,10 @@ mod tests {
 
         clock.advance(Duration::from_secs(50));
         let reset = store.check(&check).unwrap();
-        assert_eq!(reset, Decision::allowed(2, 1, Duration::from_mins(1)));
+        assert_eq!(
+            reset,
+            Decision::allowed(Allowance::new(2, 1, Duration::from_mins(1)))
+        );
     }
 
     #[test]
@@ -964,14 +973,13 @@ mod tests {
         );
         let shadow_denial = store.check(&Check::new(&shadow, subject)).unwrap();
         assert!(shadow_denial.permits_request());
-        assert!(shadow_denial.is_shadow_denied());
         assert_eq!(
             shadow_denial,
             Decision::shadow_denied(quota(1, Duration::from_mins(1)))
         );
 
         let enforced_denial = store.check(&Check::new(&enforced, subject)).unwrap();
-        assert!(enforced_denial.is_enforced_denial());
+        assert!(!enforced_denial.permits_request());
         assert_eq!(
             enforced_denial,
             Decision::quota_denied(quota(1, Duration::from_mins(1)))
@@ -999,7 +1007,11 @@ mod tests {
         let result = store.check_all(&[first, second]).unwrap();
         assert!(matches!(
             result.view(),
-            BatchDecisionView::ShadowDenied { index: 0, .. }
+            BatchDecisionView::ShadowDenied {
+                index: 0,
+                batch_size,
+                ..
+            } if batch_size.get() == 2
         ));
         assert!(
             store.check(&second).unwrap().permits_request(),
@@ -1054,16 +1066,16 @@ mod tests {
                 .permits_request()
         );
         assert!(
-            store
+            !store
                 .check(&Check::new(&limited, subject(1)))
                 .unwrap()
-                .is_enforced_denial()
+                .permits_request()
         );
         assert!(
-            store
+            !store
                 .check(&Check::new(&limited, subject(2)))
                 .unwrap()
-                .is_enforced_denial()
+                .permits_request()
         );
 
         let observations = observer.observations.lock().unwrap().clone();
@@ -1120,7 +1132,7 @@ mod tests {
             MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default())
                 .with_observer(Arc::new(PanickingObserver));
         assert!(panicking_store.check(&check).unwrap().permits_request());
-        assert!(panicking_store.check(&check).unwrap().is_enforced_denial());
+        assert!(!panicking_store.check(&check).unwrap().permits_request());
     }
 
     #[test]
@@ -1149,13 +1161,13 @@ mod tests {
                 now: Duration::ZERO,
                 subject: 1,
                 cost: 2,
-                expected: Decision::allowed(5, 3, Duration::from_millis(10)),
+                expected: Decision::allowed(Allowance::new(5, 3, Duration::from_millis(10))),
             },
             Step {
                 now: Duration::from_millis(3),
                 subject: 1,
                 cost: 2,
-                expected: Decision::allowed(5, 1, Duration::from_millis(7)),
+                expected: Decision::allowed(Allowance::new(5, 1, Duration::from_millis(7))),
             },
             Step {
                 now: Duration::from_millis(3),
@@ -1167,25 +1179,25 @@ mod tests {
                 now: Duration::from_millis(9),
                 subject: 1,
                 cost: 1,
-                expected: Decision::allowed(5, 0, Duration::from_millis(1)),
+                expected: Decision::allowed(Allowance::new(5, 0, Duration::from_millis(1))),
             },
             Step {
                 now: Duration::from_millis(10),
                 subject: 1,
                 cost: 3,
-                expected: Decision::allowed(5, 2, Duration::from_millis(10)),
+                expected: Decision::allowed(Allowance::new(5, 2, Duration::from_millis(10))),
             },
             Step {
                 now: Duration::from_millis(8),
                 subject: 1,
                 cost: 1,
-                expected: Decision::allowed(5, 1, Duration::from_millis(10)),
+                expected: Decision::allowed(Allowance::new(5, 1, Duration::from_millis(10))),
             },
             Step {
                 now: Duration::from_millis(10),
                 subject: 2,
                 cost: 1,
-                expected: Decision::allowed(5, 4, Duration::from_millis(10)),
+                expected: Decision::allowed(Allowance::new(5, 4, Duration::from_millis(10))),
             },
             Step {
                 now: Duration::from_millis(10),
@@ -1199,7 +1211,7 @@ mod tests {
                 now: Duration::from_millis(20),
                 subject: 3,
                 cost: 1,
-                expected: Decision::allowed(5, 4, Duration::from_millis(10)),
+                expected: Decision::allowed(Allowance::new(5, 4, Duration::from_millis(10))),
             },
         ];
 
@@ -1230,7 +1242,10 @@ mod tests {
         let check = Check::with_cost(&policy, subject(1), MAX_LIMIT).unwrap();
 
         let first = store.check(&check).unwrap();
-        assert_eq!(first, Decision::allowed(MAX_LIMIT, 0, MAX_WINDOW));
+        assert_eq!(
+            first,
+            Decision::allowed(Allowance::new(MAX_LIMIT, 0, MAX_WINDOW))
+        );
 
         let denied = store.check(&check).unwrap();
         assert_eq!(denied, Decision::quota_denied(quota(MAX_LIMIT, MAX_WINDOW)));
@@ -1244,7 +1259,10 @@ mod tests {
 
         clock.advance(1);
         let reset = store.check(&check).unwrap();
-        assert_eq!(reset, Decision::allowed(MAX_LIMIT, 0, MAX_WINDOW));
+        assert_eq!(
+            reset,
+            Decision::allowed(Allowance::new(MAX_LIMIT, 0, MAX_WINDOW))
+        );
     }
 
     #[test]
@@ -1316,7 +1334,7 @@ mod tests {
         }
 
         let denied = store.check(&Check::new(&policy, subject(64))).unwrap();
-        assert!(denied.is_enforced_denial());
+        assert!(!denied.permits_request());
         assert_eq!(store.stats().unwrap().entries(), 64);
     }
 
@@ -1341,9 +1359,9 @@ mod tests {
         assert_eq!(
             store.check_all(&checks),
             Ok(BatchDecision::allowed(vec![
-                Decision::allowed(10, 8, Duration::from_mins(1)),
-                Decision::allowed(10, 7, Duration::from_mins(1)),
-                Decision::allowed(10, 6, Duration::from_mins(1)),
+                Allowance::new(10, 8, Duration::from_mins(1)),
+                Allowance::new(10, 7, Duration::from_mins(1)),
+                Allowance::new(10, 6, Duration::from_mins(1)),
             ]))
         );
         assert_eq!(store.shards.shard(0).lock().unwrap().used(), 1);
@@ -1381,6 +1399,7 @@ mod tests {
             store.check_all(&checks),
             Ok(BatchDecision::denied(
                 2,
+                3,
                 Denial::storage_capacity(Some(Duration::from_mins(1))),
             ))
         );
@@ -1416,7 +1435,11 @@ mod tests {
         let other_check = Check::new(&policy, other);
         assert_eq!(
             store.check(&other_check),
-            Ok(Decision::allowed(2, 1, Duration::from_mins(1)))
+            Ok(Decision::allowed(Allowance::new(
+                2,
+                1,
+                Duration::from_mins(1)
+            )))
         );
         let checks = [
             other_check,
@@ -1436,7 +1459,11 @@ mod tests {
         assert_eq!(store.stats().unwrap().entries(), 1);
         assert_eq!(
             store.check(&other_check),
-            Ok(Decision::allowed(2, 0, Duration::from_mins(1)))
+            Ok(Decision::allowed(Allowance::new(
+                2,
+                0,
+                Duration::from_mins(1)
+            )))
         );
     }
 
@@ -1514,7 +1541,7 @@ mod tests {
         assert!(
             matches!(
                 cleanup_batch.view(),
-                BatchDecisionView::Allowed { decisions } if decisions.len() == 3
+                BatchDecisionView::Allowed { allowances } if allowances.len() == 3
             ),
             "the two checks targeting shard 0 need two cleanup slots: {cleanup_batch:?}"
         );
@@ -1555,7 +1582,7 @@ mod tests {
         let result = store.check_all(&checks).unwrap();
         assert!(matches!(
             result.view(),
-            BatchDecisionView::Allowed { decisions } if decisions.len() == 3
+            BatchDecisionView::Allowed { allowances } if allowances.len() == 3
         ));
         assert_eq!(store.stats().unwrap().entries(), 3);
     }
@@ -1614,7 +1641,10 @@ mod tests {
             } else {
                 store.check(&target).unwrap()
             };
-            assert_eq!(decision, Decision::allowed(10, 9, Duration::from_millis(2)));
+            assert_eq!(
+                decision,
+                Decision::allowed(Allowance::new(10, 9, Duration::from_millis(2)))
+            );
 
             let key = target.counter_key();
             let shard = store.shards.shard(0).lock().unwrap();
@@ -1645,7 +1675,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             result.view(),
-            BatchDecisionView::Denied { index: 0, .. }
+            BatchDecisionView::Denied {
+                index: 0,
+                batch_size,
+                ..
+            } if batch_size.get() == 2
         ));
 
         assert!(
@@ -1744,8 +1778,8 @@ mod tests {
                         assert!(
                             matches!(
                                 result.view(),
-                                BatchDecisionView::Allowed { decisions }
-                                    if decisions.len() == checks.len()
+                                BatchDecisionView::Allowed { allowances }
+                                    if allowances.len() == checks.len()
                             ),
                             "every call through the configured limit must be allowed: {result:?}"
                         );
@@ -1946,7 +1980,7 @@ mod tests {
             store.check(&reset_check),
             Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
         );
-        assert!(store.check(&retained_check).unwrap().is_enforced_denial());
+        assert!(!store.check(&retained_check).unwrap().permits_request());
         assert!(format!("{store:?}").contains("poisoned_shards: 1"));
 
         assert_eq!(store.recover_poisoned(), 1);
@@ -1961,7 +1995,7 @@ mod tests {
             "the recovered shard starts with empty quota state"
         );
         assert!(
-            store.check(&retained_check).unwrap().is_enforced_denial(),
+            !store.check(&retained_check).unwrap().permits_request(),
             "healthy-shard quota state must survive recovery"
         );
         assert!(format!("{store:?}").contains("poisoned_shards: 0"));
@@ -2006,7 +2040,7 @@ mod tests {
         assert!(
             matches!(
                 recovered.view(),
-                BatchDecisionView::Allowed { decisions } if decisions.len() == 2
+                BatchDecisionView::Allowed { allowances } if allowances.len() == 2
             ),
             "all shards must be usable after one atomic recovery: {recovered:?}"
         );

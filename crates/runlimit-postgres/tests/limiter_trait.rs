@@ -3,7 +3,7 @@
 use std::{fmt::Debug, time::Duration};
 
 use runlimit_core::{
-    BatchDecision, BatchError, Check, Decision, DecisionView, FixedWindowPolicy, Limiter, PolicyId,
+    Allowance, BatchDecision, BatchError, Check, Decision, FixedWindowPolicy, Limiter, PolicyId,
     ScopeId, SubjectKey,
 };
 use runlimit_memory::{MemoryStore, MemoryStoreConfig, MemoryStoreError};
@@ -40,7 +40,7 @@ fn key(byte: u8) -> SubjectKey {
     SubjectKey::from_digest([byte; 32])
 }
 
-fn expect_allowed<E: Debug>(result: Result<BatchDecision, E>) -> Vec<runlimit_core::Decision> {
+fn expect_allowed<E: Debug>(result: Result<BatchDecision, E>) -> Vec<Allowance> {
     result
         .expect("generic limiter call succeeds")
         .try_into_allowed()
@@ -110,23 +110,15 @@ async fn generic_batch_preserves_caller_order() {
         MemoryStoreConfig::new(4).expect("test memory-store configuration is valid"),
     );
 
-    let decisions = expect_allowed(check_batch(&memory, &checks).await);
+    let allowances = expect_allowed(check_batch(&memory, &checks).await);
 
-    assert_eq!(decisions.len(), 2);
-    assert!(matches!(
-        decisions[0].view(),
-        DecisionView::Allowed {
-            capacity: 11,
-            available: 8,
-            ..
-        }
-    ));
-    assert!(matches!(
-        decisions[1].view(),
-        DecisionView::Allowed {
-            capacity: 7,
-            available: 5,
-            ..
-        }
-    ));
+    assert_eq!(allowances.len(), 2);
+    assert_eq!(
+        (allowances[0].capacity(), allowances[0].available()),
+        (11, 8)
+    );
+    assert_eq!(
+        (allowances[1].capacity(), allowances[1].available()),
+        (7, 5)
+    );
 }

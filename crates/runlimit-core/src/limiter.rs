@@ -33,8 +33,8 @@ pub trait Limiter: Send + Sync {
 
     /// Evaluates a batch atomically.
     ///
-    /// If any check is denied, no check consumes quota. Allowed decisions
-    /// preserve the caller's input order.
+    /// If any check is denied, no check consumes quota. An allowed batch
+    /// carries one allowance per check in the caller's input order.
     ///
     /// Implementations must not evaluate the checks or consume quota until the
     /// returned future is first polled.

@@ -45,13 +45,9 @@ fn assert_lazy<L: Limiter>(limiter: &L, check: &Check<'_, L::Policy>, batch: boo
     };
     assert!(matches!(
         first.view(),
-        DecisionView::Allowed { available: 0, .. }
+        DecisionView::Allowed { allowance } if allowance.available() == 0
     ));
-    assert!(
-        poll_ready(limiter.check(check))
-            .unwrap()
-            .is_enforced_denial()
-    );
+    assert!(!poll_ready(limiter.check(check)).unwrap().permits_request());
 }
 
 fn fixed_window(batch: bool) {

@@ -2,17 +2,15 @@
 
 use std::time::Duration;
 
-use runlimit_core::{Decision, DecisionView, Denial, DenialView, QuotaDenial};
+use runlimit_core::{Allowance, Decision, DecisionView, Denial, DenialView, QuotaDenial};
 
 fn describe(decision: &Decision) -> String {
     match decision.view() {
-        DecisionView::Allowed {
-            capacity,
-            available,
-            ..
-        } => {
-            format!("admitted; {available} of {capacity} left")
-        }
+        DecisionView::Allowed { allowance } => format!(
+            "admitted; {} of {} left",
+            allowance.available(),
+            allowance.capacity(),
+        ),
         DecisionView::ShadowDenied { denial } => format!(
             "admitted; quota of {} would have denied for {}s",
             denial.capacity(),
@@ -34,7 +32,11 @@ fn describe(decision: &Decision) -> String {
 fn every_outcome_is_described_without_a_catch_all() {
     let quota = QuotaDenial::try_new(8, Duration::from_millis(30_001)).unwrap();
     assert_eq!(
-        describe(&Decision::try_allowed(8, 7, Duration::from_secs(60)).unwrap()),
+        describe(&Decision::allowed(Allowance::new(
+            8,
+            7,
+            Duration::from_secs(60)
+        ))),
         "admitted; 7 of 8 left"
     );
     assert_eq!(

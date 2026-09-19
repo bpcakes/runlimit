@@ -9,9 +9,47 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ### Changed
 
-- **Breaking:** remove `Decision::is_allowed()` and `Decision::is_denied()`.
-  Use `permits_request()` and `is_enforced_denial()` respectively. Match
-  `DecisionView::Allowed` when allowance metadata is needed.
+- **Breaking:** `permits_request()` is the only boolean admission predicate.
+  Remove `Decision::is_allowed()`, `is_denied()`, `would_deny()`,
+  `is_enforced_denial()`, and `is_shadow_denied()`, and the `would_deny()`,
+  `is_enforced_denial()`, and `is_shadow_denied()` predicates on
+  `BatchDecision`. A predicate that is true for shadow denials compiled
+  cleanly as a rejection guard and turned shadow mode into enforcement. Use
+  `!permits_request()` for enforcement and match `view()` for anything else.
+- Add `Admitted` and `AdmittedView`, a decision type that can only hold an
+  allowed or shadow-denied outcome, and `Decision::admit()`, which splits a
+  decision into `Result<Admitted, Denial>` without loss. Code that receives an
+  `Admitted` value never re-checks enforcement.
+- **Breaking:** make `Allowance` public and use it wherever a check is known to
+  be allowed. `Allowance::new` and `try_new` validate capacity and available
+  quota; `Decision::allowed` takes an `Allowance` and `Decision::try_allowed`
+  is removed. `DecisionView::Allowed` and `AdmittedView::Allowed` carry an
+  `allowance` field, `BatchDecisionView::Allowed` carries `allowances:
+  &[Allowance]`, `BatchDecision::allowed` takes `Vec<Allowance>` and cannot
+  fail, and `try_into_allowed()` returns `Vec<Allowance>`. A denied member of
+  an allowed batch is no longer representable, so `BatchDecision::try_allowed`
+  and `DecisionError::DeniedDecisionInAllowedBatch` are removed. The Serde
+  `allowed` batch object carries `allowances`, a list of `Allowance` objects
+  with `capacity`, `available`, and `replenishes_after`, instead of
+  `decisions`; `Allowance` also serializes on its own.
+- **Breaking:** `Observation`, `AdmissionOperation`, `AdmissionOutcome`, and
+  `ConsumptionStatus` are no longer `#[non_exhaustive]`. An observer names
+  every variant, so a new outcome is a compile error instead of a silently
+  unmetered wildcard arm.
+- **Breaking (`runlimit-axum`):** `RateLimitRejection` is no longer
+  `#[non_exhaustive]`, and `RateLimitRejection::Denied` carries a
+  `runlimit_core::Denial` instead of a `Decision`, so a rejection mapper names
+  every rejection category and never handles an allowed or shadow-denied arm.
+- **Breaking (`runlimit-axum`):** admitted requests carry an `Admissions`
+  request extension instead of a `runlimit_core::Decision`. Every
+  `RateLimitLayer` the request passed appends an `Admission` naming its policy
+  identifier, scope, and fingerprint together with the `Admitted` outcome, so
+  stacked layers no longer overwrite each other's decision. Look a layer's
+  outcome up with `Admissions::get(&policy)` or iterate them in evaluation
+  order. Code passing adapter outcomes to
+  `runlimit_http::draft_11::service_limit` converts an admitted outcome with
+  `Decision::from(admission.decision())` and an enforced denial with
+  `Decision::denied(denial)`.
 - **Breaking:** add `DenialView` and `Denial::view()`. `DecisionView::Denied`
   and `BatchDecisionView::Denied` carry a `DenialView` by value, and
   `DecisionView` no longer has a lifetime. Every denial reason is a named match
@@ -31,7 +69,17 @@ The format is based on [Keep a Changelog], and this project adheres to
   `quota_denial()`. Match `DecisionView` and `BatchDecisionView` instead;
   `try_into_allowed()` and `try_into_single_decision()` remain. Shadow outcomes
   store `QuotaDenial` directly, making shadowed storage-capacity denials
-  unrepresentable internally. The Serde wire representation remains unchanged.
+  unrepresentable internally. The Serde wire representation of single
+  decisions remains unchanged.
+- **Breaking:** batch denials carry their batch size. `BatchDecision::denied`
+  and `shadow_denied` take `(index, batch_size, denial)` and panic when
+  `index` is not below `batch_size`; the new `try_denied` and
+  `try_shadow_denied` return `DecisionError::DeniedIndexOutOfRange` instead.
+  `BatchDecisionView::Denied` and `ShadowDenied` expose `batch_size` as a
+  `NonZeroUsize`, `try_into_single_decision` converts a denial only when its
+  batch size is one, and the Serde `denied` and `shadow_denied` batch objects
+  gain a required `batch_size` field that deserialization validates the index
+  against.
 - **Breaking:** upgrade `runlimit-postgres` to SQLx 0.9.0. Applications passing
   SQLx pools or handling SQLx errors must also upgrade to SQLx 0.9.
 - Raise the workspace minimum supported Rust version from 1.88 to 1.94.

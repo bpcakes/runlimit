@@ -24,8 +24,12 @@ pub trait Observer: Send + Sync + 'static {
 }
 
 /// A backend-neutral operational observation.
+///
+/// This enum and the classification enums it carries are exhaustive: an
+/// observer matches every variant, so a new observation kind or outcome is a
+/// compile error in every consumer rather than a silently unmetered fallback
+/// arm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum Observation<'a> {
     /// One admission operation completed.
     Admission(AdmissionObservation<'a>),
@@ -37,7 +41,6 @@ pub enum Observation<'a> {
 
 /// Whether an admission evaluated one check or an atomic batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum AdmissionOperation {
     /// One check.
     Check,
@@ -46,8 +49,10 @@ pub enum AdmissionOperation {
 }
 
 /// Classification of a completed admission operation.
+///
+/// Every variant is a named match arm, so a metrics mapper cannot leave a new
+/// outcome unmetered behind a wildcard.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum AdmissionOutcome {
     /// Quota was consumed successfully.
     Allowed,
@@ -63,7 +68,6 @@ pub enum AdmissionOutcome {
 
 /// What a caller can know about quota consumption after an operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum ConsumptionStatus {
     /// The operation definitely consumed quota.
     Consumed,
@@ -323,7 +327,7 @@ fn batch_relevant_check<'checks, 'policy, P: RateLimitPolicy + ?Sized>(
     decision: &BatchDecision,
 ) -> Option<&'checks Check<'policy, P>> {
     match decision.view() {
-        BatchDecisionView::Allowed { decisions } if decisions.len() == 1 => checks.first(),
+        BatchDecisionView::Allowed { allowances } if allowances.len() == 1 => checks.first(),
         BatchDecisionView::Allowed { .. } => None,
         BatchDecisionView::Denied { index, .. } | BatchDecisionView::ShadowDenied { index, .. } => {
             checks.get(index)
@@ -473,8 +477,8 @@ mod tests {
         ConsumptionStatus,
     };
     use crate::{
-        BatchDecision, Check, Decision, Denial, FixedWindowPolicy, PolicyId, QuotaDenial,
-        RateLimitPolicy, ScopeId, SubjectKey,
+        Allowance, BatchDecision, Check, Decision, Denial, FixedWindowPolicy, PolicyId,
+        QuotaDenial, RateLimitPolicy, ScopeId, SubjectKey,
     };
 
     fn policy(id: &str) -> FixedWindowPolicy {
@@ -519,7 +523,7 @@ mod tests {
 
         for (decision, outcome, consumption) in [
             (
-                Decision::try_allowed(3, 2, Duration::from_mins(1)).unwrap(),
+                Decision::allowed(Allowance::new(3, 2, Duration::from_mins(1))),
                 AdmissionOutcome::Allowed,
                 ConsumptionStatus::Consumed,
             ),
@@ -610,17 +614,13 @@ mod tests {
             Check::new(&second, SubjectKey::from_digest([2; 32])),
         ];
         let elapsed = Duration::from_millis(11);
-        let allowed = Decision::try_allowed(3, 2, Duration::from_mins(1)).unwrap();
+        let allowed = Allowance::new(3, 2, Duration::from_mins(1));
         let quota_denial = QuotaDenial::try_new(3, Duration::from_secs(1)).unwrap();
         let capacity_denial = Denial::storage_capacity(None);
 
         let empty: [Check<'_, FixedWindowPolicy>; 0] = [];
         assert_admission(
-            AdmissionObservation::from_batch(
-                &empty,
-                &BatchDecision::try_allowed(Vec::new()).unwrap(),
-                elapsed,
-            ),
+            AdmissionObservation::from_batch(&empty, &BatchDecision::allowed(Vec::new()), elapsed),
             AdmissionOperation::Batch,
             0,
             None,
@@ -631,31 +631,31 @@ mod tests {
 
         for (decision, policy, outcome, consumption) in [
             (
-                BatchDecision::try_allowed(vec![allowed]).unwrap(),
+                BatchDecision::allowed(vec![allowed]),
                 Some(&first),
                 AdmissionOutcome::Allowed,
                 ConsumptionStatus::Consumed,
             ),
             (
-                BatchDecision::try_allowed(vec![allowed, allowed]).unwrap(),
+                BatchDecision::allowed(vec![allowed, allowed]),
                 None,
                 AdmissionOutcome::Allowed,
                 ConsumptionStatus::Consumed,
             ),
             (
-                BatchDecision::denied(1, quota_denial),
+                BatchDecision::denied(1, 2, quota_denial),
                 Some(&second),
                 AdmissionOutcome::QuotaDenied,
                 ConsumptionStatus::NotConsumed,
             ),
             (
-                BatchDecision::shadow_denied(0, quota_denial),
+                BatchDecision::shadow_denied(0, 2, quota_denial),
                 Some(&first),
                 AdmissionOutcome::ShadowDenied,
                 ConsumptionStatus::NotConsumed,
             ),
             (
-                BatchDecision::denied(1, capacity_denial),
+                BatchDecision::denied(1, 2, capacity_denial),
                 Some(&second),
                 AdmissionOutcome::CapacityDenied,
                 ConsumptionStatus::NotConsumed,

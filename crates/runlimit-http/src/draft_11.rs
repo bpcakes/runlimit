@@ -78,11 +78,10 @@ pub fn quota_policy<P: RateLimitPolicy + ?Sized>(
 pub fn service_limit(name: &str, decision: &Decision) -> Result<HeaderField, EncodingError> {
     let name = encode_policy_name(name)?;
     let (available, effective_window) = match decision.view() {
-        DecisionView::Allowed {
-            available,
-            replenishes_after,
-            ..
-        } => (available, ceil_seconds(replenishes_after)),
+        DecisionView::Allowed { allowance } => (
+            allowance.available(),
+            ceil_seconds(allowance.replenishes_after()),
+        ),
         DecisionView::Denied {
             denial: DenialView::QuotaExceeded(denial),
         }
@@ -200,8 +199,8 @@ mod tests {
     use std::time::Duration;
 
     use runlimit_core::{
-        Decision, Denial, FixedWindowPolicy, GcraPolicy, PolicyFingerprint, PolicyId, QuotaDenial,
-        QuotaMode, RateLimitPolicy, ScopeId,
+        Allowance, Decision, Denial, FixedWindowPolicy, GcraPolicy, PolicyFingerprint, PolicyId,
+        QuotaDenial, QuotaMode, RateLimitPolicy, ScopeId,
     };
 
     use super::{
@@ -261,7 +260,7 @@ mod tests {
         let policy_field = quota_policy("search", &policy).unwrap();
         let service_field = service_limit(
             "search",
-            &Decision::allowed(100, 49, Duration::from_secs(37)),
+            &Decision::allowed(Allowance::new(100, 49, Duration::from_secs(37))),
         )
         .unwrap();
 
@@ -289,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_and_shadow_denials_are_would_deny_service_values() {
+    fn quota_and_shadow_denials_are_exhausted_service_values() {
         let denial = QuotaDenial::try_new(10, Duration::from_millis(1_001)).unwrap();
 
         assert_eq!(
@@ -308,7 +307,7 @@ mod tests {
 
     #[test]
     fn rounds_allowed_effective_windows_up_to_whole_seconds() {
-        let decision = Decision::allowed(10, 9, Duration::from_nanos(1));
+        let decision = Decision::allowed(Allowance::new(10, 9, Duration::from_nanos(1)));
 
         assert_eq!(
             service_limit("default", &decision).unwrap().1,
@@ -376,11 +375,11 @@ mod tests {
         assert_eq!(
             service_limit(
                 "too-large",
-                &Decision::allowed(
+                &Decision::allowed(Allowance::new(
                     MAX_STRUCTURED_FIELD_INTEGER + 1,
                     MAX_STRUCTURED_FIELD_INTEGER + 1,
                     Duration::from_secs(1),
-                ),
+                )),
             ),
             Err(EncodingError::StructuredFieldIntegerTooLarge {
                 actual: MAX_STRUCTURED_FIELD_INTEGER + 1,
@@ -425,8 +424,11 @@ mod tests {
 
     #[test]
     fn rejects_effective_windows_above_the_structured_field_integer_maximum() {
-        let decision =
-            Decision::allowed(1, 0, Duration::from_secs(MAX_STRUCTURED_FIELD_INTEGER + 1));
+        let decision = Decision::allowed(Allowance::new(
+            1,
+            0,
+            Duration::from_secs(MAX_STRUCTURED_FIELD_INTEGER + 1),
+        ));
 
         assert_eq!(
             service_limit("default", &decision),

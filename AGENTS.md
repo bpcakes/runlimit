@@ -36,14 +36,31 @@ deployments.
 - Decision metadata is validated where it is constructed, never where it is
   serialized. Every constructible `Decision`, `Denial`, and `BatchDecision`
   is reportable and serializable; serialization must not reject their metadata,
-  and new invariants belong in their constructors.
-- The public API is designed for AI-agent consumers. `DecisionView`,
-  `BatchDecisionView`, and `DenialView` are exhaustive and never
-  `#[non_exhaustive]`, so a new outcome or reason is a compile error in every
+  and new invariants belong in their constructors. A batch denial carries its
+  batch size and its index is validated below that size, so a denied batch
+  never names an input it did not contain.
+- The public API is designed for AI-agent consumers. Every dispatch point a
+  consumer must match is exhaustive and never `#[non_exhaustive]`:
+  `DecisionView`, `BatchDecisionView`, `DenialView`, `AdmittedView`, the
+  observation enums `Observation`, `AdmissionOperation`, `AdmissionOutcome`,
+  and `ConsumptionStatus`, and the adapter rejection `RateLimitRejection`. A
+  new outcome, reason, or rejection category is a compile error in every
   consumer rather than a fallback arm. Do not add accessors that answer for
   several outcomes at once with an `Option`; expose new metadata on the view
   variant it belongs to, and encode header rules such as rounding up in types
   like `RetryAfter` rather than in documentation.
+- `permits_request()` is the only boolean admission predicate on `Decision`
+  and `BatchDecision`. Do not add sibling predicates such as `would_deny()`:
+  a predicate that is true for shadow denials compiles cleanly as a rejection
+  guard and silently turns shadow mode into enforcement. `Decision::admit()`
+  is the typed split into `Admitted` or `Denial`; everything else goes through
+  `view()`. Types that can only hold a subset of outcomes use the narrower type:
+  an allowed batch is `Vec<Allowance>`, an adapter rejection carries `Denial`,
+  and an admitted request carries `Admitted`.
+- HTTP adapters must record every stacked layer's admitted decision. A request
+  that passes several `RateLimitLayer`s carries one `Admissions` extension
+  with an `Admission` per layer in evaluation order; a layer must never
+  overwrite another layer's entry.
 - Multi-check operations are all-or-nothing and preserve the caller's input
   order in returned decisions.
 - `Limiter::check` and `Limiter::check_all` futures do no work before their

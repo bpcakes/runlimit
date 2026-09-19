@@ -541,15 +541,16 @@ impl Drop for ConnectionCancellationGuard {
 #[cfg(test)]
 mod tests {
     use std::{
+        num::NonZeroUsize,
         sync::{Arc, Mutex},
         time::Duration,
     };
 
     use super::*;
     use runlimit_core::{
-        AdmissionOperation, AdmissionOutcome, BatchDecisionView, ConsumptionStatus, Denial,
-        DenialView, FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, PolicyId,
-        QuotaDenial, ScopeId, SubjectKey,
+        AdmissionOperation, AdmissionOutcome, Allowance, BatchDecisionView, ConsumptionStatus,
+        DecisionView, Denial, DenialView, FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW,
+        MAX_WINDOW_MILLIS, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
     };
 
     fn policy(id: &str, scope: &str) -> FixedWindowPolicy {
@@ -585,7 +586,8 @@ mod tests {
                     cleanup.removed(),
                     cleanup.consumption(),
                 )),
-                _ => {}
+                // The PostgreSQL backend has no local capacity to report.
+                Observation::Capacity(_) => {}
             }
         }
     }
@@ -838,10 +840,7 @@ mod tests {
         })
         .finish(Duration::from_millis(80));
 
-        assert_eq!(
-            allowed,
-            Decision::allowed(10, 4, Duration::from_millis(170))
-        );
+        assert_eq!(allowed, Allowance::new(10, 4, Duration::from_millis(170)));
         assert_eq!(
             denied,
             Denial::quota_exceeded(QuotaDenial::new(10, Duration::from_millis(70)))
@@ -854,6 +853,7 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             PendingBatchDenial::Enforced {
                 index: 2,
+                batch_size: 3,
                 denial: PendingDenial::Quota(PendingQuotaDenial {
                     limit: 10,
                     retry_from_sample: Duration::from_millis(150),
@@ -873,6 +873,7 @@ mod tests {
             decision.view(),
             BatchDecisionView::Denied {
                 index: 2,
+                batch_size: NonZeroUsize::new(3).unwrap(),
                 denial: DenialView::QuotaExceeded(QuotaDenial::new(10, Duration::from_millis(130))),
             }
         );
@@ -884,6 +885,7 @@ mod tests {
             Instant::now(),
             PendingBatchDenial::Enforced {
                 index: 0,
+                batch_size: 1,
                 denial: PendingDenial::Quota(PendingQuotaDenial {
                     limit: 1,
                     retry_from_sample: Duration::from_millis(50),
@@ -902,6 +904,7 @@ mod tests {
             BatchDecisionView::Denied {
                 index: 0,
                 denial: DenialView::QuotaExceeded(quota),
+                ..
             } if quota.capacity() == 1
         ));
     }
@@ -912,6 +915,7 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             PendingBatchDenial::Shadow {
                 index: 0,
+                batch_size: 1,
                 denial: PendingQuotaDenial {
                     limit: 1,
                     retry_from_sample: Duration::from_secs(1),
@@ -927,7 +931,9 @@ mod tests {
         };
         assert!(matches!(
             decision.view(),
-            BatchDecisionView::ShadowDenied { index: 0, denial } if denial.capacity() == 1
+            BatchDecisionView::ShadowDenied {
+                index: 0, denial, ..
+            } if denial.capacity() == 1
         ));
     }
 
@@ -1036,6 +1042,31 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn mixed_quota_modes_fail_before_connecting() {
+        let enforced = policy("enforced", "client");
+        let shadow = policy("shadow", "client").with_quota_mode(QuotaMode::Shadow);
+        let checks = [Check::new(&enforced, key(1)), Check::new(&shadow, key(2))];
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://runlimit:runlimit@127.0.0.1:1/runlimit")
+            .expect("syntactically valid database URL");
+        let limiter = PostgresLimiter::new(pool);
+
+        let error = limiter
+            .check_all(&checks)
+            .await
+            .expect_err("mixed quota modes must be rejected");
+
+        assert!(matches!(
+            error,
+            CheckError::InvalidBatch(BatchError::MixedQuotaModes {
+                first: QuotaMode::Enforce,
+                index: 1,
+                actual: QuotaMode::Shadow,
+            })
+        ));
+    }
+
     #[test]
     fn error_reports_consumption_uncertainty() {
         let definite = CheckError::DefinitelyNotConsumed(sqlx::Error::RowNotFound);
@@ -1081,13 +1112,24 @@ mod tests {
 
         let committed = single_decision_from_batch(BatchDecision::allowed(Vec::new()))
             .expect_err("malformed allowed response follows a confirmed commit");
-        let rolled_back = single_decision_from_batch(BatchDecision::denied(1, denial))
+        let rolled_back = single_decision_from_batch(BatchDecision::denied(1, 2, denial))
             .expect_err("malformed denied response follows a rollback");
 
         assert!(matches!(committed, CheckError::CommittedResponseInvariant));
         assert!(committed.may_have_consumed_quota());
         assert!(matches!(rolled_back, CheckError::ResponseInvariant));
         assert!(!rolled_back.may_have_consumed_quota());
+    }
+
+    #[test]
+    fn singleton_shadow_batch_converts_to_a_permitted_decision() {
+        let denial = QuotaDenial::new(1, Duration::from_secs(1));
+
+        let decision =
+            single_decision_from_batch(BatchDecision::shadow_denied(0, 1, denial)).unwrap();
+
+        assert!(decision.permits_request());
+        assert_eq!(decision.view(), DecisionView::ShadowDenied { denial });
     }
 
     #[test]

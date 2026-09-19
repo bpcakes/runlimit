@@ -10,8 +10,8 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionOutcome, BatchDecision, BatchDecisionView, Check, ConsumptionStatus, Decision,
-    DecisionView, Denial, DenialView, FixedWindowPolicy, Limiter, MAX_LIMIT, MAX_WINDOW,
+    AdmissionOutcome, Allowance, BatchDecision, BatchDecisionView, Check, ConsumptionStatus,
+    Decision, DecisionView, Denial, DenialView, FixedWindowPolicy, Limiter, MAX_LIMIT, MAX_WINDOW,
     MAX_WINDOW_MILLIS, Observation, Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId,
     SubjectKey,
 };
@@ -42,7 +42,7 @@ static NEXT_POLICY: AtomicU64 = AtomicU64::new(0);
 
 fn available(decision: &Decision) -> u64 {
     match decision.view() {
-        DecisionView::Allowed { available, .. } => available,
+        DecisionView::Allowed { allowance } => allowance.available(),
         DecisionView::Denied { .. } | DecisionView::ShadowDenied { .. } => {
             panic!("expected an allowed decision, got {decision:?}")
         }
@@ -52,11 +52,11 @@ fn available(decision: &Decision) -> u64 {
 /// Describes an outcome without its backend-measured durations.
 fn shape(decision: &Decision) -> String {
     match decision.view() {
-        DecisionView::Allowed {
-            capacity,
-            available,
-            ..
-        } => format!("allowed {available} of {capacity}"),
+        DecisionView::Allowed { allowance } => format!(
+            "allowed {} of {}",
+            allowance.available(),
+            allowance.capacity()
+        ),
         DecisionView::Denied {
             denial: DenialView::QuotaExceeded(quota),
         } => format!("quota denied at {}", quota.capacity()),
@@ -86,7 +86,8 @@ impl Observer for RecordingObserver {
                 cleanup.removed(),
                 cleanup.consumption(),
             )),
-            _ => {}
+            // The PostgreSQL backend has no local capacity to report.
+            Observation::Capacity(_) => {}
         }
     }
 }
@@ -384,13 +385,13 @@ const FIXED_WINDOW_TRANSITIONS: [TransitionStep; 6] = [
         name: "new window",
         at_millis: 0,
         cost: 2,
-        expected: Decision::allowed(5, 3, Duration::from_secs(10)),
+        expected: Decision::allowed(Allowance::new(5, 3, Duration::from_secs(10))),
     },
     TransitionStep {
         name: "live increment",
         at_millis: 3_000,
         cost: 2,
-        expected: Decision::allowed(5, 1, Duration::from_secs(7)),
+        expected: Decision::allowed(Allowance::new(5, 1, Duration::from_secs(7))),
     },
     TransitionStep {
         name: "live denial",
@@ -402,7 +403,7 @@ const FIXED_WINDOW_TRANSITIONS: [TransitionStep; 6] = [
         name: "exact fill after denial",
         at_millis: 9_000,
         cost: 1,
-        expected: Decision::allowed(5, 0, Duration::from_secs(1)),
+        expected: Decision::allowed(Allowance::new(5, 0, Duration::from_secs(1))),
     },
     TransitionStep {
         name: "full-window denial",
@@ -414,7 +415,7 @@ const FIXED_WINDOW_TRANSITIONS: [TransitionStep; 6] = [
         name: "exact-expiry renewal",
         at_millis: 10_000,
         cost: 3,
-        expected: Decision::allowed(5, 2, Duration::from_secs(10)),
+        expected: Decision::allowed(Allowance::new(5, 2, Duration::from_secs(10))),
     },
 ];
 
@@ -1327,7 +1328,7 @@ async fn capacity_denied_batch_rolls_back_and_remains_enforced_in_shadow_mode() 
         .expect("capacity exhaustion is a batch decision");
     assert_eq!(
         result,
-        BatchDecision::denied(1, Denial::storage_capacity(None))
+        BatchDecision::denied(1, 2, Denial::storage_capacity(None))
     );
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
     assert!(!counter_exists(&pool, &policy, first_subject).await);
@@ -1351,22 +1352,51 @@ async fn shadow_quota_denial_is_reported_without_consuming_more_quota() {
     let pool = fixture.primary_pool.clone();
     let policy =
         unique_policy("shadow-quota", 1, Duration::from_mins(1)).with_quota_mode(QuotaMode::Shadow);
-    let subject = key_in_capacity_shard(&policy, 30, 1);
+    let earlier_subject = key_in_capacity_shard(&policy, 30, 1);
+    let exhausted_subject = key_in_capacity_shard(&policy, 30, 2);
     let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
 
     let allowed = limiter
-        .check(&Check::new(&policy, subject))
+        .check(&Check::new(&policy, exhausted_subject))
         .await
         .expect("first shadow-policy check is consumed");
-    let shadow_denial = limiter
-        .check(&Check::new(&policy, subject))
+    let single_shadow_denial = limiter
+        .check(&Check::new(&policy, exhausted_subject))
         .await
-        .expect("shadow quota exhaustion is a decision");
+        .expect("single shadow quota exhaustion is a decision");
     assert!(allowed.permits_request());
-    assert!(shadow_denial.is_shadow_denied());
-    assert!(shadow_denial.permits_request());
-    assert_eq!(stored_counter_usage(&pool, &policy, subject).await, 1);
-    assert_eq!(delete_counter(&pool, &policy, subject).await, 1);
+    assert!(single_shadow_denial.permits_request());
+    assert!(matches!(
+        single_shadow_denial.view(),
+        DecisionView::ShadowDenied { denial } if denial.capacity() == 1
+    ));
+    assert_eq!(
+        stored_counter_usage(&pool, &policy, exhausted_subject).await,
+        1
+    );
+
+    let batch_shadow_denial = limiter
+        .check_all(&[
+            Check::new(&policy, earlier_subject),
+            Check::new(&policy, exhausted_subject),
+        ])
+        .await
+        .expect("shadow quota exhaustion is a batch decision");
+    assert!(batch_shadow_denial.permits_request());
+    assert!(matches!(
+        batch_shadow_denial.view(),
+        BatchDecisionView::ShadowDenied {
+            index: 1,
+            batch_size,
+            denial,
+        } if batch_size.get() == 2 && denial.capacity() == 1
+    ));
+    assert!(!counter_exists(&pool, &policy, earlier_subject).await);
+    assert_eq!(
+        stored_counter_usage(&pool, &policy, exhausted_subject).await,
+        1
+    );
+    assert_eq!(delete_counter(&pool, &policy, exhausted_subject).await, 1);
 
     drop(limiter);
     fixture.teardown().await;
@@ -1663,7 +1693,7 @@ async fn single_quota_denial_and_anchored_reset() {
     assert_eq!(available(&first), 1);
     assert!(matches!(
         first.view(),
-        DecisionView::Allowed { replenishes_after, .. } if !replenishes_after.is_zero()
+        DecisionView::Allowed { allowance } if !allowance.replenishes_after().is_zero()
     ));
 
     let second = limiter.check(&check).await.expect("second check succeeds");
@@ -1729,11 +1759,8 @@ WHERE
 
     assert!(matches!(
         allowed.view(),
-        DecisionView::Allowed {
-            capacity: MAX_LIMIT,
-            available: 0,
-            ..
-        }
+        DecisionView::Allowed { allowance }
+            if allowance.capacity() == MAX_LIMIT && allowance.available() == 0
     ));
     assert_eq!(stored_used, i64::MAX);
     assert_eq!(
@@ -1921,7 +1948,7 @@ $function$
     fixture.teardown().await;
 
     assert!(
-        denied.is_enforced_denial(),
+        !denied.permits_request(),
         "a search_path-resolved future clock would incorrectly renew the active window"
     );
     assert_eq!(
@@ -1998,9 +2025,7 @@ WHERE
             step.name
         );
         let postgres_duration = match postgres_decision.view() {
-            DecisionView::Allowed {
-                replenishes_after, ..
-            } => replenishes_after,
+            DecisionView::Allowed { allowance } => allowance.replenishes_after(),
             DecisionView::Denied {
                 denial: DenialView::QuotaExceeded(quota),
             }
@@ -2136,22 +2161,14 @@ ORDER BY input.input_position
         deleted_rows += delete_counter(&pool, check.policy(), check.subject()).await;
     }
 
-    let decisions = result
+    let allowances = result
         .expect("set-based batch succeeds")
         .try_into_allowed()
         .expect("fresh counters must all be allowed");
-    assert_eq!(decisions.len(), checks.len());
-    for (decision, check) in decisions.iter().zip(&checks) {
-        let DecisionView::Allowed {
-            capacity,
-            available,
-            ..
-        } = decision.view()
-        else {
-            panic!("fresh counters must all be allowed, got {decision:?}")
-        };
-        assert_eq!(capacity, check.policy().limit());
-        assert_eq!(available, check.policy().limit() - check.cost());
+    assert_eq!(allowances.len(), checks.len());
+    for (allowance, check) in allowances.iter().zip(&checks) {
+        assert_eq!(allowance.capacity(), check.policy().limit());
+        assert_eq!(allowance.available(), check.policy().limit() - check.cost());
     }
 
     assert_eq!(stored_usage.len(), checks.len());
@@ -2247,15 +2264,10 @@ async fn opposite_order_batches_across_pools_do_not_deadlock_or_over_admit() {
             let outcome = outcome
                 .expect("contending batch task does not panic")
                 .expect("opposite-order batch completes before its deadline");
-            let decisions = outcome
+            let allowances = outcome
                 .try_into_allowed()
                 .expect("capacity permits every contending batch");
-            assert_eq!(decisions.len(), 2);
-            assert!(
-                decisions
-                    .iter()
-                    .all(runlimit_core::Decision::permits_request)
-            );
+            assert_eq!(allowances.len(), 2);
         }
     }
     assert_eq!(u64::try_from(stored_a).unwrap(), ROUNDS * 2);
@@ -2361,7 +2373,7 @@ async fn concurrent_fresh_single_checks_advance_the_waiters_snapshot() {
             .expect("fresh-key check task does not panic")
             .expect("snapshot fallback returns a decision");
         allowed += usize::from(decision.permits_request());
-        denied += usize::from(decision.is_enforced_denial());
+        denied += usize::from(!decision.permits_request());
     }
     let stored = stored_counter_usage(&pool, &policy, subject).await;
     let deleted = delete_counter(&pool, &policy, subject).await;
@@ -2438,9 +2450,9 @@ async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
 
     assert!(matches!(
         batch.view(),
-        BatchDecisionView::Allowed { decisions } if decisions.len() == 2
+        BatchDecisionView::Allowed { allowances } if allowances.len() == 2
     ));
-    assert!(single.is_enforced_denial());
+    assert!(!single.permits_request());
     assert_eq!(target_stored, 1);
     assert_eq!(companion_stored, 1);
     assert_eq!(target_deleted, 1);

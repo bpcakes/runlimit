@@ -88,13 +88,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let decision = limiter.check_all(&checks)?;
     match decision.view() {
-        BatchDecisionView::Allowed { decisions } => {
-            assert_eq!(decisions.len(), checks.len());
+        BatchDecisionView::Allowed { allowances } => {
+            assert_eq!(allowances.len(), checks.len());
             println!("request admitted");
         }
         BatchDecisionView::Denied {
             index,
             denial: DenialView::QuotaExceeded(quota),
+            ..
         } => {
             let seconds = quota.retry_after().seconds();
             println!("check {index} denied; retry after {seconds} seconds");
@@ -102,6 +103,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         BatchDecisionView::Denied {
             index,
             denial: DenialView::StorageCapacity { .. },
+            ..
         } => println!("check {index} denied; backend storage is full"),
         BatchDecisionView::ShadowDenied { index, .. } => {
             println!("request admitted after check {index} was shadow denied");
@@ -133,13 +135,11 @@ use runlimit_core::{Decision, DecisionView, DenialView};
 
 fn describe(decision: &Decision) -> String {
     match decision.view() {
-        DecisionView::Allowed {
-            capacity,
-            available,
-            ..
-        } => {
-            format!("admitted; {available} of {capacity} left")
-        }
+        DecisionView::Allowed { allowance } => format!(
+            "admitted; {} of {} left",
+            allowance.available(),
+            allowance.capacity(),
+        ),
         DecisionView::ShadowDenied { denial } => format!(
             "admitted; quota of {} would have denied for {}s",
             denial.capacity(),
@@ -160,9 +160,10 @@ fn describe(decision: &Decision) -> String {
 
 This example is exercised in `crates/runlimit-core/tests/readme_decision_model.rs`.
 
-Decision constructors validate capacity and available quota. Only a validated
-`QuotaDenial` can be shadowed, and allowed batches reject denied members.
-Serialization does not perform further metadata validation.
+Every outcome carries a validated value type. `Allowance` validates capacity
+and available quota where it is constructed, only a validated `QuotaDenial` can
+be shadowed, and an allowed batch is a `Vec<Allowance>`, so a denied member is
+not representable. Serialization does not perform further metadata validation.
 
 Retry durations are `RetryAfter` values. `RetryAfter::seconds()` rounds up to
 the whole seconds an HTTP `Retry-After` header needs, and
@@ -170,9 +171,14 @@ the whole seconds an HTTP `Retry-After` header needs, and
 always has one; a storage-capacity denial reports one only when the backend
 knows its earliest expiry.
 
-Use `permits_request()` for admission and `would_deny()` for observability.
-Match `DecisionView::Allowed` when allowance metadata is needed; there are no
-optional accessors that answer for every outcome at once.
+`permits_request()` is the only boolean admission predicate: it is true for
+allowed and shadow-denied decisions and false for every enforced denial. When
+the outcome itself is needed, `Decision::admit()` splits a decision into the
+`Admitted` value a handler may proceed with or the `Denial` it must enforce;
+`Admitted` cannot hold an enforced denial, so code that receives one never
+re-checks enforcement. Everything else, including telemetry that distinguishes
+shadow denials from allowances, matches `view()`. There are no optional
+accessors that answer for every outcome at once.
 
 ## Generic backend API
 
@@ -213,10 +219,19 @@ trusted metadata, enforced denials, and backend failures.
 
 The adapter does not interpret `Forwarded`, `X-Forwarded-For`, `ConnectInfo`,
 cookies, or application identities. Establish trust and normalize identities
-at the application boundary, then return an opaque `SubjectKey`. Allowed and
-shadow-denied decisions are inserted into request extensions for downstream
-handlers. Enforced quota and capacity denials short-circuit before the inner
-service is called or the request body is consumed.
+at the application boundary, then return an opaque `SubjectKey`.
+
+The rejection mapper receives an exhaustive `RateLimitRejection`: a key
+extraction error, an enforced `Denial`, or a backend error. Allowed and
+shadow-denied outcomes never reach it. Enforced quota and capacity denials
+short-circuit before the inner service is called or the request body is
+consumed.
+
+Admitted requests carry an `Admissions` request extension. Every layer the
+request passed through appends an `Admission` naming its policy and the
+`Admitted` outcome, so stacking a client gate and an identity gate keeps both
+decisions. Read it with `Extension<Admissions>` and look up a layer's outcome
+with `admissions.get(&policy)`.
 
 ## HTTP response metadata
 
@@ -232,6 +247,14 @@ which policies an application should disclose. Policy periods advertised in
 rounded up. Encoding also rejects quota values outside RFC 9651's Structured
 Field integer range.
 
+Axum's admitted and rejected values remain narrower than `Decision`, so
+middleware cannot accidentally enforce a shadow denial. Convert them only at
+the HTTP-metadata boundary: use `Decision::from(admission.decision())` for an
+`Admission`, or `Decision::denied(denial)` inside the rejection mapper, then
+pass the resulting decision to `draft_11::service_limit`. A storage-capacity
+denial has no quota service metadata, so `service_limit` returns
+`EncodingError::UnsupportedDecision` for it.
+
 ## Optional Serde support
 
 The core and storage backend crates have an opt-in `serde` feature. Enabling it
@@ -244,10 +267,11 @@ runlimit-memory = { version = "0.3.0", features = ["serde"] }
 
 The feature serializes validated policy and scope identifiers as strings;
 fixed-window and GCRA policies without their derived fingerprints; quota mode;
-tagged `Decision`/`Denial`/`BatchDecision` values; and backend configuration
-values. `MemoryStoreStats` is also serializable for telemetry. Durations retain
-their exact seconds and nanoseconds. Deserialization rejects unknown fields
-and values that violate Runlimit's constructors or decision invariants.
+`Allowance`; tagged `Decision`/`Denial`/`BatchDecision` values; and backend
+configuration values. `MemoryStoreStats` is also serializable for telemetry.
+Durations retain their exact seconds and nanoseconds. Deserialization rejects
+unknown fields and values that violate Runlimit's constructors or decision
+invariants.
 
 `SubjectKey`, `CounterKey`, `PolicyFingerprint`, `KeyHasher`, and live backend
 instances deliberately do not implement Serde traits. Keep opaque storage keys
@@ -262,6 +286,10 @@ as calendar minutes.
 
 - Denied checks do not consume quota.
 - A batch is all-or-nothing and allowed decisions retain input order.
+- Every check in a batch uses the same quota mode. A mixed enforced/shadow
+  batch is rejected before backend work begins.
+- A denied batch names the failing input index and the batch size. The index
+  is validated below the size at construction and on deserialization.
 - Duplicate storage keys in a batch are rejected as caller errors.
 - The policy identifier, scope, limit, and window are fingerprinted into the
   storage key. Changing any of them starts an independent counter instead of
@@ -322,10 +350,11 @@ only.
 ## Shadow mode
 
 Use `with_quota_mode(QuotaMode::Shadow)` to warm and observe a policy before
-enforcing it. Quota exhaustion then returns a shadow-denied decision for which
-`permits_request()` is true and `would_deny()` is also true. A shadow denial
-does not consume quota. Storage-capacity denials and backend errors always
-remain fail-closed.
+enforcing it. Quota exhaustion then returns a shadow-denied decision:
+`permits_request()` is true, `admit()` returns an `Admitted` value, and
+`view()` reports `DecisionView::ShadowDenied` with the quota details that
+enforcement would have applied. A shadow denial does not consume quota.
+Storage-capacity denials and backend errors always remain fail-closed.
 
 Quota mode is deliberately excluded from the policy fingerprint, so switching
 a warmed policy to enforcement keeps its counter state. Atomic batches reject
@@ -337,7 +366,10 @@ nothing.
 `MemoryStore`, `GcraStore`, and `PostgresLimiter` accept an optional
 `runlimit_core::Observer`. Admission observations classify outcome, quota
 consumption certainty, and elapsed time; cleanup observations report bounded
-work. The memory stores also report per-shard capacity headroom. Observations
+work. `Observation`, `AdmissionOperation`, `AdmissionOutcome`, and
+`ConsumptionStatus` are exhaustive enums, so an observer that maps outcomes to
+metrics names every variant and a new outcome is a compile error rather than
+a silently unmetered wildcard arm. The memory stores also report per-shard capacity headroom. Observations
 intentionally omit subject keys, backend error text, and other sensitive
 high-cardinality values. When relevant to a single check, admission observations
 include the policy fingerprint alongside its policy and scope identifiers.

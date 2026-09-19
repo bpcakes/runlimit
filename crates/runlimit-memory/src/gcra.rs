@@ -5,7 +5,7 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionObservation, BatchDecision, CapacityObservation, Check, CleanupObservation,
+    AdmissionObservation, Allowance, BatchDecision, CapacityObservation, Check, CleanupObservation,
     ConsumptionStatus, CounterKey, Decision, Denial, GcraPolicy, Limiter, Observation, Observer,
     QuotaDenial, QuotaMode, observe_safely, validate_batch,
 };
@@ -72,7 +72,7 @@ impl Shard<Entry> {
         }))
     }
 
-    fn consume(&mut self, check: &PreparedCheck, allowance: PendingAllowance) -> Decision {
+    fn consume(&mut self, check: &PreparedCheck, allowance: PendingAllowance) -> Allowance {
         self.replace(
             check.counter_key,
             Entry {
@@ -81,7 +81,7 @@ impl Shard<Entry> {
             allowance.expires_at_millis,
         );
 
-        Decision::allowed(
+        Allowance::new(
             check.burst_capacity,
             allowance.available,
             allowance.replenishes_after,
@@ -254,7 +254,7 @@ impl<C: Clock> GcraStore<C> {
                             .map(duration_from_millis),
                     ))
                 } else {
-                    shard.consume(&prepared, allowance)
+                    Decision::allowed(shard.consume(&prepared, allowance))
                 }
             }
             QuotaEvaluation::Denied(denial) => {
@@ -382,9 +382,9 @@ impl<C: Clock> GcraStore<C> {
                 QuotaEvaluation::Allowed(allowance) => allowance,
                 QuotaEvaluation::Denied(denial) => {
                     let value = if check.quota_mode == QuotaMode::Shadow {
-                        BatchDecision::shadow_denied(check.input_index, denial)
+                        BatchDecision::shadow_denied(check.input_index, checks.len(), denial)
                     } else {
-                        BatchDecision::denied(check.input_index, denial)
+                        BatchDecision::denied(check.input_index, checks.len(), denial)
                     };
                     return Ok(Evaluation {
                         value,
@@ -399,6 +399,7 @@ impl<C: Clock> GcraStore<C> {
                     return Ok(Evaluation {
                         value: BatchDecision::denied(
                             check.input_index,
+                            checks.len(),
                             Denial::storage_capacity(
                                 shard
                                     .capacity_retry_after_millis(now_millis)
@@ -413,16 +414,16 @@ impl<C: Clock> GcraStore<C> {
             allowances.push(allowance);
         }
 
-        let mut decisions = Vec::with_capacity(prepared.len());
+        let mut consumed = Vec::with_capacity(prepared.len());
         for (check, allowance) in prepared.iter().zip(allowances) {
-            decisions.push(
+            consumed.push(
                 locked_shards[check.shard_position]
                     .1
                     .consume(check, allowance),
             );
         }
         Ok(Evaluation {
-            value: BatchDecision::allowed(decisions),
+            value: BatchDecision::allowed(consumed),
             effect: collect_shard_effects(&locked_shards, &cleanup_effects),
         })
     }
@@ -534,7 +535,7 @@ mod tests {
     };
 
     use runlimit_core::{
-        AdmissionOperation, AdmissionOutcome, BatchDecision, BatchDecisionView, Check,
+        AdmissionOperation, AdmissionOutcome, Allowance, BatchDecision, BatchDecisionView, Check,
         ConsumptionStatus, Decision, DecisionView, DenialView, GcraPolicy, MAX_LIMIT, Observation,
         Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
     };
@@ -620,21 +621,20 @@ mod tests {
     }
 
     impl RecordedObservation {
-        fn from_observation(observation: &Observation<'_>) -> Option<Self> {
+        fn from_observation(observation: &Observation<'_>) -> Self {
             match observation {
-                Observation::Admission(admission) => Some(Self::Admission {
+                Observation::Admission(admission) => Self::Admission {
                     outcome: admission.outcome(),
                     consumption: admission.consumption(),
-                }),
-                Observation::Cleanup(cleanup) => Some(Self::Cleanup {
+                },
+                Observation::Cleanup(cleanup) => Self::Cleanup {
                     removed: cleanup.removed(),
-                }),
-                Observation::Capacity(capacity) => Some(Self::Capacity {
+                },
+                Observation::Capacity(capacity) => Self::Capacity {
                     used: capacity.used(),
                     capacity: capacity.capacity(),
                     shard_index: capacity.shard_index(),
-                }),
-                _ => None,
+                },
             }
         }
     }
@@ -657,13 +657,10 @@ mod tests {
 
     impl Observer for RecordingObserver {
         fn observe(&self, observation: &Observation<'_>) {
-            let Some(recorded) = RecordedObservation::from_observation(observation) else {
-                return;
-            };
             self.observations
                 .lock()
                 .expect("recording observer mutex remains healthy")
-                .push(recorded);
+                .push(RecordedObservation::from_observation(observation));
         }
     }
 
@@ -715,12 +712,10 @@ mod tests {
                     .stats()
                     .expect("observer runs after shard locks release");
             }
-            if let Some(recorded) = RecordedObservation::from_observation(observation) {
-                self.observations
-                    .lock()
-                    .expect("reentrant observer observations mutex remains healthy")
-                    .push(recorded);
-            }
+            self.observations
+                .lock()
+                .expect("reentrant observer observations mutex remains healthy")
+                .push(RecordedObservation::from_observation(observation));
         }
     }
 
@@ -763,12 +758,12 @@ mod tests {
             }
 
             self.tokens_scaled -= requested;
-            Decision::allowed(
+            Decision::allowed(Allowance::new(
                 self.capacity,
                 u64::try_from(self.tokens_scaled / self.period_millis)
                     .expect("reference availability fits the configured capacity"),
                 reference_duration(reference_div_ceil(maximum - self.tokens_scaled, self.quota)),
-            )
+            ))
         }
     }
 
@@ -844,7 +839,11 @@ mod tests {
 
         assert_eq!(
             store.check(&Check::with_cost(&policy, subject, 4).unwrap()),
-            Ok(Decision::allowed(4, 0, Duration::from_millis(14)))
+            Ok(Decision::allowed(Allowance::new(
+                4,
+                0,
+                Duration::from_millis(14)
+            )))
         );
         clock.set(Duration::from_millis(3));
         assert_eq!(
@@ -854,7 +853,11 @@ mod tests {
         clock.set(Duration::from_millis(4));
         assert_eq!(
             store.check(&Check::new(&policy, subject)),
-            Ok(Decision::allowed(4, 0, Duration::from_millis(13)))
+            Ok(Decision::allowed(Allowance::new(
+                4,
+                0,
+                Duration::from_millis(13)
+            )))
         );
     }
 
@@ -867,7 +870,11 @@ mod tests {
 
         assert_eq!(
             store.check(&Check::with_cost(&policy, subject, 12).unwrap()),
-            Ok(Decision::allowed(12, 0, Duration::from_millis(2)))
+            Ok(Decision::allowed(Allowance::new(
+                12,
+                0,
+                Duration::from_millis(2)
+            )))
         );
         assert_eq!(
             store.check(&Check::new(&policy, subject)),
@@ -876,7 +883,11 @@ mod tests {
         clock.set(Duration::from_millis(1));
         assert_eq!(
             store.check(&Check::with_cost(&policy, subject, 10).unwrap()),
-            Ok(Decision::allowed(12, 0, Duration::from_millis(2)))
+            Ok(Decision::allowed(Allowance::new(
+                12,
+                0,
+                Duration::from_millis(2)
+            )))
         );
     }
 
@@ -889,11 +900,19 @@ mod tests {
 
         assert_eq!(
             store.check(&check),
-            Ok(Decision::allowed(4, 1, Duration::from_millis(1_500)))
+            Ok(Decision::allowed(Allowance::new(
+                4,
+                1,
+                Duration::from_millis(1_500)
+            )))
         );
         assert_eq!(
             store.check(&Check::new(&policy, subject(1))),
-            Ok(Decision::allowed(4, 0, Duration::from_secs(2)))
+            Ok(Decision::allowed(Allowance::new(
+                4,
+                0,
+                Duration::from_secs(2)
+            )))
         );
         assert_eq!(
             store.check(&Check::new(&policy, subject(1))),
@@ -908,13 +927,21 @@ mod tests {
         clock.advance(Duration::from_millis(1));
         assert_eq!(
             store.check(&Check::new(&policy, subject(1))),
-            Ok(Decision::allowed(4, 0, Duration::from_secs(2)))
+            Ok(Decision::allowed(Allowance::new(
+                4,
+                0,
+                Duration::from_secs(2)
+            )))
         );
 
         clock.advance(Duration::from_secs(2));
         assert_eq!(
             store.check(&Check::new(&policy, subject(1))),
-            Ok(Decision::allowed(4, 3, Duration::from_millis(500)))
+            Ok(Decision::allowed(Allowance::new(
+                4,
+                3,
+                Duration::from_millis(500)
+            )))
         );
     }
 
@@ -953,10 +980,10 @@ mod tests {
             );
         }
         assert!(
-            store
+            !store
                 .check(&Check::new(&policy, subject(4)))
                 .unwrap()
-                .is_enforced_denial()
+                .permits_request()
         );
 
         clock.advance(Duration::from_millis(10));
@@ -1005,7 +1032,7 @@ mod tests {
         assert_eq!(
             decisions
                 .iter()
-                .filter(|decision| !decision.would_deny())
+                .filter(|decision| matches!(decision.view(), DecisionView::Allowed { .. }))
                 .count(),
             BURST
         );
@@ -1040,8 +1067,8 @@ mod tests {
         assert_eq!(
             store.check_all(&checks),
             Ok(BatchDecision::allowed(vec![
-                Decision::allowed(5, 2, Duration::from_millis(8)),
-                Decision::allowed(3, 1, Duration::from_millis(20)),
+                Allowance::new(5, 2, Duration::from_millis(8)),
+                Allowance::new(3, 1, Duration::from_millis(20)),
             ]))
         );
     }
@@ -1060,8 +1087,9 @@ mod tests {
             result.view(),
             BatchDecisionView::Denied {
                 index: 1,
+                batch_size,
                 denial: DenialView::QuotaExceeded(_),
-            }
+            } if batch_size.get() == 2
         ));
         assert!(
             store.check(&earlier).unwrap().permits_request(),
@@ -1085,8 +1113,9 @@ mod tests {
             result.view(),
             BatchDecisionView::Denied {
                 index: 1,
+                batch_size,
                 denial: DenialView::StorageCapacity { .. },
-            }
+            } if batch_size.get() == 2
         ));
         assert!(
             store.check(&earlier).unwrap().permits_request(),
@@ -1130,7 +1159,11 @@ mod tests {
         let result = store.check_all(&[first, second]).unwrap();
         assert!(matches!(
             result.view(),
-            BatchDecisionView::ShadowDenied { index: 0, .. }
+            BatchDecisionView::ShadowDenied {
+                index: 0,
+                batch_size,
+                ..
+            } if batch_size.get() == 2
         ));
         assert!(
             store.check(&second).unwrap().permits_request(),
@@ -1193,7 +1226,7 @@ mod tests {
             Check::new(&policy, subject_for_shard(0)),
         ];
 
-        assert!(!store.check_all(&checks).unwrap().would_deny());
+        assert!(store.check_all(&checks).unwrap().try_into_allowed().is_ok());
         assert_eq!(
             *observer
                 .observations

@@ -5,14 +5,20 @@
 //!
 //! - a synchronous [`ExtractSubjectKey`] implementation that derives an opaque
 //!   [`runlimit_core::SubjectKey`] from the request; and
-//! - a rejection mapper that converts extraction failures, enforced decisions,
+//! - a rejection mapper that converts extraction failures, enforced denials,
 //!   and backend failures into an Axum [`Response`].
 //!
 //! This crate never interprets forwarding headers, connection metadata, or
 //! application identities. It also does not select response status codes,
-//! bodies, or headers. A shadow denial permits the request and is available to
-//! downstream code as a [`runlimit_core::Decision`] request extension, just
-//! like an allowed decision.
+//! bodies, or headers.
+//!
+//! Every admitted request carries an [`Admissions`] request extension. Each
+//! layer the request passed through appends one [`Admission`] naming its
+//! policy and the [`runlimit_core::Admitted`] outcome, so stacking a client
+//! gate and an identity gate loses neither decision. A shadow denial is
+//! admitted and recorded just like an allowance; an enforced denial never
+//! reaches the extension because it is handed to the rejection mapper as a
+//! [`runlimit_core::Denial`].
 
 use std::{
     any::type_name,
@@ -26,7 +32,10 @@ use std::{
 };
 
 use axum::{extract::Request, response::Response};
-use runlimit_core::{Check, Decision, Limiter, SubjectKey};
+use runlimit_core::{
+    Admitted, Check, Denial, Limiter, PolicyFingerprint, PolicyId, RateLimitPolicy, ScopeId,
+    SubjectKey,
+};
 use tower::{Layer, Service};
 
 /// A synchronous, application-owned request-to-subject-key boundary.
@@ -76,12 +85,17 @@ where
 /// This type deliberately does not implement `IntoResponse`: the application
 /// controls its status, response body, headers, and operational-failure
 /// policy.
-#[non_exhaustive]
+///
+/// The enum is exhaustive. A mapper names every variant, so a new rejection
+/// category is a compile error in every application instead of landing in
+/// whatever response a wildcard arm returns. The denied variant carries a
+/// [`Denial`] rather than a full decision: an allowed or shadow-denied
+/// outcome is never rejected, so the mapper never handles one.
 pub enum RateLimitRejection<KeyError, BackendError> {
     /// The application-owned key extractor rejected the request.
     Key(KeyError),
     /// The backend returned an enforced quota or storage-capacity denial.
-    Denied(Decision),
+    Denied(Denial),
     /// The backend could not complete the admission check.
     Backend(BackendError),
 }
@@ -116,6 +130,123 @@ pub enum RejectionKind {
     Denied,
     /// The limiter backend failed.
     Backend,
+}
+
+/// One layer's admitted decision, keyed by the policy it evaluated.
+///
+/// The policy is identified by its identifier, scope, and storage fingerprint
+/// rather than by a clone of the policy value, so admissions from layers with
+/// different policy types share one collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Admission {
+    policy_id: PolicyId,
+    scope_id: ScopeId,
+    fingerprint: PolicyFingerprint,
+    decision: Admitted,
+}
+
+impl Admission {
+    /// Records an admitted decision for the policy that produced it.
+    pub fn new<P: RateLimitPolicy + ?Sized>(policy: &P, decision: Admitted) -> Self {
+        Self {
+            policy_id: policy.id().clone(),
+            scope_id: policy.scope().clone(),
+            fingerprint: policy.fingerprint(),
+            decision,
+        }
+    }
+
+    /// Returns the evaluated policy's identifier.
+    pub const fn policy_id(&self) -> &PolicyId {
+        &self.policy_id
+    }
+
+    /// Returns the evaluated policy's scope.
+    pub const fn scope_id(&self) -> &ScopeId {
+        &self.scope_id
+    }
+
+    /// Returns the evaluated policy's storage configuration fingerprint.
+    pub const fn policy_fingerprint(&self) -> PolicyFingerprint {
+        self.fingerprint
+    }
+
+    /// Returns the admitted decision.
+    pub const fn decision(&self) -> Admitted {
+        self.decision
+    }
+
+    fn is_for<P: RateLimitPolicy + ?Sized>(&self, policy: &P) -> bool {
+        self.policy_id == *policy.id()
+            && self.scope_id == *policy.scope()
+            && self.fingerprint == policy.fingerprint()
+    }
+}
+
+/// The admitted decisions of every [`RateLimitLayer`] a request passed.
+///
+/// Each layer appends its [`Admission`] before calling the wrapped service,
+/// so the collection lists layers in evaluation order: the outermost layer's
+/// admission first. Handlers read it as an `Extension<Admissions>` extractor
+/// or from `Request::extensions`. A rejected request never carries one.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Admissions {
+    entries: Vec<Admission>,
+}
+
+impl Admissions {
+    /// Creates an empty collection.
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Appends the admission of one more layer.
+    pub fn push(&mut self, admission: Admission) {
+        self.entries.push(admission);
+    }
+
+    /// Returns the admission recorded for `policy`, when a layer evaluated it.
+    ///
+    /// A policy matches by identifier, scope, and storage fingerprint. If
+    /// several layers evaluated the same policy, the outermost layer's
+    /// admission is returned; iterate the collection to see every entry.
+    pub fn get<P: RateLimitPolicy + ?Sized>(&self, policy: &P) -> Option<&Admission> {
+        self.entries.iter().find(|entry| entry.is_for(policy))
+    }
+
+    /// Iterates admissions in evaluation order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &Admission> + '_ {
+        self.entries.iter()
+    }
+
+    /// Returns the number of layers that admitted the request.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether no layer has recorded an admission.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a Admissions {
+    type Item = &'a Admission;
+    type IntoIter = std::slice::Iter<'a, Admission>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
+impl From<Admission> for Admissions {
+    fn from(admission: Admission) -> Self {
+        Self {
+            entries: vec![admission],
+        }
+    }
 }
 
 /// A Tower layer that performs one Runlimit admission check per request.
@@ -308,11 +439,20 @@ where
                     }
                 };
 
-                if decision.is_enforced_denial() {
-                    return Ok(rejection_mapper(RateLimitRejection::Denied(decision)));
-                }
+                let admitted = match decision.admit() {
+                    Ok(admitted) => admitted,
+                    Err(denial) => {
+                        return Ok(rejection_mapper(RateLimitRejection::Denied(denial)));
+                    }
+                };
 
-                request.extensions_mut().insert(decision);
+                let admission = Admission::new(policy.as_ref(), admitted);
+                match request.extensions_mut().get_mut::<Admissions>() {
+                    Some(admissions) => admissions.push(admission),
+                    None => {
+                        request.extensions_mut().insert(Admissions::from(admission));
+                    }
+                }
                 ready_inner.call(request).await
             }),
         }
