@@ -2323,10 +2323,10 @@ ORDER BY input.input_position
         deleted_rows += delete_counter(&pool, check.policy(), check.subject()).await;
     }
 
-    let allowances = result
-        .expect("set-based batch succeeds")
-        .try_into_allowed()
-        .expect("fresh counters must all be allowed");
+    let batch_decision = result.expect("set-based batch succeeds");
+    let BatchDecisionView::Allowed { allowances } = batch_decision.view() else {
+        panic!("fresh counters must all be allowed: {batch_decision:?}");
+    };
     assert_eq!(allowances.len(), checks.len());
     for (allowance, check) in allowances.iter().zip(&checks) {
         assert_eq!(allowance.capacity(), check.policy().limit());
@@ -2429,9 +2429,9 @@ async fn opposite_order_batches_across_pools_do_not_deadlock_or_over_admit() {
             let outcome = outcome
                 .expect("contending batch task does not panic")
                 .expect("opposite-order batch completes before its deadline");
-            let allowances = outcome
-                .try_into_allowed()
-                .expect("capacity permits every contending batch");
+            let BatchDecisionView::Allowed { allowances } = outcome.view() else {
+                panic!("capacity permits every contending batch: {outcome:?}");
+            };
             assert_eq!(allowances.len(), 2);
         }
     }

@@ -8,7 +8,8 @@ use std::{
 };
 
 use runlimit_core::{
-    Check, DecisionView, FixedWindowPolicy, GcraPolicy, Limiter, PolicyId, ScopeId, SubjectKey,
+    BatchDecisionView, Check, DecisionView, FixedWindowPolicy, GcraPolicy, Limiter, PolicyId,
+    ScopeId, SubjectKey,
 };
 use runlimit_memory::{Clock, GcraStore, MemoryStore, MemoryStoreConfig};
 
@@ -35,18 +36,20 @@ fn assert_lazy<L: Limiter>(limiter: &L, check: &Check<'_, L::Policy>, batch: boo
         drop(limiter.check(check));
     }
 
-    let first = if batch {
-        poll_ready(limiter.check_all(checks))
-            .unwrap()
-            .try_into_single_decision()
-            .unwrap()
+    let first_allowance = if batch {
+        match poll_ready(limiter.check_all(checks)).unwrap().view() {
+            BatchDecisionView::Allowed {
+                allowances: [allowance],
+            } => *allowance,
+            other => panic!("the first one-check batch is allowed: {other:?}"),
+        }
     } else {
-        poll_ready(limiter.check(check)).unwrap()
+        match poll_ready(limiter.check(check)).unwrap().view() {
+            DecisionView::Allowed { allowance } => allowance,
+            other => panic!("the first check is allowed: {other:?}"),
+        }
     };
-    assert!(matches!(
-        first.view(),
-        DecisionView::Allowed { allowance } if allowance.available() == 0
-    ));
+    assert_eq!(first_allowance.available(), 0);
     assert!(!poll_ready(limiter.check(check)).unwrap().permits_request());
 }
 

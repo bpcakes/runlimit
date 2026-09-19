@@ -359,17 +359,20 @@ impl CleanupObservation {
     }
 }
 
-/// Local capacity use reported by a bounded backend.
+/// Local capacity use reported by one shard of a bounded backend.
+///
+/// Every bounded backend that reports capacity is sharded, so the shard index
+/// is always present and an observer never handles a missing one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapacityObservation {
     used: u64,
     capacity: u64,
-    shard_index: Option<usize>,
+    shard_index: usize,
 }
 
 impl CapacityObservation {
-    /// Constructs capacity metadata.
-    pub const fn new(used: u64, capacity: u64, shard_index: Option<usize>) -> Self {
+    /// Constructs capacity metadata for one shard.
+    pub const fn new(used: u64, capacity: u64, shard_index: usize) -> Self {
         Self {
             used,
             capacity,
@@ -392,8 +395,8 @@ impl CapacityObservation {
         self.capacity.saturating_sub(self.used)
     }
 
-    /// Returns the backend-local shard index, when applicable.
-    pub const fn shard_index(self) -> Option<usize> {
+    /// Returns the backend-local shard index.
+    pub const fn shard_index(self) -> usize {
         self.shard_index
     }
 }

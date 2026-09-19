@@ -533,7 +533,7 @@ impl<C: Clock> GcraStore<C> {
             &Observation::Capacity(CapacityObservation::new(
                 usize_to_u64(effect.used),
                 usize_to_u64(effect.capacity),
-                Some(effect.shard_index),
+                effect.shard_index,
             )),
         );
     }
@@ -689,7 +689,7 @@ mod tests {
         Capacity {
             used: u64,
             capacity: u64,
-            shard_index: Option<usize>,
+            shard_index: usize,
         },
     }
 
@@ -1285,7 +1285,10 @@ mod tests {
             Check::new(subject_for_shard(0).bind(&policy)),
         ];
 
-        assert!(store.check_all(&checks).unwrap().try_into_allowed().is_ok());
+        assert!(matches!(
+            store.check_all(&checks).unwrap().view(),
+            BatchDecisionView::Allowed { .. }
+        ));
         assert_eq!(
             *observer
                 .observations
@@ -1298,7 +1301,7 @@ mod tests {
                 RecordedObservation::Capacity {
                     used: 1,
                     capacity: 1,
-                    shard_index: Some(0),
+                    shard_index: 0,
                 },
                 RecordedObservation::Cleanup {
                     outcome: CleanupOutcome::Confirmed { removed: 0 },
@@ -1306,7 +1309,7 @@ mod tests {
                 RecordedObservation::Capacity {
                     used: 1,
                     capacity: 1,
-                    shard_index: Some(1),
+                    shard_index: 1,
                 },
                 RecordedObservation::Admission {
                     outcome: AdmissionOutcome::Allowed,

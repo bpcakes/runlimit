@@ -254,7 +254,7 @@ impl<C: Clock> MemoryStore<C> {
             &Observation::Capacity(CapacityObservation::new(
                 usize_to_u64(effect.used),
                 usize_to_u64(effect.capacity),
-                Some(effect.shard_index),
+                effect.shard_index,
             )),
         );
     }
@@ -657,6 +657,27 @@ mod tests {
 
     fn allowance(capacity_value: u64, available: u64, replenishes_after: Duration) -> Allowance {
         Allowance::new(capacity(capacity_value), available, replenishes_after).unwrap()
+    }
+
+    /// Shapes a one-check batch into the decision its single check would have
+    /// produced, so the single and batch paths can be compared exactly.
+    fn single_decision(batch: &BatchDecision) -> Decision {
+        match batch.view() {
+            BatchDecisionView::Allowed {
+                allowances: [allowance],
+            } => Decision::allowed(*allowance),
+            BatchDecisionView::Denied {
+                index: 0,
+                batch_size,
+                denial,
+            } if batch_size.get() == 1 => Decision::denied(denial),
+            BatchDecisionView::ShadowDenied {
+                index: 0,
+                batch_size,
+                denial,
+            } if batch_size.get() == 1 => Decision::shadow_denied(denial),
+            other => panic!("a one-check batch yields exactly one decision: {other:?}"),
+        }
     }
 
     fn storage_capacity(retry_after: Option<Duration>) -> Denial {
@@ -1296,11 +1317,8 @@ mod tests {
                 .unwrap();
 
             let single = single_store.check(&check).unwrap();
-            let batch = batch_store
-                .check_all(std::slice::from_ref(&check))
-                .unwrap()
-                .try_into_single_decision()
-                .expect("a one-element batch returns one decision");
+            let batch =
+                single_decision(&batch_store.check_all(std::slice::from_ref(&check)).unwrap());
 
             assert_eq!(single, batch, "step {index}");
             assert_eq!(single, step.expected, "step {index}");
@@ -1701,11 +1719,7 @@ mod tests {
             clock.advance(Duration::from_millis(2));
 
             let decision = if use_batch {
-                store
-                    .check_all(std::slice::from_ref(&target))
-                    .unwrap()
-                    .try_into_single_decision()
-                    .expect("a one-element batch returns one decision")
+                single_decision(&store.check_all(std::slice::from_ref(&target)).unwrap())
             } else {
                 store.check(&target).unwrap()
             };

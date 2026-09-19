@@ -3,8 +3,8 @@
 use std::{fmt::Debug, time::Duration};
 
 use runlimit_core::{
-    Allowance, BatchDecision, BatchError, Check, Decision, FixedWindowPolicy, Limiter, PolicyId,
-    ScopeId, SubjectKey,
+    Allowance, BatchDecision, BatchDecisionView, BatchError, Check, Decision, FixedWindowPolicy,
+    Limiter, PolicyId, ScopeId, SubjectKey,
 };
 use runlimit_memory::{MemoryBatchError, MemoryStore, MemoryStoreConfig};
 use runlimit_postgres::{BatchCheckError, PostgresLimiter};
@@ -44,10 +44,10 @@ fn key(byte: u8) -> SubjectKey {
 }
 
 fn expect_allowed<E: Debug>(result: Result<BatchDecision, E>) -> Vec<Allowance> {
-    result
-        .expect("generic limiter call succeeds")
-        .try_into_allowed()
-        .expect("generic limiter call should be allowed")
+    match result.expect("generic limiter call succeeds").view() {
+        BatchDecisionView::Allowed { allowances } => allowances.to_vec(),
+        denied => panic!("generic limiter call should be allowed: {denied:?}"),
+    }
 }
 
 #[tokio::test]

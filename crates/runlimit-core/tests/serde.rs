@@ -494,6 +494,5 @@ fn batch_denials_reject_indices_outside_the_batch_size() {
             BatchDecisionView::Denied { index: 1, .. }
                 | BatchDecisionView::ShadowDenied { index: 1, .. }
         ));
-        assert!(accepted.try_into_single_decision().is_err());
     }
 }

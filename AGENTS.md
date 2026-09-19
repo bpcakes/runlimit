@@ -60,9 +60,11 @@ deployments.
   `Observation`, `AdmissionOperation`, `AdmissionOutcome`, `ConsumptionStatus`,
   and `CleanupOutcome`, the adapter rejection `RateLimitRejection`, and the
   HTTP `QuotaState`. Do not add accessors that answer for several outcomes at
-  once with an `Option`; expose new metadata on the view variant it belongs
-  to, and encode header rules such as rounding up in types like `Delay`
-  rather than in documentation. `Delay` is the one type for every
+  once with an `Option`, and do not make a field optional that every producer
+  fills in: `CapacityObservation` always names its shard because every bounded
+  backend that reports capacity is sharded. Expose new metadata on the view
+  variant it belongs to, and encode header rules such as rounding up in types
+  like `Delay` rather than in documentation. `Delay` is the one type for every
   backend-measured duration that feeds a whole-second header field.
 - An error enum contains only variants its operation can produce. Single
   checks and batches have separate error types, `Limiter::CheckError` and
@@ -83,12 +85,16 @@ deployments.
 - `permits_request()` is the only boolean admission predicate on `Decision`
   and `BatchDecision`. Do not add sibling predicates such as `would_deny()`:
   a predicate that is true for shadow denials compiles cleanly as a rejection
-  guard and silently turns shadow mode into enforcement. `Decision::admit()`
-  is the typed split into `Admitted` or `Denial`; everything else goes through
-  `view()`. Types that can only hold a subset of outcomes use the narrower type:
-  an allowed batch is `Vec<Allowance>`, an adapter rejection carries `Denial`,
-  an admitted request carries `Admitted`, and the HTTP service-limit encoder
-  accepts only `QuotaState`, so a storage-capacity denial cannot reach it.
+  guard and silently turns shadow mode into enforcement. The same rule covers
+  fallible conversions: `BatchDecision` has no `try_into_allowed()`, whose
+  `is_ok()` was an `is_allowed()` predicate that is false for a shadow denial,
+  and no `try_into_single_decision()`, because every backend shapes a single
+  decision directly. `Decision::admit()` is the typed split into `Admitted` or
+  `Denial`; everything else goes through `view()`. Types that can only hold a
+  subset of outcomes use the narrower type: an allowed batch view is
+  `&[Allowance]`, an adapter rejection carries `Denial`, an admitted request
+  carries `Admitted`, and the HTTP service-limit encoder accepts only
+  `QuotaState`, so a storage-capacity denial cannot reach it.
 - HTTP adapters must record every stacked layer's admitted decision. A request
   that passes several `RateLimitLayer`s carries one `Admissions` extension
   with an `Admission` per layer in evaluation order; a layer must never

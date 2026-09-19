@@ -41,10 +41,10 @@ The format is based on [Keep a Changelog], and this project adheres to
   takes a `Capacity` and cannot fail, so `QuotaDenial::try_new` and
   `DecisionError::InvalidCapacity` are removed. `Decision::allowed` takes an
   `Allowance` and `Decision::try_allowed` is removed. `DecisionView::Allowed`
-  and `AdmittedView::Allowed` carry an `allowance` field,
-  `BatchDecisionView::Allowed` carries `allowances: &[Allowance]`, and
-  `try_into_allowed()` returns `Vec<Allowance>`. A denied member of an allowed
-  batch is no longer representable, so `BatchDecision::try_allowed` and
+  and `AdmittedView::Allowed` carry an `allowance` field, and
+  `BatchDecisionView::Allowed` carries `allowances: &[Allowance]`. A denied
+  member of an allowed batch is no longer representable, so
+  `BatchDecision::try_allowed` and
   `DecisionError::DeniedDecisionInAllowedBatch` are removed. The Serde
   `allowed` batch object carries `allowances`, a list of `Allowance` objects
   with `capacity`, `available`, and `replenishes_after`, instead of
@@ -56,8 +56,7 @@ The format is based on [Keep a Changelog], and this project adheres to
   take `(index, batch_size, denial)` and return
   `DecisionError::DeniedIndexOutOfRange` when `index` is not below
   `batch_size`. `BatchDecisionView::Denied` and `ShadowDenied` expose
-  `batch_size` as a `NonZeroUsize`, `try_into_single_decision` converts a
-  denial only when its batch size is one, and the Serde `denied` and
+  `batch_size` as a `NonZeroUsize`, and the Serde `denied` and
   `shadow_denied` batch objects gain a required `batch_size` field that
   deserialization validates the index against.
 - **Breaking:** empty batches are rejected. `validate_batch` and every
@@ -88,8 +87,11 @@ The format is based on [Keep a Changelog], and this project adheres to
   `available()`, `replenishes_after()`, `retry_after()`,
   `retry_after_seconds()`, `denial()`, and `quota_denial()`, and
   `BatchDecision::allowed_decisions()`, `denied_index()`, `denial()`, and
-  `quota_denial()`. Match `DecisionView` and `BatchDecisionView` instead;
-  `try_into_allowed()` and `try_into_single_decision()` remain. Shadow outcomes
+  `quota_denial()`, together with `BatchDecision::try_into_allowed()` and
+  `try_into_single_decision()`. Match `DecisionView` and `BatchDecisionView`
+  instead: `try_into_allowed().is_ok()` was an `is_allowed()` predicate that
+  is false for a shadow denial, and no backend converts a batch of one into a
+  single decision any more. Shadow outcomes
   store `QuotaDenial` directly, making shadowed storage-capacity denials
   unrepresentable internally, and the Serde `shadow_denied` object now parses
   only a `quota_exceeded` denial instead of parsing any denial and rejecting a
@@ -108,6 +110,9 @@ The format is based on [Keep a Changelog], and this project adheres to
   `confirmed`, `definitely_no_effect`, and `outcome_unknown` factories, and
   `CleanupObservation::outcome()` replaces `removed()` and `consumption()`,
   which had reused `ConsumptionStatus::Consumed` to mean "rows were deleted".
+  `CapacityObservation::new` takes and `shard_index()` returns a plain
+  `usize`: every backend that reports capacity is sharded, so the index was
+  never absent.
 - **Breaking:** `Observation`, `AdmissionOperation`, `AdmissionOutcome`, and
   `ConsumptionStatus` are no longer `#[non_exhaustive]`, and neither is any
   other public enum: `DecisionError`, `runlimit_postgres::CheckError`,

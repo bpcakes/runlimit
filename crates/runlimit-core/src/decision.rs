@@ -564,48 +564,11 @@ impl BatchDecision {
     ///
     /// This is the only boolean admission predicate. It is true for allowed
     /// and shadow-denied batches and false for every enforced denial. Match
-    /// [`BatchDecision::view`] for anything else.
+    /// [`BatchDecision::view`] for anything else. There is no fallible
+    /// conversion into the allowed allowances: its `is_ok()` would be an
+    /// `is_allowed()` predicate that is false for a shadow denial.
     pub const fn permits_request(&self) -> bool {
         !matches!(self.outcome, BatchOutcome::Denied { .. })
-    }
-
-    /// Consumes an allowed batch and returns its allowances in caller order.
-    ///
-    /// # Errors
-    ///
-    /// Returns the unchanged batch when it is an enforced or shadow denial.
-    pub fn try_into_allowed(self) -> Result<Vec<Allowance>, Self> {
-        match self.outcome {
-            BatchOutcome::Allowed(allowances) => Ok(allowances),
-            BatchOutcome::Denied { .. } | BatchOutcome::ShadowDenied { .. } => Err(self),
-        }
-    }
-
-    /// Converts a batch-of-one outcome into its single-check decision.
-    ///
-    /// Returns the original batch when it was not evaluated for exactly one
-    /// check: an allowed result with any other number of allowances, or a
-    /// denial whose batch size is not one.
-    ///
-    /// # Errors
-    ///
-    /// Returns the unchanged batch when it is not a batch-of-one result.
-    pub fn try_into_single_decision(self) -> Result<Decision, Self> {
-        match self.outcome {
-            BatchOutcome::Allowed(allowances) => match allowances.as_slice() {
-                [allowance] => Ok(Decision::allowed(*allowance)),
-                _ => Err(Self {
-                    outcome: BatchOutcome::Allowed(allowances),
-                }),
-            },
-            BatchOutcome::Denied {
-                batch_size, denial, ..
-            } if batch_size.get() == 1 => Ok(Decision::denied(denial)),
-            BatchOutcome::ShadowDenied {
-                batch_size, denial, ..
-            } if batch_size.get() == 1 => Ok(Decision::shadow_denied(denial)),
-            outcome => Err(Self { outcome }),
-        }
     }
 }
 
@@ -1055,50 +1018,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_of_one_converts_to_a_single_decision() {
-        let allowance = allowance(8, 7, Duration::from_mins(1));
-        let denied = quota(8, Duration::from_mins(1));
-
-        assert_eq!(
-            BatchDecision::allowed(vec![allowance])
-                .unwrap()
-                .try_into_single_decision(),
-            Ok(Decision::allowed(allowance))
-        );
-        assert_eq!(
-            BatchDecision::denied(0, 1, denied)
-                .unwrap()
-                .try_into_single_decision(),
-            Ok(Decision::denied(denied))
-        );
-    }
-
-    #[test]
-    fn malformed_batch_of_one_is_rejected() {
-        let allowance = allowance(8, 7, Duration::from_mins(1));
-        let denial = quota(8, Duration::from_mins(1));
-
-        assert_eq!(
-            BatchDecision::allowed(vec![allowance, allowance])
-                .unwrap()
-                .try_into_single_decision(),
-            Err(BatchDecision::allowed(vec![allowance, allowance]).unwrap())
-        );
-        assert!(
-            BatchDecision::denied(1, 2, denial)
-                .unwrap()
-                .try_into_single_decision()
-                .is_err()
-        );
-        assert!(
-            BatchDecision::denied(0, 2, denial)
-                .unwrap()
-                .try_into_single_decision()
-                .is_err()
-        );
-    }
-
-    #[test]
     fn allowed_batches_are_never_empty() {
         assert_eq!(
             BatchDecision::allowed(Vec::new()),
@@ -1136,21 +1055,6 @@ mod tests {
     }
 
     #[test]
-    fn allowed_batches_yield_their_allowances_in_caller_order() {
-        let first = allowance(8, 7, Duration::from_mins(1));
-        let second = allowance(4, 2, Duration::from_secs(30));
-        let shadow = BatchDecision::shadow_denied(0, 2, quota(8, Duration::from_secs(30))).unwrap();
-
-        assert_eq!(
-            BatchDecision::allowed(vec![first, second])
-                .unwrap()
-                .try_into_allowed(),
-            Ok(vec![first, second])
-        );
-        assert_eq!(shadow.clone().try_into_allowed(), Err(shadow));
-    }
-
-    #[test]
     fn shadow_denial_permits_the_request_without_claiming_consumption() {
         let denial = quota(8, Duration::from_millis(30_001));
         let decision = Decision::shadow_denied(denial);
@@ -1158,12 +1062,6 @@ mod tests {
         assert!(decision.permits_request());
         assert_eq!(decision.view(), DecisionView::ShadowDenied { denial });
         assert_eq!(denial.retry_after().seconds(), 31);
-        assert_eq!(
-            BatchDecision::shadow_denied(0, 1, denial)
-                .unwrap()
-                .try_into_single_decision(),
-            Ok(decision)
-        );
         assert!(
             BatchDecision::shadow_denied(0, 1, denial)
                 .unwrap()
@@ -1233,7 +1131,6 @@ mod tests {
                 denial: quota,
             }
         );
-        assert_eq!(shadow.clone().try_into_single_decision(), Err(shadow));
     }
 
     #[test]
