@@ -5,6 +5,11 @@ use thiserror::Error;
 
 use crate::{PolicyId, ScopeId};
 
+// These domain strings and the byte layouts in `fingerprint` and
+// `gcra_fingerprint` are persistent cross-replica protocols. Changing any byte
+// splits storage keys during rolling deployments. A deliberate incompatible
+// change therefore requires a new domain version and a semver-signaled storage
+// migration, never an in-place rewrite of either v1 encoding.
 const FIXED_WINDOW_FINGERPRINT_DOMAIN: &[u8] = b"runlimit/fixed-window-policy/v1\0";
 const GCRA_FINGERPRINT_DOMAIN: &[u8] = b"runlimit/gcra-policy/v1\0";
 const MAX_EXACT_DOUBLE_INTEGER: u64 = 1_u64 << f64::MANTISSA_DIGITS;
@@ -24,6 +29,150 @@ pub const MAX_WINDOW_MILLIS: u64 = MAX_EXACT_DOUBLE_INTEGER / 1_000;
 
 /// Largest policy duration supported by built-in policies.
 pub const MAX_WINDOW: Duration = Duration::from_millis(MAX_WINDOW_MILLIS);
+
+/// A validated quota or immediate capacity in the portable policy range.
+///
+/// A capacity is never zero and never exceeds [`MAX_LIMIT`], so every value
+/// fits the signed 64-bit counters used by persistent backends. Policies,
+/// allowances, and quota denials all carry a `Capacity`, which is why none of
+/// them re-validates the number at construction.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Capacity(NonZeroU64);
+
+impl Capacity {
+    /// The largest portable capacity, [`MAX_LIMIT`].
+    pub const MAX: Self = Self(NonZeroU64::new(MAX_LIMIT).expect("MAX_LIMIT is nonzero"));
+
+    /// Validates a capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapacityError::Zero`] for zero and [`CapacityError::TooLarge`]
+    /// for a value above [`MAX_LIMIT`].
+    pub const fn new(value: u64) -> Result<Self, CapacityError> {
+        match NonZeroU64::new(value) {
+            None => Err(CapacityError::Zero),
+            Some(_) if value > MAX_LIMIT => Err(CapacityError::TooLarge {
+                actual: value,
+                maximum: MAX_LIMIT,
+            }),
+            Some(value) => Ok(Self(value)),
+        }
+    }
+
+    /// Returns the capacity as a plain integer.
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for Capacity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl From<Capacity> for u64 {
+    fn from(capacity: Capacity) -> Self {
+        capacity.get()
+    }
+}
+
+/// An invalid quota or immediate capacity.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CapacityError {
+    /// The capacity was zero.
+    #[error("capacity must be greater than zero")]
+    Zero,
+    /// The capacity exceeded the portable backend maximum.
+    #[error("capacity {actual} exceeds portable maximum {maximum}")]
+    TooLarge {
+        /// Supplied capacity.
+        actual: u64,
+        /// Largest capacity supported by every backend.
+        maximum: u64,
+    },
+}
+
+/// A validated replenishment period.
+///
+/// A period is never zero, is an exact whole number of milliseconds, and never
+/// exceeds [`MAX_WINDOW`], so every backend can store it exactly. A
+/// fixed-window policy's window and a GCRA policy's period are both
+/// `QuotaPeriod` values.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct QuotaPeriod(NonZeroU64);
+
+impl QuotaPeriod {
+    /// The longest portable period, [`MAX_WINDOW`].
+    pub const MAX: Self = Self(NonZeroU64::new(MAX_WINDOW_MILLIS).expect("MAX_WINDOW is nonzero"));
+
+    /// Validates a replenishment period.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the period is zero, has finer precision than a
+    /// whole millisecond, or exceeds [`MAX_WINDOW`].
+    pub fn new(period: Duration) -> Result<Self, QuotaPeriodError> {
+        if period.is_zero() {
+            return Err(QuotaPeriodError::Zero);
+        }
+        if !period.subsec_nanos().is_multiple_of(1_000_000) {
+            return Err(QuotaPeriodError::NotWholeMilliseconds);
+        }
+        if period > MAX_WINDOW {
+            return Err(QuotaPeriodError::TooLarge {
+                actual: period,
+                maximum: MAX_WINDOW,
+            });
+        }
+
+        // Both conversions are guaranteed by the checks above; they are kept as
+        // errors rather than panics so this path never unwinds.
+        let millis = u64::try_from(period.as_millis()).map_err(|_| QuotaPeriodError::TooLarge {
+            actual: period,
+            maximum: MAX_WINDOW,
+        })?;
+        NonZeroU64::new(millis)
+            .map(Self)
+            .ok_or(QuotaPeriodError::Zero)
+    }
+
+    /// Returns the period as a duration.
+    pub const fn duration(self) -> Duration {
+        Duration::from_millis(self.0.get())
+    }
+
+    /// Returns the period as an exact, nonzero millisecond count.
+    pub const fn millis(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl From<QuotaPeriod> for Duration {
+    fn from(period: QuotaPeriod) -> Self {
+        period.duration()
+    }
+}
+
+/// An invalid replenishment period.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum QuotaPeriodError {
+    /// The period was zero.
+    #[error("period must be greater than zero")]
+    Zero,
+    /// The period had finer precision than a whole millisecond.
+    #[error("period must be an exact whole number of milliseconds")]
+    NotWholeMilliseconds,
+    /// The period exceeded the portable backend maximum.
+    #[error("period {actual:?} exceeds portable maximum {maximum:?}")]
+    TooLarge {
+        /// Supplied period.
+        actual: Duration,
+        /// Largest period supported by every backend.
+        maximum: Duration,
+    },
+}
 
 /// Whether quota exhaustion is enforced or reported in shadow mode.
 ///
@@ -49,6 +198,10 @@ pub enum QuotaMode {
 /// Storage backends remain free to support one specific policy algorithm by
 /// choosing it as [`crate::Limiter::Policy`]. Application adapters can be
 /// generic over this trait without assuming fixed-window behavior.
+///
+/// Every numeric value is returned as a validated type. A third-party policy
+/// therefore cannot report a zero or oversized quota, capacity, or period, and
+/// checks, decisions, and HTTP encoders built from it never re-validate them.
 pub trait RateLimitPolicy: fmt::Debug + Send + Sync {
     /// Returns the application-defined policy identifier.
     fn id(&self) -> &PolicyId;
@@ -57,14 +210,14 @@ pub trait RateLimitPolicy: fmt::Debug + Send + Sync {
     fn scope(&self) -> &ScopeId;
 
     /// Returns the quota replenished during [`Self::quota_period`].
-    fn quota(&self) -> u64;
+    fn quota(&self) -> Capacity;
 
     /// Returns the period during which [`Self::quota`] is replenished.
-    fn quota_period(&self) -> Duration;
+    fn quota_period(&self) -> QuotaPeriod;
 
     /// Returns the largest single cost and maximum immediately available
     /// allowance supported by this policy.
-    fn capacity(&self) -> u64;
+    fn capacity(&self) -> Capacity;
 
     /// Returns the deterministic storage-key fingerprint.
     fn fingerprint(&self) -> PolicyFingerprint;
@@ -78,6 +231,11 @@ pub trait RateLimitPolicy: fmt::Debug + Send + Sync {
 /// Storage backends include this value in counter keys. Consequently, changing
 /// any storage-relevant policy configuration starts an independent counter
 /// instead of reinterpreting existing state.
+///
+/// The built-in policies' exact derivations are persistent cross-replica
+/// protocols pinned by golden-vector tests. Their domains, field order,
+/// separators, and integer encodings must remain stable through rolling
+/// deployments.
 ///
 /// This storage-key component deliberately does not implement Serde traits.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -145,8 +303,8 @@ fn write_hex(formatter: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
 pub struct FixedWindowPolicy {
     id: PolicyId,
     scope: ScopeId,
-    limit: NonZeroU64,
-    window_millis: NonZeroU64,
+    limit: Capacity,
+    window: QuotaPeriod,
     fingerprint: PolicyFingerprint,
     quota_mode: QuotaMode,
 }
@@ -165,21 +323,26 @@ impl FixedWindowPolicy {
         limit: u64,
         window: Duration,
     ) -> Result<Self, PolicyError> {
-        let limit = NonZeroU64::new(limit).ok_or(PolicyError::ZeroLimit)?;
-        if limit.get() > MAX_LIMIT {
-            return Err(PolicyError::LimitTooLarge {
-                actual: limit.get(),
-                maximum: MAX_LIMIT,
-            });
-        }
-        let window_millis = validate_window(window).map_err(PolicyError::from)?;
-        let fingerprint = fingerprint(&id, &scope, limit, window_millis);
+        let limit = Capacity::new(limit).map_err(|error| match error {
+            CapacityError::Zero => PolicyError::ZeroLimit,
+            CapacityError::TooLarge { actual, maximum } => {
+                PolicyError::LimitTooLarge { actual, maximum }
+            }
+        })?;
+        let window = QuotaPeriod::new(window).map_err(|error| match error {
+            QuotaPeriodError::Zero => PolicyError::ZeroWindow,
+            QuotaPeriodError::NotWholeMilliseconds => PolicyError::WindowNotWholeMilliseconds,
+            QuotaPeriodError::TooLarge { actual, maximum } => {
+                PolicyError::WindowTooLarge { actual, maximum }
+            }
+        })?;
+        let fingerprint = fingerprint(&id, &scope, limit, window);
 
         Ok(Self {
             id,
             scope,
             limit,
-            window_millis,
+            window,
             fingerprint,
             quota_mode: QuotaMode::Enforce,
         })
@@ -206,18 +369,13 @@ impl FixedWindowPolicy {
     }
 
     /// Returns the maximum cost allowed during one window.
-    pub const fn limit(&self) -> u64 {
-        self.limit.get()
+    pub const fn limit(&self) -> Capacity {
+        self.limit
     }
 
     /// Returns the anchored window duration.
-    pub const fn window(&self) -> Duration {
-        Duration::from_millis(self.window_millis.get())
-    }
-
-    /// Returns the anchored window as an exact, nonzero millisecond count.
-    pub const fn window_millis(&self) -> u64 {
-        self.window_millis.get()
+    pub const fn window(&self) -> QuotaPeriod {
+        self.window
     }
 
     /// Returns the deterministic configuration fingerprint.
@@ -240,15 +398,15 @@ impl RateLimitPolicy for FixedWindowPolicy {
         self.scope()
     }
 
-    fn quota(&self) -> u64 {
+    fn quota(&self) -> Capacity {
         self.limit()
     }
 
-    fn quota_period(&self) -> Duration {
+    fn quota_period(&self) -> QuotaPeriod {
         self.window()
     }
 
-    fn capacity(&self) -> u64 {
+    fn capacity(&self) -> Capacity {
         self.limit()
     }
 
@@ -293,8 +451,8 @@ impl serde::Serialize for FixedWindowPolicy {
             &FixedWindowPolicyRef {
                 id: self.id(),
                 scope: self.scope(),
-                limit: self.limit(),
-                window_millis: self.window_millis(),
+                limit: self.limit().get(),
+                window_millis: self.window().millis(),
                 quota_mode: self.quota_mode(),
             },
             serializer,
@@ -320,38 +478,13 @@ impl<'de> serde::Deserialize<'de> for FixedWindowPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DurationValidationError {
-    Zero,
-    NotWholeMilliseconds,
-    TooLarge { actual: Duration, maximum: Duration },
-}
-
-fn validate_window(window: Duration) -> Result<NonZeroU64, DurationValidationError> {
-    if window.is_zero() {
-        return Err(DurationValidationError::Zero);
-    }
-    if !window.subsec_nanos().is_multiple_of(1_000_000) {
-        return Err(DurationValidationError::NotWholeMilliseconds);
-    }
-    if window > MAX_WINDOW {
-        return Err(DurationValidationError::TooLarge {
-            actual: window,
-            maximum: MAX_WINDOW,
-        });
-    }
-
-    let millis =
-        u64::try_from(window.as_millis()).expect("the portable window maximum fits in u64");
-    Ok(NonZeroU64::new(millis).expect("the validated duration is nonzero"))
-}
-
 fn fingerprint(
     id: &PolicyId,
     scope: &ScopeId,
-    limit: NonZeroU64,
-    window_millis: NonZeroU64,
+    limit: Capacity,
+    window: QuotaPeriod,
 ) -> PolicyFingerprint {
+    // v1 = domain || id || NUL || scope || NUL || limit_u64_be || window_ms_u64_be
     let mut digest = Sha256::new();
     digest.update(FIXED_WINDOW_FINGERPRINT_DOMAIN);
     digest.update(id.as_str().as_bytes());
@@ -359,7 +492,7 @@ fn fingerprint(
     digest.update(scope.as_str().as_bytes());
     digest.update([0]);
     digest.update(limit.get().to_be_bytes());
-    digest.update(window_millis.get().to_be_bytes());
+    digest.update(window.millis().to_be_bytes());
     PolicyFingerprint(digest.finalize().into())
 }
 
@@ -373,9 +506,9 @@ fn fingerprint(
 pub struct GcraPolicy {
     id: PolicyId,
     scope: ScopeId,
-    quota: NonZeroU64,
-    period_millis: NonZeroU64,
-    burst_capacity: NonZeroU64,
+    quota: Capacity,
+    period: QuotaPeriod,
+    burst_capacity: Capacity,
     fingerprint: PolicyFingerprint,
     quota_mode: QuotaMode,
 }
@@ -395,24 +528,27 @@ impl GcraPolicy {
         period: Duration,
         burst_capacity: u64,
     ) -> Result<Self, GcraPolicyError> {
-        let quota = NonZeroU64::new(quota).ok_or(GcraPolicyError::ZeroQuota)?;
-        if quota.get() > MAX_LIMIT {
-            return Err(GcraPolicyError::QuotaTooLarge {
-                actual: quota.get(),
-                maximum: MAX_LIMIT,
-            });
-        }
-        let burst_capacity =
-            NonZeroU64::new(burst_capacity).ok_or(GcraPolicyError::ZeroBurstCapacity)?;
-        if burst_capacity.get() > MAX_LIMIT {
-            return Err(GcraPolicyError::BurstCapacityTooLarge {
-                actual: burst_capacity.get(),
-                maximum: MAX_LIMIT,
-            });
-        }
-        let period_millis = validate_window(period).map_err(GcraPolicyError::from)?;
+        let quota = Capacity::new(quota).map_err(|error| match error {
+            CapacityError::Zero => GcraPolicyError::ZeroQuota,
+            CapacityError::TooLarge { actual, maximum } => {
+                GcraPolicyError::QuotaTooLarge { actual, maximum }
+            }
+        })?;
+        let burst_capacity = Capacity::new(burst_capacity).map_err(|error| match error {
+            CapacityError::Zero => GcraPolicyError::ZeroBurstCapacity,
+            CapacityError::TooLarge { actual, maximum } => {
+                GcraPolicyError::BurstCapacityTooLarge { actual, maximum }
+            }
+        })?;
+        let period = QuotaPeriod::new(period).map_err(|error| match error {
+            QuotaPeriodError::Zero => GcraPolicyError::ZeroPeriod,
+            QuotaPeriodError::NotWholeMilliseconds => GcraPolicyError::PeriodNotWholeMilliseconds,
+            QuotaPeriodError::TooLarge { actual, maximum } => {
+                GcraPolicyError::PeriodTooLarge { actual, maximum }
+            }
+        })?;
         let full_refill_millis = div_ceil_u128(
-            u128::from(burst_capacity.get()) * u128::from(period_millis.get()),
+            u128::from(burst_capacity.get()) * u128::from(period.millis()),
             u128::from(quota.get()),
         );
         if full_refill_millis > u128::from(MAX_WINDOW_MILLIS) {
@@ -421,13 +557,13 @@ impl GcraPolicy {
                 maximum_millis: MAX_WINDOW_MILLIS,
             });
         }
-        let fingerprint = gcra_fingerprint(&id, &scope, quota, period_millis, burst_capacity);
+        let fingerprint = gcra_fingerprint(&id, &scope, quota, period, burst_capacity);
 
         Ok(Self {
             id,
             scope,
             quota,
-            period_millis,
+            period,
             burst_capacity,
             fingerprint,
             quota_mode: QuotaMode::Enforce,
@@ -452,23 +588,18 @@ impl GcraPolicy {
     }
 
     /// Returns the number of units replenished during one period.
-    pub const fn quota(&self) -> u64 {
-        self.quota.get()
+    pub const fn quota(&self) -> Capacity {
+        self.quota
     }
 
     /// Returns the replenishment period.
-    pub const fn period(&self) -> Duration {
-        Duration::from_millis(self.period_millis.get())
-    }
-
-    /// Returns the replenishment period as exact whole milliseconds.
-    pub const fn period_millis(&self) -> u64 {
-        self.period_millis.get()
+    pub const fn period(&self) -> QuotaPeriod {
+        self.period
     }
 
     /// Returns the maximum immediately available allowance.
-    pub const fn burst_capacity(&self) -> u64 {
-        self.burst_capacity.get()
+    pub const fn burst_capacity(&self) -> Capacity {
+        self.burst_capacity
     }
 
     /// Returns the deterministic configuration fingerprint.
@@ -491,15 +622,15 @@ impl RateLimitPolicy for GcraPolicy {
         self.scope()
     }
 
-    fn quota(&self) -> u64 {
+    fn quota(&self) -> Capacity {
         self.quota()
     }
 
-    fn quota_period(&self) -> Duration {
+    fn quota_period(&self) -> QuotaPeriod {
         self.period()
     }
 
-    fn capacity(&self) -> u64 {
+    fn capacity(&self) -> Capacity {
         self.burst_capacity()
     }
 
@@ -546,9 +677,9 @@ impl serde::Serialize for GcraPolicy {
             &GcraPolicyRef {
                 id: self.id(),
                 scope: self.scope(),
-                quota: self.quota(),
-                period_millis: self.period_millis(),
-                burst_capacity: self.burst_capacity(),
+                quota: self.quota().get(),
+                period_millis: self.period().millis(),
+                burst_capacity: self.burst_capacity().get(),
                 quota_mode: self.quota_mode(),
             },
             serializer,
@@ -578,10 +709,12 @@ impl<'de> serde::Deserialize<'de> for GcraPolicy {
 fn gcra_fingerprint(
     id: &PolicyId,
     scope: &ScopeId,
-    quota: NonZeroU64,
-    period_millis: NonZeroU64,
-    burst_capacity: NonZeroU64,
+    quota: Capacity,
+    period: QuotaPeriod,
+    burst_capacity: Capacity,
 ) -> PolicyFingerprint {
+    // v1 = domain || id || NUL || scope || NUL || quota_u64_be
+    //      || period_ms_u64_be || burst_capacity_u64_be
     let mut digest = Sha256::new();
     digest.update(GCRA_FINGERPRINT_DOMAIN);
     digest.update(id.as_str().as_bytes());
@@ -589,7 +722,7 @@ fn gcra_fingerprint(
     digest.update(scope.as_str().as_bytes());
     digest.update([0]);
     digest.update(quota.get().to_be_bytes());
-    digest.update(period_millis.get().to_be_bytes());
+    digest.update(period.millis().to_be_bytes());
     digest.update(burst_capacity.get().to_be_bytes());
     PolicyFingerprint(digest.finalize().into())
 }
@@ -684,37 +817,14 @@ pub enum GcraPolicyError {
     },
 }
 
-impl From<DurationValidationError> for PolicyError {
-    fn from(error: DurationValidationError) -> Self {
-        match error {
-            DurationValidationError::Zero => Self::ZeroWindow,
-            DurationValidationError::NotWholeMilliseconds => Self::WindowNotWholeMilliseconds,
-            DurationValidationError::TooLarge { actual, maximum } => {
-                Self::WindowTooLarge { actual, maximum }
-            }
-        }
-    }
-}
-
-impl From<DurationValidationError> for GcraPolicyError {
-    fn from(error: DurationValidationError) -> Self {
-        match error {
-            DurationValidationError::Zero => Self::ZeroPeriod,
-            DurationValidationError::NotWholeMilliseconds => Self::PeriodNotWholeMilliseconds,
-            DurationValidationError::TooLarge { actual, maximum } => {
-                Self::PeriodTooLarge { actual, maximum }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
-        FixedWindowPolicy, GcraPolicy, GcraPolicyError, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS,
-        PolicyError, QuotaMode, RateLimitPolicy,
+        Capacity, CapacityError, FixedWindowPolicy, GcraPolicy, GcraPolicyError, MAX_LIMIT,
+        MAX_WINDOW, MAX_WINDOW_MILLIS, PolicyError, QuotaMode, QuotaPeriod, QuotaPeriodError,
+        RateLimitPolicy,
     };
     use crate::{PolicyId, ScopeId};
 
@@ -728,12 +838,52 @@ mod tests {
     }
 
     #[test]
+    fn capacity_is_validated_once() {
+        assert_eq!(Capacity::new(0), Err(CapacityError::Zero));
+        assert_eq!(
+            Capacity::new(MAX_LIMIT + 1),
+            Err(CapacityError::TooLarge {
+                actual: MAX_LIMIT + 1,
+                maximum: MAX_LIMIT,
+            })
+        );
+        assert_eq!(Capacity::new(MAX_LIMIT), Ok(Capacity::MAX));
+        assert_eq!(Capacity::new(8).unwrap().get(), 8);
+        assert_eq!(u64::from(Capacity::new(8).unwrap()), 8);
+        assert_eq!(Capacity::new(8).unwrap().to_string(), "8");
+    }
+
+    #[test]
+    fn quota_period_is_validated_once() {
+        assert_eq!(
+            QuotaPeriod::new(Duration::ZERO),
+            Err(QuotaPeriodError::Zero)
+        );
+        assert_eq!(
+            QuotaPeriod::new(Duration::from_micros(1_500)),
+            Err(QuotaPeriodError::NotWholeMilliseconds)
+        );
+        assert_eq!(
+            QuotaPeriod::new(MAX_WINDOW + Duration::from_millis(1)),
+            Err(QuotaPeriodError::TooLarge {
+                actual: MAX_WINDOW + Duration::from_millis(1),
+                maximum: MAX_WINDOW,
+            })
+        );
+        assert_eq!(QuotaPeriod::new(MAX_WINDOW), Ok(QuotaPeriod::MAX));
+        let period = QuotaPeriod::new(Duration::from_millis(1_500)).unwrap();
+        assert_eq!(period.millis(), 1_500);
+        assert_eq!(period.duration(), Duration::from_millis(1_500));
+        assert_eq!(Duration::from(period), Duration::from_millis(1_500));
+    }
+
+    #[test]
     fn accepts_nonzero_whole_millisecond_windows() {
         let policy = policy(8, Duration::from_millis(60_001)).unwrap();
 
-        assert_eq!(policy.limit(), 8);
-        assert_eq!(policy.window(), Duration::from_millis(60_001));
-        assert_eq!(policy.window_millis(), 60_001);
+        assert_eq!(policy.limit().get(), 8);
+        assert_eq!(policy.window().duration(), Duration::from_millis(60_001));
+        assert_eq!(policy.window().millis(), 60_001);
         assert_eq!(policy.id().as_str(), "auth.login");
         assert_eq!(policy.scope().as_str(), "client");
     }
@@ -763,9 +913,9 @@ mod tests {
     fn accepts_portable_upper_bounds() {
         let policy = policy(MAX_LIMIT, MAX_WINDOW).unwrap();
 
-        assert_eq!(policy.limit(), MAX_LIMIT);
-        assert_eq!(policy.window(), MAX_WINDOW);
-        assert_eq!(policy.window_millis(), MAX_WINDOW_MILLIS);
+        assert_eq!(policy.limit(), Capacity::MAX);
+        assert_eq!(policy.window(), QuotaPeriod::MAX);
+        assert_eq!(policy.window().millis(), MAX_WINDOW_MILLIS);
     }
 
     #[test]
@@ -816,6 +966,16 @@ mod tests {
     }
 
     #[test]
+    fn fixed_window_fingerprint_matches_stable_protocol_vector() {
+        let policy = policy(8, Duration::from_mins(1)).unwrap();
+
+        assert_eq!(
+            policy.fingerprint().to_string(),
+            "b4c06fc2a76c7f9c49dabaf929ced6ed17e7d739a558174ca41c42cea25751d9"
+        );
+    }
+
+    #[test]
     fn fingerprint_changes_with_every_storage_relevant_field() {
         let baseline = policy(8, Duration::from_mins(1)).unwrap();
         let different_limit = policy(9, Duration::from_mins(1)).unwrap();
@@ -849,7 +1009,7 @@ mod tests {
         assert_eq!(enforced.fingerprint(), shadowed.fingerprint());
         assert_eq!(enforced.quota_mode(), QuotaMode::Enforce);
         assert_eq!(shadowed.quota_mode(), QuotaMode::Shadow);
-        assert_eq!(RateLimitPolicy::capacity(&shadowed), 8);
+        assert_eq!(RateLimitPolicy::capacity(&shadowed).get(), 8);
     }
 
     #[test]
@@ -860,10 +1020,11 @@ mod tests {
             GcraPolicy::new(id.clone(), scope.clone(), 10, Duration::from_secs(1), 20).unwrap();
         let fixed = FixedWindowPolicy::new(id, scope, 10, Duration::from_secs(1)).unwrap();
 
-        assert_eq!(gcra.quota(), 10);
-        assert_eq!(gcra.period(), Duration::from_secs(1));
-        assert_eq!(gcra.burst_capacity(), 20);
-        assert_eq!(RateLimitPolicy::capacity(&gcra), 20);
+        assert_eq!(gcra.quota().get(), 10);
+        assert_eq!(gcra.period().duration(), Duration::from_secs(1));
+        assert_eq!(gcra.burst_capacity().get(), 20);
+        assert_eq!(RateLimitPolicy::capacity(&gcra).get(), 20);
+        assert_eq!(RateLimitPolicy::quota_period(&gcra), gcra.period());
         assert_ne!(gcra.fingerprint(), fixed.fingerprint());
         assert_eq!(
             gcra.fingerprint(),
@@ -917,6 +1078,23 @@ mod tests {
                 .clone()
                 .with_quota_mode(QuotaMode::Shadow)
                 .fingerprint()
+        );
+    }
+
+    #[test]
+    fn gcra_fingerprint_matches_stable_protocol_vector() {
+        let policy = GcraPolicy::new(
+            PolicyId::new("api.read").unwrap(),
+            ScopeId::new("account").unwrap(),
+            10,
+            Duration::from_secs(1),
+            20,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.fingerprint().to_string(),
+            "c0aac2c2bbad1b6e7a626da8f103429e6863736dfe23bdd4b6c5853b80260d54"
         );
     }
 

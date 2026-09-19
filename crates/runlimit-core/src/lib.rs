@@ -5,8 +5,8 @@
 //! no async runtime, transport framework, or persistence integration.
 //!
 //! Applications own subject normalization and policy selection. Raw subjects
-//! should be converted to [`SubjectKey`] values with [`KeyHasher`] before they
-//! cross into a storage backend.
+//! should be converted to policy-bound [`PolicySubject`] values with
+//! [`KeyHasher`] before they cross into a storage backend.
 //! Async application adapters can use [`Limiter`] for generic dispatch across
 //! storage backends without requiring boxed futures.
 //!
@@ -29,16 +29,18 @@ pub use check::{Check, CheckError};
 pub use counter::CounterKey;
 pub use decision::{
     Admitted, AdmittedView, Allowance, BatchDecision, BatchDecisionView, Decision, DecisionError,
-    DecisionView, Denial, DenialView, QuotaDenial, RetryAfter,
+    DecisionView, Delay, Denial, QuotaDenial,
 };
 pub use identifier::{IdentifierError, MAX_IDENTIFIER_LENGTH, PolicyId, ScopeId};
-pub use key::{KeyHasher, KeyHasherError, SubjectKey};
+pub use key::{KeyHasher, KeyHasherError, PolicySubject, SubjectKey};
 pub use limiter::Limiter;
 pub use observation::{
-    AdmissionObservation, AdmissionOperation, AdmissionOutcome, CapacityObservation,
-    CleanupObservation, ConsumptionStatus, Observation, Observer, observe_safely,
+    AdmissionObservation, AdmissionOperation, AdmissionOutcome, AdmissionPolicy,
+    CapacityObservation, CleanupObservation, CleanupOutcome, ConsumptionStatus, Observation,
+    Observer, observe_safely,
 };
 pub use policy::{
-    FixedWindowPolicy, GcraPolicy, GcraPolicyError, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS,
-    PolicyError, PolicyFingerprint, QuotaMode, RateLimitPolicy,
+    Capacity, CapacityError, FixedWindowPolicy, GcraPolicy, GcraPolicyError, MAX_LIMIT, MAX_WINDOW,
+    MAX_WINDOW_MILLIS, PolicyError, PolicyFingerprint, QuotaMode, QuotaPeriod, QuotaPeriodError,
+    RateLimitPolicy,
 };

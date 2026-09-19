@@ -6,18 +6,21 @@ use runlimit_core::{
     Allowance, BatchDecision, BatchError, Check, Decision, FixedWindowPolicy, Limiter, PolicyId,
     ScopeId, SubjectKey,
 };
-use runlimit_memory::{MemoryStore, MemoryStoreConfig, MemoryStoreError};
-use runlimit_postgres::{CheckError, PostgresLimiter};
+use runlimit_memory::{MemoryBatchError, MemoryStore, MemoryStoreConfig};
+use runlimit_postgres::{BatchCheckError, PostgresLimiter};
 use sqlx::postgres::PgPoolOptions;
 
-async fn check_batch<L>(limiter: &L, checks: &[Check<'_>]) -> Result<BatchDecision, L::Error>
+async fn check_batch<L>(
+    limiter: &L,
+    checks: &[Check<'_>],
+) -> Result<BatchDecision, L::CheckAllError>
 where
     L: Limiter<Policy = FixedWindowPolicy>,
 {
     limiter.check_all(checks).await
 }
 
-async fn check_one<L>(limiter: &L, check: &Check<'_>) -> Result<Decision, L::Error>
+async fn check_one<L>(limiter: &L, check: &Check<'_>) -> Result<Decision, L::CheckError>
 where
     L: Limiter<Policy = FixedWindowPolicy>,
 {
@@ -58,7 +61,7 @@ async fn one_generic_function_swaps_between_backends() {
             .expect("test database URL is valid"),
     );
     let single_policy = policy("single", 2);
-    let single_check = Check::new(&single_policy, key(9));
+    let single_check = Check::new(key(9).bind(&single_policy));
     let duplicate_checks = [single_check, single_check];
 
     assert!(
@@ -69,24 +72,25 @@ async fn one_generic_function_swaps_between_backends() {
     );
     assert_eq!(
         check_batch(&memory, &[]).await,
-        Ok(BatchDecision::allowed(Vec::new()))
+        Err(MemoryBatchError::InvalidBatch(BatchError::EmptyBatch))
     );
-    assert_eq!(
-        check_batch(&postgres, &[])
-            .await
-            .expect("an empty PostgreSQL batch needs no connection"),
-        BatchDecision::allowed(Vec::new())
+    assert!(
+        matches!(
+            check_batch(&postgres, &[]).await,
+            Err(BatchCheckError::InvalidBatch(BatchError::EmptyBatch))
+        ),
+        "an empty PostgreSQL batch is rejected before a connection is needed"
     );
     assert!(matches!(
         check_batch(&memory, &duplicate_checks).await,
-        Err(MemoryStoreError::InvalidBatch(BatchError::DuplicateKey {
+        Err(MemoryBatchError::InvalidBatch(BatchError::DuplicateKey {
             first_index: 0,
             duplicate_index: 1,
         }))
     ));
     assert!(matches!(
         check_batch(&postgres, &duplicate_checks).await,
-        Err(CheckError::InvalidBatch(BatchError::DuplicateKey {
+        Err(BatchCheckError::InvalidBatch(BatchError::DuplicateKey {
             first_index: 0,
             duplicate_index: 1,
         }))
@@ -103,8 +107,12 @@ async fn generic_batch_preserves_caller_order() {
     let first_policy = policy("first", 11);
     let second_policy = policy("second", 7);
     let checks = [
-        Check::with_cost(&first_policy, key(1), 3).expect("test check is valid"),
-        Check::with_cost(&second_policy, key(2), 2).expect("test check is valid"),
+        Check::new(key(1).bind(&first_policy))
+            .with_cost(3)
+            .expect("test check is valid"),
+        Check::new(key(2).bind(&second_policy))
+            .with_cost(2)
+            .expect("test check is valid"),
     ];
     let memory = MemoryStore::new(
         MemoryStoreConfig::new(4).expect("test memory-store configuration is valid"),
@@ -114,11 +122,11 @@ async fn generic_batch_preserves_caller_order() {
 
     assert_eq!(allowances.len(), 2);
     assert_eq!(
-        (allowances[0].capacity(), allowances[0].available()),
+        (allowances[0].capacity().get(), allowances[0].available()),
         (11, 8)
     );
     assert_eq!(
-        (allowances[1].capacity(), allowances[1].available()),
+        (allowances[1].capacity().get(), allowances[1].available()),
         (7, 5)
     );
 }

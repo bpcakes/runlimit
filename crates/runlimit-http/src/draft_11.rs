@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
-use runlimit_core::{Decision, DecisionView, DenialView, RateLimitPolicy};
+use runlimit_core::{Admitted, AdmittedView, Allowance, QuotaDenial, RateLimitPolicy};
 use thiserror::Error;
 
 /// Largest integer representable by an RFC 9651 Structured Field.
@@ -25,6 +25,45 @@ pub const MAX_POLICY_NAME_LENGTH: usize = 128;
 
 /// A typed HTTP header name and value.
 pub type HeaderField = (HeaderName, HeaderValue);
+
+/// The quota state a `RateLimit` field can describe.
+///
+/// Only an allowance or a quota denial has service-limit metadata. A
+/// storage-capacity denial is not representable here, so it cannot reach
+/// [`service_limit`] and become an encoding error in the response path.
+/// Callers holding a [`runlimit_core::Denial`] match it and pass the
+/// [`QuotaDenial`] from its `QuotaExceeded` arm. An [`Admitted`] outcome
+/// converts directly: an allowance becomes [`QuotaState::Available`] and a
+/// shadow denial becomes [`QuotaState::Exhausted`], so a shadow denial exposes
+/// the service value that would have applied if the policy were enforced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotaState {
+    /// Quota was consumed and the allowance remains available.
+    Available(Allowance),
+    /// The requested cost exceeded the quota, enforced or shadowed.
+    Exhausted(QuotaDenial),
+}
+
+impl From<Allowance> for QuotaState {
+    fn from(allowance: Allowance) -> Self {
+        Self::Available(allowance)
+    }
+}
+
+impl From<QuotaDenial> for QuotaState {
+    fn from(denial: QuotaDenial) -> Self {
+        Self::Exhausted(denial)
+    }
+}
+
+impl From<Admitted> for QuotaState {
+    fn from(admitted: Admitted) -> Self {
+        match admitted.view() {
+            AdmittedView::Allowed { allowance } => Self::Available(allowance),
+            AdmittedView::ShadowDenied { denial } => Self::Exhausted(denial),
+        }
+    }
+}
 
 /// Encodes one `RateLimit-Policy` field.
 ///
@@ -37,62 +76,52 @@ pub type HeaderField = (HeaderName, HeaderValue);
 ///
 /// Returns [`EncodingError`] when the public policy name is unsafe for an
 /// HTTP Structured Field String, a numeric value exceeds the Structured Field
-/// integer range, or the quota period is zero or not an exact whole number of
+/// integer range, or the quota period is not an exact whole number of
 /// seconds.
 pub fn quota_policy<P: RateLimitPolicy + ?Sized>(
     name: &str,
     policy: &P,
 ) -> Result<HeaderField, EncodingError> {
     let name = encode_policy_name(name)?;
-    let quota = structured_integer(policy.quota())?;
+    let quota = structured_integer(policy.quota().get())?;
     let period = policy.quota_period();
-    if period.is_zero() {
-        return Err(EncodingError::ZeroQuotaPeriod);
+    if !period.millis().is_multiple_of(1_000) {
+        return Err(EncodingError::QuotaPeriodNotWholeSeconds {
+            actual: period.duration(),
+        });
     }
-    if period.subsec_nanos() != 0 {
-        return Err(EncodingError::QuotaPeriodNotWholeSeconds { actual: period });
-    }
-    let period = structured_integer(period.as_secs())?;
-    let value = header_value(format!("{name};q={quota};w={period}"))?;
+    let period = structured_integer(period.millis() / 1_000)?;
+    let value = header_value(format!("{name};q={quota};w={period}"));
 
     Ok((HeaderName::from_static("ratelimit-policy"), value))
 }
 
 /// Encodes one `RateLimit` field.
 ///
-/// An allowed decision uses the immediately available allowance and rounds
-/// its replenishment duration up to whole seconds. An enforced or shadow quota
-/// denial uses `r=0` and rounds the backend's retry duration up in the same
-/// way. Thus a shadow denial exposes the service value that would have applied
-/// if the policy were enforced, without creating a `Retry-After` field or
-/// choosing an HTTP status.
-///
-/// Storage-capacity denials cannot be represented as a quota service limit and
-/// return [`EncodingError::UnsupportedDecision`].
+/// An available quota uses the immediately available allowance and rounds
+/// its replenishment delay up to whole seconds. An exhausted quota uses `r=0`
+/// and rounds the backend's retry delay up in the same way. Neither creates a
+/// `Retry-After` field or chooses an HTTP status.
 ///
 /// # Errors
 ///
-/// Returns [`EncodingError`] when the public policy name is unsafe, a numeric
-/// value exceeds the Structured Field integer range, or the decision lacks
-/// quota service metadata.
-pub fn service_limit(name: &str, decision: &Decision) -> Result<HeaderField, EncodingError> {
+/// Returns [`EncodingError`] when the public policy name is unsafe or a
+/// numeric value exceeds the Structured Field integer range.
+pub fn service_limit(
+    name: &str,
+    state: impl Into<QuotaState>,
+) -> Result<HeaderField, EncodingError> {
     let name = encode_policy_name(name)?;
-    let (available, effective_window) = match decision.view() {
-        DecisionView::Allowed { allowance } => (
+    let (available, effective_window) = match state.into() {
+        QuotaState::Available(allowance) => (
             allowance.available(),
-            ceil_seconds(allowance.replenishes_after()),
+            allowance.replenishes_after().seconds(),
         ),
-        DecisionView::Denied {
-            denial: DenialView::QuotaExceeded(denial),
-        }
-        | DecisionView::ShadowDenied { denial } => (0, denial.retry_after().seconds()),
-        DecisionView::Denied {
-            denial: DenialView::StorageCapacity { .. },
-        } => return Err(EncodingError::UnsupportedDecision),
+        QuotaState::Exhausted(denial) => (0, denial.retry_after().seconds()),
     };
     let available = structured_integer(available)?;
     let effective_window = structured_integer(effective_window)?;
-    let value = header_value(format!("{name};r={available};t={effective_window}"))?;
+    let value = header_value(format!("{name};r={available};t={effective_window}"));
 
     Ok((HeaderName::from_static("ratelimit"), value))
 }
@@ -133,19 +162,18 @@ fn structured_integer(value: u64) -> Result<u64, EncodingError> {
     Ok(value)
 }
 
-fn ceil_seconds(duration: Duration) -> u64 {
-    duration
-        .as_secs()
-        .saturating_add(u64::from(duration.subsec_nanos() != 0))
-}
-
-fn header_value(value: String) -> Result<HeaderValue, EncodingError> {
-    HeaderValue::try_from(value).map_err(|_| EncodingError::InvalidHeaderValue)
+/// Converts an encoded member into a header value.
+///
+/// Every byte is either visible ASCII validated by [`encode_policy_name`] or a
+/// literal from the Structured Field grammar, all of which `HeaderValue`
+/// accepts, so this conversion cannot fail.
+fn header_value(value: String) -> HeaderValue {
+    HeaderValue::try_from(value)
+        .expect("validated policy names and Structured Field literals are visible ASCII")
 }
 
 /// Failure to encode draft-11 response metadata.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum EncodingError {
     /// The public policy name was empty.
     #[error("RateLimit policy name must not be empty")]
@@ -177,21 +205,12 @@ pub enum EncodingError {
         /// Largest representable integer.
         maximum: u64,
     },
-    /// The policy's replenishment period was zero.
-    #[error("RateLimit-Policy quota period must be greater than zero")]
-    ZeroQuotaPeriod,
     /// The policy's replenishment period was not an exact whole second.
     #[error("RateLimit-Policy quota period {actual:?} is not an exact whole number of seconds")]
     QuotaPeriodNotWholeSeconds {
         /// Supplied quota period.
         actual: Duration,
     },
-    /// The decision did not describe an allowed allowance or quota denial.
-    #[error("the decision cannot be represented as a RateLimit quota service limit")]
-    UnsupportedDecision,
-    /// A validated field unexpectedly failed the HTTP value grammar.
-    #[error("encoded RateLimit metadata is not a valid HTTP header value")]
-    InvalidHeaderValue,
 }
 
 #[cfg(test)]
@@ -199,13 +218,13 @@ mod tests {
     use std::time::Duration;
 
     use runlimit_core::{
-        Allowance, Decision, Denial, FixedWindowPolicy, GcraPolicy, PolicyFingerprint, PolicyId,
-        QuotaDenial, QuotaMode, RateLimitPolicy, ScopeId,
+        Admitted, Allowance, Capacity, FixedWindowPolicy, GcraPolicy, PolicyId, QuotaDenial,
+        ScopeId,
     };
 
     use super::{
-        EncodingError, MAX_POLICY_NAME_LENGTH, MAX_STRUCTURED_FIELD_INTEGER, quota_policy,
-        service_limit,
+        EncodingError, MAX_POLICY_NAME_LENGTH, MAX_STRUCTURED_FIELD_INTEGER, QuotaState,
+        quota_policy, service_limit,
     };
 
     fn fixed_policy(limit: u64, window: Duration) -> FixedWindowPolicy {
@@ -218,51 +237,25 @@ mod tests {
         .unwrap()
     }
 
-    #[derive(Debug)]
-    struct PeriodOverride {
-        policy: FixedWindowPolicy,
-        period: Duration,
+    fn allowance(capacity: u64, available: u64, replenishes_after: Duration) -> Allowance {
+        Allowance::new(
+            Capacity::new(capacity).unwrap(),
+            available,
+            replenishes_after,
+        )
+        .unwrap()
     }
 
-    impl RateLimitPolicy for PeriodOverride {
-        fn id(&self) -> &PolicyId {
-            self.policy.id()
-        }
-
-        fn scope(&self) -> &ScopeId {
-            self.policy.scope()
-        }
-
-        fn quota(&self) -> u64 {
-            self.policy.limit()
-        }
-
-        fn quota_period(&self) -> Duration {
-            self.period
-        }
-
-        fn capacity(&self) -> u64 {
-            self.policy.limit()
-        }
-
-        fn fingerprint(&self) -> PolicyFingerprint {
-            self.policy.fingerprint()
-        }
-
-        fn quota_mode(&self) -> QuotaMode {
-            self.policy.quota_mode()
-        }
+    fn quota(capacity: u64, retry_after: Duration) -> QuotaDenial {
+        QuotaDenial::new(Capacity::new(capacity).unwrap(), retry_after)
     }
 
     #[test]
     fn encodes_exact_draft_11_golden_fields() {
         let policy = fixed_policy(100, Duration::from_mins(1));
         let policy_field = quota_policy("search", &policy).unwrap();
-        let service_field = service_limit(
-            "search",
-            &Decision::allowed(Allowance::new(100, 49, Duration::from_secs(37))),
-        )
-        .unwrap();
+        let service_field =
+            service_limit("search", allowance(100, 49, Duration::from_secs(37))).unwrap();
 
         assert_eq!(policy_field.0.as_str(), "ratelimit-policy");
         assert_eq!(policy_field.1, "\"search\";q=100;w=60");
@@ -288,17 +281,42 @@ mod tests {
     }
 
     #[test]
-    fn quota_and_shadow_denials_are_exhausted_service_values() {
-        let denial = QuotaDenial::try_new(10, Duration::from_millis(1_001)).unwrap();
+    fn exhausted_quota_is_an_r_zero_service_value() {
+        let denial = quota(10, Duration::from_millis(1_001));
 
         assert_eq!(
-            service_limit("default", &Decision::denied(denial))
+            service_limit("default", denial).unwrap().1,
+            "\"default\";r=0;t=2"
+        );
+        assert_eq!(
+            service_limit("default", QuotaState::Exhausted(denial))
                 .unwrap()
                 .1,
             "\"default\";r=0;t=2"
         );
+    }
+
+    #[test]
+    fn admitted_outcomes_convert_without_a_decision_round_trip() {
+        let allowance = allowance(10, 4, Duration::from_millis(500));
+        let denial = quota(10, Duration::from_millis(1_001));
+
         assert_eq!(
-            service_limit("default", &Decision::shadow_denied(denial))
+            QuotaState::from(Admitted::allowed(allowance)),
+            QuotaState::Available(allowance)
+        );
+        assert_eq!(
+            QuotaState::from(Admitted::shadow_denied(denial)),
+            QuotaState::Exhausted(denial)
+        );
+        assert_eq!(
+            service_limit("default", Admitted::allowed(allowance))
+                .unwrap()
+                .1,
+            "\"default\";r=4;t=1"
+        );
+        assert_eq!(
+            service_limit("default", Admitted::shadow_denied(denial))
                 .unwrap()
                 .1,
             "\"default\";r=0;t=2"
@@ -307,10 +325,10 @@ mod tests {
 
     #[test]
     fn rounds_allowed_effective_windows_up_to_whole_seconds() {
-        let decision = Decision::allowed(Allowance::new(10, 9, Duration::from_nanos(1)));
-
         assert_eq!(
-            service_limit("default", &decision).unwrap().1,
+            service_limit("default", allowance(10, 9, Duration::from_nanos(1)))
+                .unwrap()
+                .1,
             "\"default\";r=9;t=1"
         );
     }
@@ -337,6 +355,23 @@ mod tests {
                 character: 'é',
             })
         );
+    }
+
+    #[test]
+    fn every_accepted_policy_name_character_produces_valid_headers() {
+        let policy = fixed_policy(5, Duration::from_secs(1));
+
+        for byte in b' '..=b'~' {
+            let name = char::from(byte).to_string();
+            assert!(
+                quota_policy(&name, &policy).is_ok(),
+                "RateLimit-Policy rejected accepted byte {byte}"
+            );
+            assert!(
+                service_limit(&name, allowance(5, 4, Duration::from_secs(1))).is_ok(),
+                "RateLimit rejected accepted byte {byte}"
+            );
+        }
     }
 
     #[test]
@@ -375,11 +410,11 @@ mod tests {
         assert_eq!(
             service_limit(
                 "too-large",
-                &Decision::allowed(Allowance::new(
+                allowance(
                     MAX_STRUCTURED_FIELD_INTEGER + 1,
                     MAX_STRUCTURED_FIELD_INTEGER + 1,
                     Duration::from_secs(1),
-                )),
+                ),
             ),
             Err(EncodingError::StructuredFieldIntegerTooLarge {
                 actual: MAX_STRUCTURED_FIELD_INTEGER + 1,
@@ -401,37 +436,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_policy_periods_from_custom_policies() {
-        let policy = PeriodOverride {
-            policy: fixed_policy(5, Duration::from_secs(1)),
-            period: Duration::ZERO,
-        };
-
-        assert_eq!(
-            quota_policy("zero", &policy),
-            Err(EncodingError::ZeroQuotaPeriod)
-        );
-    }
-
-    #[test]
-    fn rejects_capacity_denials_as_quota_service_limits() {
-        let decision = Decision::denied(Denial::storage_capacity(Some(Duration::from_secs(1))));
-        assert_eq!(
-            service_limit("default", &decision),
-            Err(EncodingError::UnsupportedDecision)
-        );
-    }
-
-    #[test]
     fn rejects_effective_windows_above_the_structured_field_integer_maximum() {
-        let decision = Decision::allowed(Allowance::new(
-            1,
-            0,
-            Duration::from_secs(MAX_STRUCTURED_FIELD_INTEGER + 1),
-        ));
-
         assert_eq!(
-            service_limit("default", &decision),
+            service_limit(
+                "default",
+                allowance(1, 0, Duration::from_secs(MAX_STRUCTURED_FIELD_INTEGER + 1)),
+            ),
             Err(EncodingError::StructuredFieldIntegerTooLarge {
                 actual: MAX_STRUCTURED_FIELD_INTEGER + 1,
                 maximum: MAX_STRUCTURED_FIELD_INTEGER,

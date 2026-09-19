@@ -27,7 +27,11 @@ impl CounterKey {
         self.fingerprint
     }
 
-    /// Returns the opaque subject key.
+    /// Returns an unbound copy of the opaque subject key.
+    ///
+    /// This accessor exists for storage-backend integration. Binding the
+    /// returned key to a policy is an explicit new binding, independent of
+    /// the fingerprint retained by this counter key.
     pub const fn subject(self) -> SubjectKey {
         self.subject
     }
@@ -70,7 +74,7 @@ mod tests {
         )
         .unwrap();
         let subject = SubjectKey::from_digest([0x5a; 32]);
-        let key = Check::new(&policy, subject).counter_key();
+        let key = Check::new(subject.bind(&policy)).counter_key();
         let bytes = key.to_bytes();
 
         assert_eq!(&bytes[..32], policy.fingerprint().as_bytes());

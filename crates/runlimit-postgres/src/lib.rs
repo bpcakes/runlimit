@@ -52,9 +52,11 @@
 //! did not commit. A
 //! [`CheckError::CommitOutcomeUnknown`] or [`CheckError::CommitTimedOut`] error
 //! means `PostgreSQL` may have committed even though the client did not receive
-//! confirmation. [`CheckError::CommittedResponseInvariant`] means the commit
-//! was confirmed but its response was unusable. Fail closed in all three cases,
-//! and do not blindly retry a check that may already have consumed quota.
+//! confirmation. Fail closed in both cases, and do not blindly retry a check
+//! that may already have consumed quota; [`CheckError::consumption`] names the
+//! certainty. A decision is always built from the database response before the
+//! transaction is finalized, so a malformed response is reported as a
+//! pre-commit failure and never as a possibly committed one.
 //! Once the database has produced a denial, an explicit rollback failure or
 //! deadline cannot replace that valid decision; the connection is discarded so
 //! closing it rolls back the non-mutating denied transaction.
@@ -92,8 +94,8 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionObservation, BatchDecision, Check, CleanupObservation, Decision, FixedWindowPolicy,
-    Limiter, Observation, Observer, observe_safely, validate_batch,
+    AdmissionObservation, BatchDecision, Check, CleanupObservation, CleanupOutcome, Decision,
+    FixedWindowPolicy, Limiter, Observation, Observer, observe_safely, validate_batch,
 };
 use sqlx::{
     PgPool, Postgres,
@@ -124,26 +126,26 @@ mod maintenance;
 mod protocol;
 
 pub use config::{PostgresConfig, PostgresConfigError};
-pub use errors::{CheckError, MaintenanceError};
+pub use errors::{
+    BatchCheckError, CheckError, CheckPhase, CleanupPhase, MaintenanceError, StorageInvariantError,
+};
 pub use protocol::{CAPACITY_SHARD_COUNT, HARD_MAX_ROWS_PER_SHARD};
 
 use admission::{
-    BatchSqlInput, acquire_check_connection, run_check_transaction, single_decision_from_batch,
+    Admission, BatchSqlInput, acquire_check_connection, batch_decision, run_check_transaction,
+    single_decision,
 };
-use errors::check_error_consumption;
 use maintenance::{acquire_maintenance_connection, run_cleanup_transaction};
 
 #[cfg(test)]
 use admission::{
-    PendingAllowance, PendingBatchDenial, PendingDenial, PendingQuotaDenial, database_integer,
+    PendingAllowance, PendingDenial, PendingQuotaDenial, database_integer,
     finish_denied_transaction,
 };
 #[cfg(test)]
 use protocol::{
     BATCH_PREFLIGHT_SQL, BATCH_UPSERT_SQL, CLEANUP_SQL, advisory_lock_id, capacity_shard,
 };
-#[cfg(test)]
-use runlimit_core::BatchError;
 #[cfg(test)]
 use sqlx::postgres::types::PgInterval;
 
@@ -208,7 +210,7 @@ impl fmt::Debug for PostgresLimiter {
 }
 
 impl PostgresLimiter {
-    /// Creates a limiter using `pool`.
+    /// Creates a limiter using `pool` and the default [`PostgresConfig`].
     ///
     /// Call [`Self::migrate`] during application startup before admitting
     /// requests.
@@ -220,13 +222,11 @@ impl PostgresLimiter {
         }
     }
 
-    /// Creates a limiter using an explicit runtime configuration.
-    pub const fn with_config(pool: PgPool, config: PostgresConfig) -> Self {
-        Self {
-            pool,
-            config,
-            observer: None,
-        }
+    /// Returns this limiter with an explicit runtime configuration.
+    #[must_use]
+    pub const fn with_config(mut self, config: PostgresConfig) -> Self {
+        self.config = config;
+        self
     }
 
     /// Returns this limiter with an operational observer.
@@ -284,43 +284,9 @@ impl PostgresLimiter {
 
     /// Checks and, when allowed, consumes one fixed-window quota.
     ///
-    /// A denied decision does not change the stored counter.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CheckError::DefinitelyNotConsumed`] for failures before a
-    /// successful commit and [`CheckError::CommitOutcomeUnknown`] when commit
-    /// confirmation is unavailable. An internal single-response invariant
-    /// failure reports whether the batch was rolled back or committed.
-    pub async fn check(&self, check: &Check<'_>) -> Result<Decision, CheckError> {
-        let started = WallClockInstant::now();
-        let result = self
-            .check_all_unobserved(std::slice::from_ref(check))
-            .await
-            .and_then(single_decision_from_batch);
-        self.observe_single_admission(check, &result, started.elapsed());
-        result
-    }
-
-    /// Atomically checks and consumes every quota in `checks`.
-    ///
-    /// Rows are acquired in a deterministic storage-key order to avoid
-    /// deadlocks between overlapping batches. Returned allowed decisions retain
-    /// the caller's input order. Repeated occurrences of the same storage key
-    /// are rejected before a connection is acquired because their independent
-    /// decision metadata would be ambiguous.
-    ///
-    /// New keys lock their capacity-ledger rows in shard order. If the earliest
-    /// caller-ordered failure is the configured shard bound, the batch returns
-    /// [`runlimit_core::Denial::storage_capacity`] with no retry duration and changes neither
-    /// quota nor storage. Existing and expired target rows need no new slot.
-    ///
-    /// If any check is denied, the backend attempts an explicit rollback and
-    /// the returned denial index is the earliest denied item in caller order.
-    /// A rollback error or deadline does not replace the denial because no
-    /// counter was changed; instead, the connection is discarded so socket
-    /// closure rolls the transaction back. Passing an empty slice succeeds
-    /// without acquiring a database connection.
+    /// A denied decision does not change the stored counter. A single check
+    /// has no batch structure to validate, so it goes straight to the
+    /// database and its error type carries no batch-only variants.
     ///
     /// # Errors
     ///
@@ -328,7 +294,41 @@ impl PostgresLimiter {
     /// [`CheckError::TimedOutBeforeCommit`]. Other database failures before
     /// commit are [`CheckError::DefinitelyNotConsumed`]. Any commit error is
     /// conservatively classified as [`CheckError::CommitOutcomeUnknown`].
-    pub async fn check_all(&self, checks: &[Check<'_>]) -> Result<BatchDecision, CheckError> {
+    pub async fn check(&self, check: &Check<'_>) -> Result<Decision, CheckError> {
+        let started = WallClockInstant::now();
+        let result = self
+            .run_checks(std::slice::from_ref(check), single_decision)
+            .await;
+        self.observe_single_admission(check, &result, started.elapsed());
+        result
+    }
+
+    /// Atomically checks and consumes every quota in the nonempty `checks`.
+    ///
+    /// Rows are acquired in a deterministic storage-key order to avoid
+    /// deadlocks between overlapping batches. Returned allowed decisions retain
+    /// the caller's input order. An empty batch, repeated occurrences of the
+    /// same storage key, and mixed quota modes are rejected before a
+    /// connection is acquired.
+    ///
+    /// New keys lock their capacity-ledger rows in shard order. If the earliest
+    /// caller-ordered failure is the configured shard bound, the batch returns
+    /// [`runlimit_core::Denial::StorageCapacity`] with no retry delay and
+    /// changes neither quota nor storage. Existing and expired target rows
+    /// need no new slot.
+    ///
+    /// If any check is denied, the backend attempts an explicit rollback and
+    /// the returned denial index is the earliest denied item in caller order.
+    /// A rollback error or deadline does not replace the denial because no
+    /// counter was changed; instead, the connection is discarded so socket
+    /// closure rolls the transaction back.
+    ///
+    /// # Errors
+    ///
+    /// Structural batch failures are [`BatchCheckError::InvalidBatch`] and
+    /// consume nothing. Database failures are [`BatchCheckError::Check`] with
+    /// the same classification as [`Self::check`].
+    pub async fn check_all(&self, checks: &[Check<'_>]) -> Result<BatchDecision, BatchCheckError> {
         let started = WallClockInstant::now();
         let result = self.check_all_unobserved(checks).await;
         self.observe_batch_admission(checks, &result, started.elapsed());
@@ -338,12 +338,23 @@ impl PostgresLimiter {
     async fn check_all_unobserved(
         &self,
         checks: &[Check<'_>],
-    ) -> Result<BatchDecision, CheckError> {
+    ) -> Result<BatchDecision, BatchCheckError> {
         validate_batch(checks, self.config.max_batch_size())?;
-        if checks.is_empty() {
-            return Ok(BatchDecision::allowed(Vec::new()));
-        }
+        let batch_size = checks.len();
+        Ok(self
+            .run_checks(checks, move |admission| {
+                batch_decision(batch_size, admission)
+            })
+            .await?)
+    }
 
+    /// Runs one admission transaction for a validated, nonempty slice of
+    /// checks and shapes its outcome with `build`.
+    async fn run_checks<D>(
+        &self,
+        checks: &[Check<'_>],
+        build: impl FnOnce(Admission) -> Result<D, CheckError>,
+    ) -> Result<D, CheckError> {
         // Materialize every SQL array and both lock orders before reserving a
         // pool slot. Every database phase then consumes the exact same key
         // arrays, preventing identity drift between locking and mutation.
@@ -361,6 +372,7 @@ impl PostgresLimiter {
             checks,
             self.config.maximum_rows_per_shard(),
             deadline,
+            build,
         )
         .await;
         guarded_connection.finish(outcome)
@@ -412,7 +424,7 @@ impl PostgresLimiter {
             Ok(decision) => self
                 .observe_admission(|| AdmissionObservation::from_check(check, decision, elapsed)),
             Err(error) => self.observe_admission(|| {
-                AdmissionObservation::failed_check(check, check_error_consumption(error), elapsed)
+                AdmissionObservation::failed_check(check, error.consumption(), elapsed)
             }),
         }
     }
@@ -420,7 +432,7 @@ impl PostgresLimiter {
     fn observe_batch_admission(
         &self,
         checks: &[Check<'_>],
-        result: &Result<BatchDecision, CheckError>,
+        result: &Result<BatchDecision, BatchCheckError>,
         elapsed: Duration,
     ) {
         match result {
@@ -428,19 +440,7 @@ impl PostgresLimiter {
                 .observe_admission(|| AdmissionObservation::from_batch(checks, decision, elapsed)),
             Err(error) => {
                 self.observe_admission(|| {
-                    if let [check] = checks {
-                        AdmissionObservation::failed_batch_for_check(
-                            check,
-                            check_error_consumption(error),
-                            elapsed,
-                        )
-                    } else {
-                        AdmissionObservation::failed_batch(
-                            checks.len(),
-                            check_error_consumption(error),
-                            elapsed,
-                        )
-                    }
+                    AdmissionObservation::failed_batch(checks, error.consumption(), elapsed)
                 });
             }
         }
@@ -464,32 +464,34 @@ impl PostgresLimiter {
             return;
         };
         let requested = usize::try_from(requested).unwrap_or(usize::MAX);
-        let observation = match result {
-            Ok(removed) => CleanupObservation::confirmed(requested, *removed, elapsed),
-            Err(error) if error.may_have_removed_rows() => {
-                CleanupObservation::outcome_unknown(requested, elapsed)
-            }
-            Err(_) => CleanupObservation::definitely_no_effect(requested, elapsed),
+        let outcome = match result {
+            Ok(removed) => CleanupOutcome::Confirmed { removed: *removed },
+            Err(error) if error.may_have_removed_rows() => CleanupOutcome::Unknown,
+            Err(_) => CleanupOutcome::NoEffect,
         };
-        observe_safely(observer.as_ref(), &Observation::Cleanup(observation));
+        observe_safely(
+            observer.as_ref(),
+            &Observation::Cleanup(CleanupObservation::new(requested, outcome, elapsed)),
+        );
     }
 }
 
 impl Limiter for PostgresLimiter {
     type Policy = FixedWindowPolicy;
-    type Error = CheckError;
+    type CheckError = CheckError;
+    type CheckAllError = BatchCheckError;
 
     fn check(
         &self,
         check: &Check<'_>,
-    ) -> impl Future<Output = Result<Decision, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Decision, Self::CheckError>> + Send {
         PostgresLimiter::check(self, check)
     }
 
     fn check_all(
         &self,
         checks: &[Check<'_>],
-    ) -> impl Future<Output = Result<BatchDecision, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<BatchDecision, Self::CheckAllError>> + Send {
         PostgresLimiter::check_all(self, checks)
     }
 }
@@ -548,10 +550,14 @@ mod tests {
 
     use super::*;
     use runlimit_core::{
-        AdmissionOperation, AdmissionOutcome, Allowance, BatchDecisionView, ConsumptionStatus,
-        DecisionView, Denial, DenialView, FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW,
+        AdmissionOperation, AdmissionOutcome, Allowance, BatchDecisionView, BatchError, Capacity,
+        ConsumptionStatus, DecisionView, Denial, FixedWindowPolicy, MAX_LIMIT, MAX_WINDOW,
         MAX_WINDOW_MILLIS, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
     };
+
+    fn capacity(value: u64) -> Capacity {
+        Capacity::new(value).unwrap()
+    }
 
     fn policy(id: &str, scope: &str) -> FixedWindowPolicy {
         FixedWindowPolicy::new(
@@ -569,23 +575,26 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingObserver {
-        events: Mutex<Vec<(AdmissionOperation, AdmissionOutcome, ConsumptionStatus)>>,
-        cleanups: Mutex<Vec<(usize, Option<u64>, ConsumptionStatus)>>,
+        events: Mutex<Vec<(usize, AdmissionOutcome, ConsumptionStatus)>>,
+        cleanups: Mutex<Vec<(usize, CleanupOutcome)>>,
     }
 
     impl Observer for RecordingObserver {
         fn observe(&self, observation: &Observation<'_>) {
             match observation {
                 Observation::Admission(admission) => self.events.lock().unwrap().push((
-                    admission.operation(),
+                    match admission.operation() {
+                        AdmissionOperation::Check { .. } => 1,
+                        AdmissionOperation::Batch { batch_size, .. } => batch_size,
+                    },
                     admission.outcome(),
                     admission.consumption(),
                 )),
-                Observation::Cleanup(cleanup) => self.cleanups.lock().unwrap().push((
-                    cleanup.requested(),
-                    cleanup.removed(),
-                    cleanup.consumption(),
-                )),
+                Observation::Cleanup(cleanup) => self
+                    .cleanups
+                    .lock()
+                    .unwrap()
+                    .push((cleanup.requested(), cleanup.outcome())),
                 // The PostgreSQL backend has no local capacity to report.
                 Observation::Capacity(_) => {}
             }
@@ -593,12 +602,14 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RecordedOperation {
+        Check,
+        Batch { batch_size: usize, has_policy: bool },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct RecordedAdmissionMetadata {
-        operation: AdmissionOperation,
-        batch_size: usize,
-        has_policy_id: bool,
-        has_scope_id: bool,
-        has_policy_fingerprint: bool,
+        operation: RecordedOperation,
         consumption: ConsumptionStatus,
     }
 
@@ -616,11 +627,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(RecordedAdmissionMetadata {
-                    operation: admission.operation(),
-                    batch_size: admission.batch_size(),
-                    has_policy_id: admission.policy_id().is_some(),
-                    has_scope_id: admission.scope_id().is_some(),
-                    has_policy_fingerprint: admission.policy_fingerprint().is_some(),
+                    operation: match admission.operation() {
+                        AdmissionOperation::Check { .. } => RecordedOperation::Check,
+                        AdmissionOperation::Batch { batch_size, policy } => {
+                            RecordedOperation::Batch {
+                                batch_size,
+                                has_policy: policy.is_some(),
+                            }
+                        }
+                    },
                     consumption: admission.consumption(),
                 });
         }
@@ -643,11 +658,13 @@ mod tests {
             MAX_WINDOW,
         )
         .unwrap();
-        let check = Check::with_cost(&policy, key(1), MAX_LIMIT).unwrap();
+        let check = Check::new(key(1).bind(&policy))
+            .with_cost(MAX_LIMIT)
+            .unwrap();
 
-        assert_eq!(database_integer(policy.limit()), i64::MAX);
+        assert_eq!(database_integer(policy.limit().get()), i64::MAX);
         assert_eq!(database_integer(check.cost()), i64::MAX);
-        let interval = PgInterval::try_from(policy.window()).unwrap();
+        let interval = PgInterval::try_from(policy.window().duration()).unwrap();
         assert_eq!(interval.months, 0);
         assert_eq!(interval.days, 0);
         assert_eq!(
@@ -662,10 +679,10 @@ mod tests {
         let alpha_identity = policy("alpha", "identity");
         let beta_client = policy("beta", "client");
         let checks = [
-            Check::new(&beta_client, key(0)),
-            Check::new(&alpha_identity, key(0)),
-            Check::new(&alpha_client, key(1)),
-            Check::new(&alpha_client, key(0)),
+            Check::new(key(0).bind(&beta_client)),
+            Check::new(key(0).bind(&alpha_identity)),
+            Check::new(key(1).bind(&alpha_client)),
+            Check::new(key(0).bind(&alpha_client)),
         ];
 
         let input = BatchSqlInput::from_checks(&checks);
@@ -681,7 +698,7 @@ mod tests {
     #[test]
     fn advisory_lock_protocol_has_a_golden_vector() {
         let policy = policy("login", "client");
-        let check = Check::new(&policy, key(7));
+        let check = Check::new(key(7).bind(&policy));
 
         assert_eq!(
             advisory_lock_id(check.counter_key()),
@@ -692,7 +709,7 @@ mod tests {
     #[test]
     fn capacity_shard_protocol_has_a_golden_vector() {
         let policy = policy("login", "client");
-        let check = Check::new(&policy, key(7));
+        let check = Check::new(key(7).bind(&policy));
 
         assert_eq!(capacity_shard(check.counter_key()), 141);
     }
@@ -705,29 +722,25 @@ mod tests {
         let observer = Arc::new(RecordingObserver::default());
         let limiter = PostgresLimiter::new(pool.clone()).with_observer(observer.clone());
 
-        assert_eq!(
-            limiter.check_all(&[]).await.unwrap(),
-            BatchDecision::allowed(Vec::new())
-        );
+        assert!(matches!(
+            limiter.check_all(&[]).await,
+            Err(BatchCheckError::InvalidBatch(BatchError::EmptyBatch))
+        ));
         assert_eq!(limiter.cleanup_expired(0).await.unwrap(), 0);
         assert_eq!(
             observer.events.lock().unwrap().as_slice(),
-            [(
-                AdmissionOperation::Batch,
-                AdmissionOutcome::Allowed,
-                ConsumptionStatus::NotConsumed,
-            )]
+            [(0, AdmissionOutcome::Failed, ConsumptionStatus::NotConsumed,)]
         );
         assert_eq!(
             observer.cleanups.lock().unwrap().as_slice(),
-            [(0, Some(0), ConsumptionStatus::Consumed)]
+            [(0, CleanupOutcome::Confirmed { removed: 0 })]
         );
 
         let panicking = PostgresLimiter::new(pool).with_observer(Arc::new(PanickingObserver));
-        assert_eq!(
-            panicking.check_all(&[]).await.unwrap(),
-            BatchDecision::allowed(Vec::new())
-        );
+        assert!(matches!(
+            panicking.check_all(&[]).await,
+            Err(BatchCheckError::InvalidBatch(BatchError::EmptyBatch))
+        ));
         assert_eq!(panicking.cleanup_expired(0).await.unwrap(), 0);
     }
 
@@ -740,15 +753,19 @@ mod tests {
         let limiter = PostgresLimiter::new(pool).with_observer(observer.clone());
         let first_policy = policy("observed.failure.first", "client");
         let second_policy = policy("observed.failure.second", "client");
-        let first = Check::new(&first_policy, key(1));
-        let second = Check::new(&second_policy, key(2));
+        let first = Check::new(key(1).bind(&first_policy));
+        let second = Check::new(key(2).bind(&second_policy));
         let elapsed = Duration::from_millis(5);
 
         limiter.observe_single_admission(&first, &Err(CheckError::CommitTimedOut), elapsed);
-        limiter.observe_batch_admission(&[first], &Err(CheckError::CommitTimedOut), elapsed);
+        limiter.observe_batch_admission(
+            &[first],
+            &Err(BatchCheckError::Check(CheckError::CommitTimedOut)),
+            elapsed,
+        );
         limiter.observe_batch_admission(
             &[first, second],
-            &Err(CheckError::CommitTimedOut),
+            &Err(BatchCheckError::Check(CheckError::CommitTimedOut)),
             elapsed,
         );
 
@@ -756,27 +773,21 @@ mod tests {
             observer.admissions.lock().unwrap().as_slice(),
             [
                 RecordedAdmissionMetadata {
-                    operation: AdmissionOperation::Check,
-                    batch_size: 1,
-                    has_policy_id: true,
-                    has_scope_id: true,
-                    has_policy_fingerprint: true,
+                    operation: RecordedOperation::Check,
                     consumption: ConsumptionStatus::PossiblyConsumed,
                 },
                 RecordedAdmissionMetadata {
-                    operation: AdmissionOperation::Batch,
-                    batch_size: 1,
-                    has_policy_id: true,
-                    has_scope_id: true,
-                    has_policy_fingerprint: true,
+                    operation: RecordedOperation::Batch {
+                        batch_size: 1,
+                        has_policy: true,
+                    },
                     consumption: ConsumptionStatus::PossiblyConsumed,
                 },
                 RecordedAdmissionMetadata {
-                    operation: AdmissionOperation::Batch,
-                    batch_size: 2,
-                    has_policy_id: false,
-                    has_scope_id: false,
-                    has_policy_fingerprint: false,
+                    operation: RecordedOperation::Batch {
+                        batch_size: 2,
+                        has_policy: false,
+                    },
                     consumption: ConsumptionStatus::PossiblyConsumed,
                 },
             ]
@@ -801,7 +812,7 @@ mod tests {
         limiter.observe_cleanup(
             7,
             &Err(MaintenanceError::TimedOutBeforeCommit {
-                operation: "testing",
+                phase: CleanupPhase::DeletingExpiredWindows,
             }),
             elapsed,
         );
@@ -817,49 +828,51 @@ mod tests {
         assert_eq!(
             observer.cleanups.lock().unwrap().as_slice(),
             [
-                (7, Some(3), ConsumptionStatus::Consumed),
-                (7, Some(0), ConsumptionStatus::NotConsumed),
-                (7, Some(0), ConsumptionStatus::NotConsumed),
-                (7, None, ConsumptionStatus::PossiblyConsumed),
-                (7, None, ConsumptionStatus::PossiblyConsumed),
+                (7, CleanupOutcome::Confirmed { removed: 3 }),
+                (7, CleanupOutcome::NoEffect),
+                (7, CleanupOutcome::NoEffect),
+                (7, CleanupOutcome::Unknown),
+                (7, CleanupOutcome::Unknown),
             ]
         );
     }
 
     #[test]
     fn response_metadata_subtracts_only_authoritative_elapsed_time() {
-        let allowed = PendingAllowance {
-            limit: 10,
-            remaining: 4,
-            reset_from_sample: Duration::from_millis(250),
-        }
-        .finish(Duration::from_millis(80));
+        let allowed = PendingAllowance::new(capacity(10), 6, Duration::from_millis(250))
+            .unwrap()
+            .finish(Duration::from_millis(80));
         let denied = PendingDenial::Quota(PendingQuotaDenial {
-            limit: 10,
+            limit: capacity(10),
             retry_from_sample: Duration::from_millis(150),
         })
         .finish(Duration::from_millis(80));
 
-        assert_eq!(allowed, Allowance::new(10, 4, Duration::from_millis(170)));
+        assert_eq!(
+            allowed,
+            Allowance::new(capacity(10), 4, Duration::from_millis(170)).unwrap()
+        );
         assert_eq!(
             denied,
-            Denial::quota_exceeded(QuotaDenial::new(10, Duration::from_millis(70)))
+            Denial::QuotaExceeded(QuotaDenial::new(capacity(10), Duration::from_millis(70)))
         );
+    }
+
+    #[test]
+    fn stored_usage_above_the_limit_cannot_construct_a_pending_allowance() {
+        let malformed = PendingAllowance::new(capacity(10), 11, Duration::from_millis(250))
+            .expect_err("usage above the limit cannot become pending allowance state");
+
+        assert!(matches!(malformed, CheckError::StorageInvariant(_)));
+        assert_eq!(malformed.consumption(), ConsumptionStatus::NotConsumed);
     }
 
     #[tokio::test]
     async fn denied_decision_survives_rollback_failure_and_discards_connection() {
+        let quota = QuotaDenial::new(capacity(10), Duration::from_millis(130));
         let outcome = finish_denied_transaction(
             Instant::now() + Duration::from_secs(1),
-            PendingBatchDenial::Enforced {
-                index: 2,
-                batch_size: 3,
-                denial: PendingDenial::Quota(PendingQuotaDenial {
-                    limit: 10,
-                    retry_from_sample: Duration::from_millis(150),
-                }),
-            },
-            Duration::from_millis(20),
+            BatchDecision::denied(2, 3, quota).unwrap(),
             std::future::ready(Err(sqlx::Error::Protocol(
                 "injected rollback failure".to_owned(),
             ))),
@@ -874,24 +887,17 @@ mod tests {
             BatchDecisionView::Denied {
                 index: 2,
                 batch_size: NonZeroUsize::new(3).unwrap(),
-                denial: DenialView::QuotaExceeded(QuotaDenial::new(10, Duration::from_millis(130))),
+                denial: Denial::QuotaExceeded(quota),
             }
         );
     }
 
     #[tokio::test]
     async fn denied_decision_survives_rollback_deadline_and_discards_connection() {
+        let quota = QuotaDenial::new(capacity(1), Duration::from_millis(50));
         let outcome = finish_denied_transaction(
             Instant::now(),
-            PendingBatchDenial::Enforced {
-                index: 0,
-                batch_size: 1,
-                denial: PendingDenial::Quota(PendingQuotaDenial {
-                    limit: 1,
-                    retry_from_sample: Duration::from_millis(50),
-                }),
-            },
-            Duration::ZERO,
+            Decision::denied(quota),
             std::future::pending(),
         )
         .await;
@@ -899,29 +905,20 @@ mod tests {
         let ConnectionOutcome::MustClose(decision) = outcome else {
             panic!("rollback deadline must close the connection")
         };
-        assert!(matches!(
+        assert_eq!(
             decision.view(),
-            BatchDecisionView::Denied {
-                index: 0,
-                denial: DenialView::QuotaExceeded(quota),
-                ..
-            } if quota.capacity() == 1
-        ));
+            DecisionView::Denied {
+                denial: Denial::QuotaExceeded(quota),
+            }
+        );
     }
 
     #[tokio::test]
     async fn shadow_quota_denial_is_reported_after_rollback() {
+        let quota = QuotaDenial::new(capacity(1), Duration::from_secs(1));
         let outcome = finish_denied_transaction(
             Instant::now() + Duration::from_secs(1),
-            PendingBatchDenial::Shadow {
-                index: 0,
-                batch_size: 1,
-                denial: PendingQuotaDenial {
-                    limit: 1,
-                    retry_from_sample: Duration::from_secs(1),
-                },
-            },
-            Duration::ZERO,
+            Decision::shadow_denied(quota),
             std::future::ready(Ok(())),
         )
         .await;
@@ -929,12 +926,99 @@ mod tests {
         let ConnectionOutcome::Reusable(decision) = outcome else {
             panic!("successful rollback must reuse the connection")
         };
-        assert!(matches!(
+        assert_eq!(
             decision.view(),
-            BatchDecisionView::ShadowDenied {
-                index: 0, denial, ..
-            } if denial.capacity() == 1
+            DecisionView::ShadowDenied { denial: quota }
+        );
+    }
+
+    #[test]
+    fn single_decisions_are_shaped_before_the_transaction_is_finalized() {
+        let allowance = Allowance::new(capacity(10), 4, Duration::from_secs(1)).unwrap();
+        let quota = QuotaDenial::new(capacity(10), Duration::from_secs(1));
+
+        assert_eq!(
+            single_decision(Admission::Allowed(vec![allowance])).unwrap(),
+            Decision::allowed(allowance)
+        );
+        assert_eq!(
+            single_decision(Admission::Denied {
+                index: 0,
+                denial: Denial::QuotaExceeded(quota),
+            })
+            .unwrap(),
+            Decision::denied(quota)
+        );
+        assert_eq!(
+            single_decision(Admission::ShadowDenied {
+                index: 0,
+                denial: quota,
+            })
+            .unwrap(),
+            Decision::shadow_denied(quota)
+        );
+
+        for malformed in [
+            single_decision(Admission::Allowed(vec![allowance, allowance])),
+            single_decision(Admission::Denied {
+                index: 1,
+                denial: Denial::QuotaExceeded(quota),
+            }),
+            single_decision(Admission::ShadowDenied {
+                index: 1,
+                denial: quota,
+            }),
+        ] {
+            let error = malformed.expect_err("a malformed single response is a failure");
+            assert!(matches!(error, CheckError::StorageInvariant(_)));
+            assert_eq!(error.consumption(), ConsumptionStatus::NotConsumed);
+        }
+    }
+
+    #[test]
+    fn batch_decisions_are_shaped_against_the_submitted_batch() {
+        let allowance = Allowance::new(capacity(10), 4, Duration::from_secs(1)).unwrap();
+        let quota = QuotaDenial::new(capacity(10), Duration::from_secs(1));
+
+        assert_eq!(
+            batch_decision(2, Admission::Allowed(vec![allowance, allowance])).unwrap(),
+            BatchDecision::allowed(vec![allowance, allowance]).unwrap()
+        );
+        assert!(matches!(
+            batch_decision(2, Admission::Allowed(vec![allowance])),
+            Err(CheckError::StorageInvariant(_))
         ));
+        assert_eq!(
+            batch_decision(
+                2,
+                Admission::Denied {
+                    index: 1,
+                    denial: Denial::QuotaExceeded(quota),
+                }
+            )
+            .unwrap(),
+            BatchDecision::denied(1, 2, quota).unwrap()
+        );
+        assert_eq!(
+            batch_decision(
+                2,
+                Admission::ShadowDenied {
+                    index: 1,
+                    denial: quota,
+                }
+            )
+            .unwrap(),
+            BatchDecision::shadow_denied(1, 2, quota).unwrap()
+        );
+        let out_of_range = batch_decision(
+            2,
+            Admission::Denied {
+                index: 2,
+                denial: Denial::QuotaExceeded(quota),
+            },
+        )
+        .expect_err("a denial outside the batch is a failure");
+        assert!(matches!(out_of_range, CheckError::StorageInvariant(_)));
     }
 
     #[test]
@@ -988,10 +1072,10 @@ mod tests {
         let alpha = policy("alpha", "client");
         let beta = policy("beta", "client");
         let checks = [
-            Check::new(&beta, key(7)),
-            Check::new(&beta, key(7)),
-            Check::new(&alpha, key(8)),
-            Check::new(&alpha, key(8)),
+            Check::new(key(7).bind(&beta)),
+            Check::new(key(7).bind(&beta)),
+            Check::new(key(8).bind(&alpha)),
+            Check::new(key(8).bind(&alpha)),
         ];
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgresql://runlimit:runlimit@127.0.0.1:1/runlimit")
@@ -1005,7 +1089,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            CheckError::InvalidBatch(BatchError::DuplicateKey {
+            BatchCheckError::InvalidBatch(BatchError::DuplicateKey {
                 first_index: 0,
                 duplicate_index: 1,
             })
@@ -1017,8 +1101,8 @@ mod tests {
         let first_policy = policy("login", "client");
         let second_policy = policy("signup", "client");
         let checks = [
-            Check::new(&first_policy, key(1)),
-            Check::new(&second_policy, key(2)),
+            Check::new(key(1).bind(&first_policy)),
+            Check::new(key(2).bind(&second_policy)),
         ];
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgresql://runlimit:runlimit@127.0.0.1:1/runlimit")
@@ -1026,7 +1110,7 @@ mod tests {
         let config = PostgresConfig::new()
             .with_max_batch_size(1)
             .expect("one is a valid batch limit");
-        let limiter = PostgresLimiter::with_config(pool, config);
+        let limiter = PostgresLimiter::new(pool).with_config(config);
 
         let error = limiter
             .check_all(&checks)
@@ -1035,7 +1119,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            CheckError::InvalidBatch(BatchError::BatchTooLarge {
+            BatchCheckError::InvalidBatch(BatchError::BatchTooLarge {
                 actual: 2,
                 maximum: 1,
             })
@@ -1046,7 +1130,10 @@ mod tests {
     async fn mixed_quota_modes_fail_before_connecting() {
         let enforced = policy("enforced", "client");
         let shadow = policy("shadow", "client").with_quota_mode(QuotaMode::Shadow);
-        let checks = [Check::new(&enforced, key(1)), Check::new(&shadow, key(2))];
+        let checks = [
+            Check::new(key(1).bind(&enforced)),
+            Check::new(key(2).bind(&shadow)),
+        ];
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgresql://runlimit:runlimit@127.0.0.1:1/runlimit")
             .expect("syntactically valid database URL");
@@ -1059,7 +1146,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            CheckError::InvalidBatch(BatchError::MixedQuotaModes {
+            BatchCheckError::InvalidBatch(BatchError::MixedQuotaModes {
                 first: QuotaMode::Enforce,
                 index: 1,
                 actual: QuotaMode::Shadow,
@@ -1068,68 +1155,60 @@ mod tests {
     }
 
     #[test]
-    fn error_reports_consumption_uncertainty() {
+    fn error_reports_consumption_certainty() {
         let definite = CheckError::DefinitelyNotConsumed(sqlx::Error::RowNotFound);
         let unknown = CheckError::CommitOutcomeUnknown(sqlx::Error::RowNotFound);
-        let rolled_back_invariant = CheckError::ResponseInvariant;
-        let committed_invariant = CheckError::CommittedResponseInvariant;
+        let timed_out = CheckError::TimedOutBeforeCommit {
+            phase: CheckPhase::AcquiringCounterRowLocks,
+        };
+        let invariant = CheckError::storage_invariant("injected");
+        let decode_invariant =
+            CheckError::storage_decode_invariant("decode injected", sqlx::Error::RowNotFound);
         let cleanup_definite = MaintenanceError::Database(sqlx::Error::RowNotFound);
         let cleanup_unknown = MaintenanceError::CommitOutcomeUnknown(sqlx::Error::RowNotFound);
 
-        assert!(!definite.may_have_consumed_quota());
-        assert!(unknown.may_have_consumed_quota());
-        assert!(CheckError::CommitTimedOut.may_have_consumed_quota());
-        assert!(!rolled_back_invariant.may_have_consumed_quota());
-        assert!(committed_invariant.may_have_consumed_quota());
+        assert_eq!(definite.consumption(), ConsumptionStatus::NotConsumed);
+        assert_eq!(timed_out.consumption(), ConsumptionStatus::NotConsumed);
+        assert_eq!(invariant.consumption(), ConsumptionStatus::NotConsumed);
         assert_eq!(
-            check_error_consumption(&definite),
+            decode_invariant.consumption(),
             ConsumptionStatus::NotConsumed
         );
+        assert_eq!(unknown.consumption(), ConsumptionStatus::PossiblyConsumed);
         assert_eq!(
-            check_error_consumption(&unknown),
+            CheckError::CommitTimedOut.consumption(),
             ConsumptionStatus::PossiblyConsumed
         );
         assert_eq!(
-            check_error_consumption(&CheckError::CommitTimedOut),
-            ConsumptionStatus::PossiblyConsumed
-        );
-        assert_eq!(
-            check_error_consumption(&rolled_back_invariant),
+            BatchCheckError::InvalidBatch(BatchError::EmptyBatch).consumption(),
             ConsumptionStatus::NotConsumed
         );
         assert_eq!(
-            check_error_consumption(&committed_invariant),
-            ConsumptionStatus::Consumed
+            BatchCheckError::Check(CheckError::CommitTimedOut).consumption(),
+            ConsumptionStatus::PossiblyConsumed
+        );
+        assert_eq!(
+            timed_out.to_string(),
+            "PostgreSQL rate-limit check timed out while acquiring counter row lock; quota was \
+             not consumed"
+        );
+        let CheckError::StorageInvariant(semantic) = &invariant else {
+            panic!("expected a storage invariant");
+        };
+        assert_eq!(semantic.detail(), "injected");
+        assert!(std::error::Error::source(semantic).is_none());
+
+        let CheckError::StorageInvariant(decode) = &decode_invariant else {
+            panic!("expected a decode storage invariant");
+        };
+        assert_eq!(decode.detail(), "decode injected");
+        assert!(
+            std::error::Error::source(decode)
+                .is_some_and(|source| source.downcast_ref::<sqlx::Error>().is_some())
         );
         assert!(!cleanup_definite.may_have_removed_rows());
         assert!(cleanup_unknown.may_have_removed_rows());
         assert!(MaintenanceError::CommitTimedOut.may_have_removed_rows());
-    }
-
-    #[test]
-    fn malformed_single_responses_preserve_consumption_status() {
-        let denial = QuotaDenial::try_new(1, Duration::from_secs(1)).unwrap();
-
-        let committed = single_decision_from_batch(BatchDecision::allowed(Vec::new()))
-            .expect_err("malformed allowed response follows a confirmed commit");
-        let rolled_back = single_decision_from_batch(BatchDecision::denied(1, 2, denial))
-            .expect_err("malformed denied response follows a rollback");
-
-        assert!(matches!(committed, CheckError::CommittedResponseInvariant));
-        assert!(committed.may_have_consumed_quota());
-        assert!(matches!(rolled_back, CheckError::ResponseInvariant));
-        assert!(!rolled_back.may_have_consumed_quota());
-    }
-
-    #[test]
-    fn singleton_shadow_batch_converts_to_a_permitted_decision() {
-        let denial = QuotaDenial::new(1, Duration::from_secs(1));
-
-        let decision =
-            single_decision_from_batch(BatchDecision::shadow_denied(0, 1, denial)).unwrap();
-
-        assert!(decision.permits_request());
-        assert_eq!(decision.view(), DecisionView::ShadowDenied { denial });
     }
 
     #[test]

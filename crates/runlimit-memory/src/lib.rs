@@ -5,11 +5,14 @@
 //! generic-cell-rate-algorithm model for process-local use. Both stores
 //! deliberately refuse to evict live entries. When a shard is full, a new
 //! subject is denied until bounded cleanup frees space. An atomic batch that
-//! can never fit in one shard returns a structural [`MemoryStoreError`] (wrapped
-//! by [`GcraStoreError`] for GCRA admission) instead of a retryable capacity
-//! denial. Both stores implement
-//! [`runlimit_core::Limiter`] for async generic adapters while retaining their
-//! synchronous inherent check methods.
+//! can never fit in one shard returns a structural [`MemoryBatchError`]
+//! (wrapped by [`GcraBatchError`] for GCRA admission) instead of a retryable
+//! capacity denial. A single [`MemoryStore`] check can fail only because its
+//! shard is poisoned, so its error type is the bare [`PoisonedShardError`]. A
+//! single [`GcraStore`] check returns [`GcraCheckError`], which also names an
+//! exact-arithmetic overflow. Both stores implement [`runlimit_core::Limiter`]
+//! for async generic adapters while retaining their synchronous inherent check
+//! methods.
 //!
 //! The optional `serde` feature enables validated [`MemoryStoreConfig`]
 //! loading, read-only [`MemoryStoreStats`] serialization, and the corresponding
@@ -23,5 +26,7 @@ mod store;
 
 pub use clock::{Clock, SystemClock};
 pub use config::{MemoryStoreConfig, MemoryStoreConfigError};
-pub use gcra::{GcraStore, GcraStoreError};
-pub use store::{MemoryStore, MemoryStoreError, MemoryStoreStats};
+pub use gcra::{GcraBatchError, GcraCheckError, GcraStore, GcraStoreBuilder};
+pub use store::{
+    MemoryBatchError, MemoryStore, MemoryStoreBuilder, MemoryStoreStats, PoisonedShardError,
+};

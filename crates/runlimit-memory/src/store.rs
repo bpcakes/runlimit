@@ -5,9 +5,9 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionObservation, Allowance, BatchDecision, BatchError, CapacityObservation, Check,
-    CleanupObservation, ConsumptionStatus, CounterKey, Decision, Denial, Limiter, Observation,
-    Observer, QuotaDenial, observe_safely, validate_batch,
+    AdmissionObservation, Allowance, BatchDecision, BatchError, Capacity, CapacityObservation,
+    Check, CleanupObservation, CleanupOutcome, ConsumptionStatus, CounterKey, Decision, Limiter,
+    Observation, Observer, QuotaDenial, QuotaMode, observe_safely, validate_batch,
 };
 use thiserror::Error;
 
@@ -29,11 +29,10 @@ impl Shard<Entry> {
         let (entry, expires_at_millis) = self.active_entry(check.counter_key, now_millis)?;
         let remaining = remaining_quota(check.limit, entry.used);
         (check.cost > remaining).then(|| {
-            QuotaDenial::try_new(
+            QuotaDenial::new(
                 check.limit,
                 duration_from_millis(expires_at_millis.saturating_sub(now_millis)),
             )
-            .expect("prepared policy limits are validated")
         })
     }
 
@@ -51,7 +50,7 @@ impl Shard<Entry> {
                 entry.used = entry.used.saturating_add(check.cost);
             })
             .expect("the active entry was present");
-            return Allowance::new(
+            return allowance(
                 check.limit,
                 remaining.saturating_sub(check.cost),
                 duration_from_millis(active_expires_at_millis.saturating_sub(now_millis)),
@@ -63,7 +62,7 @@ impl Shard<Entry> {
             Entry { used: check.cost },
             expires_at_millis,
         );
-        Allowance::new(
+        allowance(
             check.limit,
             remaining_quota(check.limit, check.cost),
             duration_from_millis(expires_at_millis.saturating_sub(now_millis)),
@@ -71,12 +70,19 @@ impl Shard<Entry> {
     }
 }
 
+/// Builds an allowance whose `available` was derived by subtracting from
+/// `limit`, so it can never exceed the capacity.
+fn allowance(limit: Capacity, available: u64, replenishes_after: Duration) -> Allowance {
+    Allowance::new(limit, available, replenishes_after)
+        .expect("remaining quota is derived from the limit and cannot exceed it")
+}
+
 #[derive(Debug)]
 struct PreparedCheck {
     input_index: usize,
     counter_key: CounterKey,
     shard_position: usize,
-    limit: u64,
+    limit: Capacity,
     window_millis: u64,
     cost: u64,
 }
@@ -88,7 +94,7 @@ impl PreparedCheck {
             counter_key: check.counter_key(),
             shard_position,
             limit: check.policy().limit(),
-            window_millis: check.policy().window_millis(),
+            window_millis: check.policy().window().millis(),
             cost: check.cost(),
         }
     }
@@ -108,14 +114,40 @@ struct Evaluation<T, E> {
 ///
 /// If application code panics while a shard is locked, that shard remains
 /// poisoned and every later operation touching it fails closed with
-/// [`MemoryStoreError::PoisonedShard`]. [`MemoryStore::recover_poisoned`] is an
-/// explicit availability tradeoff: it restores poisoned shards by discarding
-/// their counters rather than trusting state whose consistency is unknown.
+/// [`PoisonedShardError`]. [`MemoryStore::recover_poisoned`] is an explicit
+/// availability tradeoff: it restores poisoned shards by discarding their
+/// counters rather than trusting state whose consistency is unknown.
 pub struct MemoryStore<C = SystemClock> {
     config: MemoryStoreConfig,
     clock: C,
     shards: BoundedShards<Entry>,
     observer: Option<Arc<dyn Observer>>,
+}
+
+/// Builds an empty [`MemoryStore`] with its clock chosen before any quota
+/// state exists.
+///
+/// Clock readings are coordinates for every timestamp stored in the shards,
+/// so the clock is part of the store's identity rather than mutable runtime
+/// configuration. A built store therefore exposes no clock-replacement API.
+///
+/// ```compile_fail,E0599
+/// use std::time::Duration;
+/// use runlimit_memory::{Clock, MemoryStore, MemoryStoreConfig};
+///
+/// struct TestClock;
+/// impl Clock for TestClock {
+///     fn now(&self) -> Duration { Duration::ZERO }
+/// }
+///
+/// let store = MemoryStore::new(MemoryStoreConfig::new(1)?);
+/// let store = store.with_clock(TestClock);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use]
+pub struct MemoryStoreBuilder<C = SystemClock> {
+    config: MemoryStoreConfig,
+    clock: C,
 }
 
 impl<C> fmt::Debug for MemoryStore<C> {
@@ -143,25 +175,47 @@ impl fmt::Debug for Redacted {
 impl MemoryStore<SystemClock> {
     /// Creates a store using the system monotonic clock.
     pub fn new(config: MemoryStoreConfig) -> Self {
-        Self::with_clock(config, SystemClock::new())
+        Self::builder(config).build()
+    }
+
+    /// Begins constructing an empty store.
+    ///
+    /// Use [`MemoryStoreBuilder::with_clock`] before [`MemoryStoreBuilder::build`]
+    /// when deterministic time is required. Once built, the store's clock
+    /// cannot be replaced because its counters contain timestamps in that
+    /// clock's coordinate system.
+    pub fn builder(config: MemoryStoreConfig) -> MemoryStoreBuilder<SystemClock> {
+        MemoryStoreBuilder {
+            config,
+            clock: SystemClock::new(),
+        }
     }
 }
 
-impl<C: Clock> MemoryStore<C> {
-    /// Creates a store using a caller-supplied monotonic clock.
-    ///
-    /// Supplying a clock is primarily useful for deterministic tests.
-    pub fn with_clock(config: MemoryStoreConfig, clock: C) -> Self {
-        let shards = BoundedShards::new(&config);
-
-        Self {
-            config,
+impl<C> MemoryStoreBuilder<C> {
+    /// Returns this builder with a caller-supplied monotonic clock.
+    pub fn with_clock<D: Clock>(self, clock: D) -> MemoryStoreBuilder<D> {
+        MemoryStoreBuilder {
+            config: self.config,
             clock,
+        }
+    }
+}
+
+impl<C: Clock> MemoryStoreBuilder<C> {
+    /// Builds an empty store whose timestamps use the selected clock.
+    pub fn build(self) -> MemoryStore<C> {
+        let shards = BoundedShards::new(&self.config);
+        MemoryStore {
+            config: self.config,
+            clock: self.clock,
             shards,
             observer: None,
         }
     }
+}
 
+impl<C> MemoryStore<C> {
     /// Returns this store with an operational observer.
     ///
     /// Observer callbacks run after internal locks are released. A callback
@@ -171,7 +225,9 @@ impl<C: Clock> MemoryStore<C> {
         self.observer = Some(observer);
         self
     }
+}
 
+impl<C: Clock> MemoryStore<C> {
     fn observe_shard_effects(&self, effects: &[ShardEffect]) {
         for effect in effects {
             self.observe_shard_effect(effect);
@@ -185,9 +241,11 @@ impl<C: Clock> MemoryStore<C> {
 
         observe_safely(
             observer.as_ref(),
-            &Observation::Cleanup(CleanupObservation::confirmed(
+            &Observation::Cleanup(CleanupObservation::new(
                 effect.cleanup.requested,
-                usize_to_u64(effect.cleanup.removed),
+                CleanupOutcome::Confirmed {
+                    removed: usize_to_u64(effect.cleanup.removed),
+                },
                 effect.cleanup.elapsed,
             )),
         );
@@ -215,7 +273,7 @@ impl<C: Clock> MemoryStore<C> {
     ///
     /// Returns an error without allowing the request when the target shard is
     /// poisoned.
-    pub fn check(&self, check: &Check<'_>) -> Result<Decision, MemoryStoreError> {
+    pub fn check(&self, check: &Check<'_>) -> Result<Decision, PoisonedShardError> {
         let started = Instant::now();
         let result = self.check_inner(check);
         let elapsed = started.elapsed();
@@ -238,7 +296,7 @@ impl<C: Clock> MemoryStore<C> {
     fn check_inner(
         &self,
         check: &Check<'_>,
-    ) -> Result<Evaluation<Decision, ShardEffect>, MemoryStoreError> {
+    ) -> Result<Evaluation<Decision, ShardEffect>, PoisonedShardError> {
         let counter_key = check.counter_key();
         let shard_index = self.shards.shard_index(&counter_key);
         let prepared = PreparedCheck::new(0, check, 0);
@@ -252,17 +310,13 @@ impl<C: Clock> MemoryStore<C> {
         let cleanup_elapsed = cleanup_started.elapsed();
 
         let decision = if let Some(denial) = shard.quota_denial(&prepared, now_millis) {
-            if check.policy().quota_mode() == runlimit_core::QuotaMode::Shadow {
+            if check.policy().quota_mode() == QuotaMode::Shadow {
                 Decision::shadow_denied(denial)
             } else {
                 Decision::denied(denial)
             }
         } else if !shard.contains_key(counter_key) && shard.used() >= shard.capacity() {
-            Decision::denied(Denial::storage_capacity(
-                shard
-                    .capacity_retry_after_millis(now_millis)
-                    .map(duration_from_millis),
-            ))
+            Decision::denied(shard.storage_capacity_denial(now_millis))
         } else {
             Decision::allowed(shard.consume(&prepared, now_millis))
         };
@@ -282,20 +336,18 @@ impl<C: Clock> MemoryStore<C> {
         })
     }
 
-    /// Evaluates a batch atomically.
+    /// Evaluates a nonempty batch atomically.
     ///
     /// If any check is denied, none of the checks consumes quota. Returned
     /// allowed decisions preserve input order.
     ///
     /// # Errors
     ///
-    /// Returns an error before quota consumption when the batch exceeds its
-    /// configured bound, contains a duplicate key, targets more distinct keys
-    /// at one shard than that shard can ever store, or a touched shard is
-    /// poisoned.
-    ///
-    #[allow(clippy::too_many_lines)]
-    pub fn check_all(&self, checks: &[Check<'_>]) -> Result<BatchDecision, MemoryStoreError> {
+    /// Returns an error before quota consumption when the batch is empty,
+    /// exceeds its configured bound, mixes quota modes, contains a duplicate
+    /// key, targets more distinct keys at one shard than that shard can ever
+    /// store, or a touched shard is poisoned.
+    pub fn check_all(&self, checks: &[Check<'_>]) -> Result<BatchDecision, MemoryBatchError> {
         let started = Instant::now();
         let result = self.check_all_inner(checks);
         let elapsed = started.elapsed();
@@ -308,11 +360,7 @@ impl<C: Clock> MemoryStore<C> {
                 });
             }
             Err(_) => self.observe_admission(|| {
-                AdmissionObservation::failed_batch(
-                    checks.len(),
-                    ConsumptionStatus::NotConsumed,
-                    elapsed,
-                )
+                AdmissionObservation::failed_batch(checks, ConsumptionStatus::NotConsumed, elapsed)
             }),
         }
 
@@ -323,14 +371,8 @@ impl<C: Clock> MemoryStore<C> {
     fn check_all_inner(
         &self,
         checks: &[Check<'_>],
-    ) -> Result<Evaluation<BatchDecision, Vec<ShardEffect>>, MemoryStoreError> {
+    ) -> Result<Evaluation<BatchDecision, Vec<ShardEffect>>, MemoryBatchError> {
         validate_batch(checks, self.config.max_batch_size())?;
-        if checks.is_empty() {
-            return Ok(Evaluation {
-                value: BatchDecision::allowed(Vec::new()),
-                effect: Vec::new(),
-            });
-        }
 
         let topology = BatchTopology::new(
             checks
@@ -372,13 +414,13 @@ impl<C: Clock> MemoryStore<C> {
         for check in &prepared {
             let shard = &locked_shards[check.shard_position].1;
             if let Some(denial) = shard.quota_denial(check, now_millis) {
-                let value = if checks[check.input_index].policy().quota_mode()
-                    == runlimit_core::QuotaMode::Shadow
+                let value = if checks[check.input_index].policy().quota_mode() == QuotaMode::Shadow
                 {
                     BatchDecision::shadow_denied(check.input_index, checks.len(), denial)
                 } else {
                     BatchDecision::denied(check.input_index, checks.len(), denial)
-                };
+                }
+                .expect("a prepared check's input index is below the batch size");
                 return Ok(Evaluation {
                     value,
                     effect: collect_shard_effects(&locked_shards, &cleanup_effects),
@@ -392,12 +434,9 @@ impl<C: Clock> MemoryStore<C> {
                         value: BatchDecision::denied(
                             check.input_index,
                             checks.len(),
-                            Denial::storage_capacity(
-                                shard
-                                    .capacity_retry_after_millis(now_millis)
-                                    .map(duration_from_millis),
-                            ),
-                        ),
+                            shard.storage_capacity_denial(now_millis),
+                        )
+                        .expect("a prepared check's input index is below the batch size"),
                         effect: collect_shard_effects(&locked_shards, &cleanup_effects),
                     });
                 }
@@ -412,7 +451,8 @@ impl<C: Clock> MemoryStore<C> {
         }
 
         Ok(Evaluation {
-            value: BatchDecision::allowed(allowances),
+            value: BatchDecision::allowed(allowances)
+                .expect("batch validation rejected the empty batch"),
             effect: collect_shard_effects(&locked_shards, &cleanup_effects),
         })
     }
@@ -422,7 +462,7 @@ impl<C: Clock> MemoryStore<C> {
     /// # Errors
     ///
     /// Returns an error if a shard is poisoned.
-    pub fn stats(&self) -> Result<MemoryStoreStats, MemoryStoreError> {
+    pub fn stats(&self) -> Result<MemoryStoreStats, PoisonedShardError> {
         self.shards.stats(&self.config)
     }
 
@@ -431,7 +471,7 @@ impl<C: Clock> MemoryStore<C> {
     /// # Errors
     ///
     /// Returns an error if a shard is poisoned.
-    pub fn clear(&self) -> Result<(), MemoryStoreError> {
+    pub fn clear(&self) -> Result<(), PoisonedShardError> {
         self.shards.clear()
     }
 
@@ -443,7 +483,7 @@ impl<C: Clock> MemoryStore<C> {
     /// denied. Healthy shards and their active counters are left unchanged.
     ///
     /// Until this method is called, operations touching a poisoned shard
-    /// continue to fail closed with [`MemoryStoreError::PoisonedShard`].
+    /// continue to fail closed with [`PoisonedShardError`].
     /// Recovery is safe to invoke through an [`std::sync::Arc`]. It locks every
     /// shard in index order before changing any of them, so concurrent checks
     /// observe either the pre-recovery poisoned store or the complete recovered
@@ -453,12 +493,12 @@ impl<C: Clock> MemoryStore<C> {
     }
 }
 
-fn remaining_quota(limit: u64, used: u64) -> u64 {
+fn remaining_quota(limit: Capacity, used: u64) -> u64 {
     debug_assert!(
-        used <= limit,
+        used <= limit.get(),
         "stored quota usage ({used}) exceeded its policy limit ({limit})"
     );
-    limit.saturating_sub(used)
+    limit.get().saturating_sub(used)
 }
 
 // Both async bodies contain no `.await`: they exist to defer the synchronous
@@ -466,13 +506,14 @@ fn remaining_quota(limit: u64, used: u64) -> u64 {
 #[allow(clippy::unused_async_trait_impl)]
 impl<C: Clock> Limiter for MemoryStore<C> {
     type Policy = runlimit_core::FixedWindowPolicy;
-    type Error = MemoryStoreError;
+    type CheckError = PoisonedShardError;
+    type CheckAllError = MemoryBatchError;
 
-    async fn check(&self, check: &Check<'_>) -> Result<Decision, Self::Error> {
+    async fn check(&self, check: &Check<'_>) -> Result<Decision, Self::CheckError> {
         MemoryStore::check(self, check)
     }
 
-    async fn check_all(&self, checks: &[Check<'_>]) -> Result<BatchDecision, Self::Error> {
+    async fn check_all(&self, checks: &[Check<'_>]) -> Result<BatchDecision, Self::CheckAllError> {
         MemoryStore::check_all(self, checks)
     }
 }
@@ -545,9 +586,24 @@ impl serde::Serialize for MemoryStoreStats {
     }
 }
 
-/// A fail-closed in-memory store error.
+/// A shard mutex was poisoned by a panic and remains unavailable.
+///
+/// This is the only failure a single check, [`MemoryStore::stats`], or
+/// [`MemoryStore::clear`] can report. Every operation touching the shard
+/// fails closed until [`MemoryStore::recover_poisoned`] rebuilds it.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("memory-store shard {shard_index} is poisoned and unavailable")]
+pub struct PoisonedShardError {
+    /// Poisoned shard index.
+    pub shard_index: usize,
+}
+
+/// A fail-closed failure of an in-memory atomic batch.
+///
+/// Every variant is reachable from [`MemoryStore::check_all`]; failures that
+/// only a batch can produce never appear on the single-check path.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum MemoryStoreError {
+pub enum MemoryBatchError {
     /// The atomic batch violated a backend-independent structural requirement.
     #[error(transparent)]
     InvalidBatch(#[from] BatchError),
@@ -564,12 +620,9 @@ pub enum MemoryStoreError {
         /// Hard key capacity of the shard.
         capacity: usize,
     },
-    /// A shard mutex was poisoned and remains unavailable.
-    #[error("memory-store shard {shard_index} is poisoned and unavailable")]
-    PoisonedShard {
-        /// Poisoned shard index.
-        shard_index: usize,
-    },
+    /// A touched shard was poisoned and remains unavailable.
+    #[error(transparent)]
+    PoisonedShard(#[from] PoisonedShardError),
 }
 
 #[cfg(test)]
@@ -586,16 +639,34 @@ mod tests {
 
     use runlimit_core::{
         AdmissionOperation, AdmissionOutcome, Allowance, BatchDecision, BatchDecisionView,
-        BatchError, Check, ConsumptionStatus, Decision, DecisionView, Denial, DenialView,
-        FixedWindowPolicy, KeyHasher, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS, Observation,
-        Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
+        BatchError, Capacity, Check, CleanupOutcome, ConsumptionStatus, Decision, DecisionView,
+        Delay, Denial, FixedWindowPolicy, KeyHasher, MAX_LIMIT, MAX_WINDOW, MAX_WINDOW_MILLIS,
+        Observation, Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
     };
 
-    use super::{Entry, MemoryStore, MemoryStoreError, remaining_quota};
+    use super::{Entry, MemoryBatchError, MemoryStore, PoisonedShardError, remaining_quota};
     use crate::{Clock, MemoryStoreConfig, shards::counter_key_hash};
 
-    fn quota(capacity: u64, retry_after: Duration) -> QuotaDenial {
-        QuotaDenial::try_new(capacity, retry_after).unwrap()
+    fn capacity(value: u64) -> Capacity {
+        Capacity::new(value).unwrap()
+    }
+
+    fn quota(capacity_value: u64, retry_after: Duration) -> QuotaDenial {
+        QuotaDenial::new(capacity(capacity_value), retry_after)
+    }
+
+    fn allowance(capacity_value: u64, available: u64, replenishes_after: Duration) -> Allowance {
+        Allowance::new(capacity(capacity_value), available, replenishes_after).unwrap()
+    }
+
+    fn storage_capacity(retry_after: Option<Duration>) -> Denial {
+        Denial::StorageCapacity {
+            retry_after: retry_after.map(Delay::new),
+        }
+    }
+
+    fn with_clock<C: Clock>(config: MemoryStoreConfig, clock: C) -> MemoryStore<C> {
+        MemoryStore::builder(config).with_clock(clock).build()
     }
 
     #[derive(Clone, Default)]
@@ -672,7 +743,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum RecordedObservation {
         Admission(AdmissionOutcome, ConsumptionStatus, usize),
-        Cleanup(usize, Option<u64>),
+        Cleanup(usize, CleanupOutcome),
         Capacity(u64, u64, u64),
     }
 
@@ -687,10 +758,13 @@ mod tests {
                 Observation::Admission(admission) => RecordedObservation::Admission(
                     admission.outcome(),
                     admission.consumption(),
-                    admission.batch_size(),
+                    match admission.operation() {
+                        AdmissionOperation::Check { .. } => 1,
+                        AdmissionOperation::Batch { batch_size, .. } => batch_size,
+                    },
                 ),
                 Observation::Cleanup(cleanup) => {
-                    RecordedObservation::Cleanup(cleanup.requested(), cleanup.removed())
+                    RecordedObservation::Cleanup(cleanup.requested(), cleanup.outcome())
                 }
                 Observation::Capacity(capacity) => RecordedObservation::Capacity(
                     capacity.used(),
@@ -703,12 +777,14 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RecordedOperation {
+        Check,
+        Batch { batch_size: usize, has_policy: bool },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct RecordedAdmissionMetadata {
-        operation: AdmissionOperation,
-        batch_size: usize,
-        has_policy_id: bool,
-        has_scope_id: bool,
-        has_policy_fingerprint: bool,
+        operation: RecordedOperation,
         outcome: AdmissionOutcome,
         consumption: ConsumptionStatus,
     }
@@ -727,11 +803,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(RecordedAdmissionMetadata {
-                    operation: admission.operation(),
-                    batch_size: admission.batch_size(),
-                    has_policy_id: admission.policy_id().is_some(),
-                    has_scope_id: admission.scope_id().is_some(),
-                    has_policy_fingerprint: admission.policy_fingerprint().is_some(),
+                    operation: match admission.operation() {
+                        AdmissionOperation::Check { .. } => RecordedOperation::Check,
+                        AdmissionOperation::Batch { batch_size, policy } => {
+                            RecordedOperation::Batch {
+                                batch_size,
+                                has_policy: policy.is_some(),
+                            }
+                        }
+                    },
                     outcome: admission.outcome(),
                     consumption: admission.consumption(),
                 });
@@ -787,7 +867,7 @@ mod tests {
             let mut digest = [0_u8; 32];
             digest[..8].copy_from_slice(&value.to_le_bytes());
             let candidate = SubjectKey::from_digest(digest);
-            let counter_key = Check::new(policy, candidate).counter_key();
+            let counter_key = Check::new(candidate.bind(policy)).counter_key();
             if store.shards.shard_index(&counter_key) == shard_index {
                 subjects.push(candidate);
                 if subjects.len() == count {
@@ -813,15 +893,15 @@ mod tests {
             .unwrap()
             .with_shard_count(SHARD_COUNT)
             .unwrap();
-        let first = MemoryStore::with_clock(config.clone(), ManualClock::default());
-        let second = MemoryStore::with_clock(config, ManualClock::default());
+        let first = with_clock(config.clone(), ManualClock::default());
+        let second = with_clock(config, ManualClock::default());
         let policy = policy("auth.login", "client", 2, Duration::from_mins(1));
         let key_hasher = KeyHasher::new([0x42; 32]).unwrap();
         let mut counts = [0_usize; SHARD_COUNT];
 
         for value in 0_u64..SUBJECT_COUNT {
             let subject = key_hasher.hash_for(&policy, value.to_le_bytes());
-            let key = Check::new(&policy, subject).counter_key();
+            let key = Check::new(subject).counter_key();
             let first_index = first.shards.shard_index(&key);
 
             assert_eq!(first_index, second.shards.shard_index(&key));
@@ -839,24 +919,23 @@ mod tests {
         let first_policy = policy("auth.login", "client", 1, Duration::from_mins(1));
         let second_policy = policy("auth.reset", "client", 2, Duration::from_mins(1));
         let first_subject = SubjectKey::from_digest([0_u8; 32]);
-        let first_key = Check::new(&first_policy, first_subject).counter_key();
+        let first_key = Check::new(first_subject.bind(&first_policy)).counter_key();
 
         let zero_second_key =
-            Check::new(&second_policy, SubjectKey::from_digest([0_u8; 32])).counter_key();
+            Check::new(SubjectKey::from_digest([0_u8; 32]).bind(&second_policy)).counter_key();
         let colliding_subject_word =
             counter_key_hash(first_key) ^ counter_key_hash(zero_second_key);
         let mut second_digest = [0_u8; 32];
         second_digest[..8].copy_from_slice(&colliding_subject_word.to_le_bytes());
         let second_subject = SubjectKey::from_digest(second_digest);
-        let second_key = Check::new(&second_policy, second_subject).counter_key();
+        let second_key = Check::new(second_subject.bind(&second_policy)).counter_key();
 
         assert_ne!(first_key, second_key);
         assert_eq!(counter_key_hash(first_key), counter_key_hash(second_key));
 
-        let store =
-            MemoryStore::with_clock(MemoryStoreConfig::new(4).unwrap(), ManualClock::default());
-        let first_check = Check::new(&first_policy, first_subject);
-        let second_check = Check::new(&second_policy, second_subject);
+        let store = with_clock(MemoryStoreConfig::new(4).unwrap(), ManualClock::default());
+        let first_check = Check::new(first_subject.bind(&first_policy));
+        let second_check = Check::new(second_subject.bind(&second_policy));
 
         assert!(store.check(&first_check).unwrap().permits_request());
         assert!(store.check(&second_check).unwrap().permits_request());
@@ -867,25 +946,24 @@ mod tests {
 
     #[test]
     fn remaining_quota_reaches_zero_without_wrapping() {
-        assert_eq!(remaining_quota(3, 0), 3);
-        assert_eq!(remaining_quota(3, 3), 0);
+        assert_eq!(remaining_quota(capacity(3), 0), 3);
+        assert_eq!(remaining_quota(capacity(3), 3), 0);
     }
 
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "stored quota usage (4) exceeded its policy limit (3)")]
     fn corrupt_quota_state_trips_the_debug_invariant() {
-        let _ = remaining_quota(3, 4);
+        let _ = remaining_quota(capacity(3), 4);
     }
 
     #[cfg(not(debug_assertions))]
     #[test]
     fn corrupt_quota_state_fails_closed_in_release_builds() {
         let policy = policy("auth.login", "client", 3, Duration::from_secs(60));
-        let check = Check::new(&policy, subject(1));
+        let check = Check::new(subject(1).bind(&policy));
         let key = check.counter_key();
-        let store =
-            MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
         {
             let mut shard = store.shards.shard(0).lock().unwrap();
             assert!(shard.replace(key, Entry { used: 4 }, 60_000).is_none());
@@ -899,11 +977,10 @@ mod tests {
 
     #[test]
     fn debug_output_is_useful_without_exposing_counter_state() {
-        let store =
-            MemoryStore::with_clock(MemoryStoreConfig::new(8).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(8).unwrap(), ManualClock::default());
         let policy = policy("auth.login", "client", 2, Duration::from_mins(1));
         store
-            .check(&Check::new(&policy, subject(0xab)))
+            .check(&Check::new(subject(0xab).bind(&policy)))
             .expect("store is available");
 
         let output = format!("{store:?}");
@@ -920,75 +997,72 @@ mod tests {
     #[test]
     fn enforces_quota_and_reports_exact_retry_duration() {
         let clock = ManualClock::default();
-        let store = MemoryStore::with_clock(MemoryStoreConfig::new(8).unwrap(), clock.clone());
+        let store = with_clock(MemoryStoreConfig::new(8).unwrap(), clock.clone());
         let policy = policy("auth.login", "client", 2, Duration::from_mins(1));
-        let check = Check::new(&policy, subject(1));
+        let check = Check::new(subject(1).bind(&policy));
 
         let first = store.check(&check).unwrap();
         assert_eq!(
             first,
-            Decision::allowed(Allowance::new(2, 1, Duration::from_mins(1)))
+            Decision::allowed(allowance(2, 1, Duration::from_mins(1)))
         );
 
         let second = store.check(&check).unwrap();
         assert_eq!(
             second,
-            Decision::allowed(Allowance::new(2, 0, Duration::from_mins(1)))
+            Decision::allowed(allowance(2, 0, Duration::from_mins(1)))
         );
 
         let denied = store.check(&check).unwrap();
         assert!(!denied.permits_request());
-        assert_eq!(
-            denied,
-            Decision::quota_denied(quota(2, Duration::from_mins(1)))
-        );
+        assert_eq!(denied, Decision::denied(quota(2, Duration::from_mins(1))));
 
         clock.advance(Duration::from_secs(10));
         assert_eq!(
             store.check(&check).unwrap(),
-            Decision::quota_denied(quota(2, Duration::from_secs(50)))
+            Decision::denied(quota(2, Duration::from_secs(50)))
         );
 
         clock.advance(Duration::from_secs(50));
         let reset = store.check(&check).unwrap();
         assert_eq!(
             reset,
-            Decision::allowed(Allowance::new(2, 1, Duration::from_mins(1)))
+            Decision::allowed(allowance(2, 1, Duration::from_mins(1)))
         );
     }
 
     #[test]
     fn shadow_mode_reports_quota_without_consuming_or_rejecting() {
         let clock = ManualClock::default();
-        let store = MemoryStore::with_clock(MemoryStoreConfig::new(4).unwrap(), clock.clone());
+        let store = with_clock(MemoryStoreConfig::new(4).unwrap(), clock.clone());
         let enforced = policy("auth.login", "client", 1, Duration::from_mins(1));
         let shadow = enforced.clone().with_quota_mode(QuotaMode::Shadow);
         let subject = subject(7);
 
         assert!(
             store
-                .check(&Check::new(&shadow, subject))
+                .check(&Check::new(subject.bind(&shadow)))
                 .unwrap()
                 .permits_request()
         );
-        let shadow_denial = store.check(&Check::new(&shadow, subject)).unwrap();
+        let shadow_denial = store.check(&Check::new(subject.bind(&shadow))).unwrap();
         assert!(shadow_denial.permits_request());
         assert_eq!(
             shadow_denial,
             Decision::shadow_denied(quota(1, Duration::from_mins(1)))
         );
 
-        let enforced_denial = store.check(&Check::new(&enforced, subject)).unwrap();
+        let enforced_denial = store.check(&Check::new(subject.bind(&enforced))).unwrap();
         assert!(!enforced_denial.permits_request());
         assert_eq!(
             enforced_denial,
-            Decision::quota_denied(quota(1, Duration::from_mins(1)))
+            Decision::denied(quota(1, Duration::from_mins(1)))
         );
 
         clock.advance(Duration::from_mins(1));
         assert!(
             store
-                .check(&Check::new(&enforced, subject))
+                .check(&Check::new(subject.bind(&enforced)))
                 .unwrap()
                 .permits_request()
         );
@@ -996,12 +1070,11 @@ mod tests {
 
     #[test]
     fn shadow_batches_roll_back_and_capacity_denials_remain_enforced() {
-        let store =
-            MemoryStore::with_clock(MemoryStoreConfig::new(3).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(3).unwrap(), ManualClock::default());
         let shadow = policy("auth.login", "client", 1, Duration::from_mins(1))
             .with_quota_mode(QuotaMode::Shadow);
-        let first = Check::new(&shadow, subject(1));
-        let second = Check::new(&shadow, subject(2));
+        let first = Check::new(subject(1).bind(&shadow));
+        let second = Check::new(subject(2).bind(&shadow));
 
         assert!(store.check(&first).unwrap().permits_request());
         let result = store.check_all(&[first, second]).unwrap();
@@ -1018,33 +1091,31 @@ mod tests {
             "a shadow-denied atomic batch must not consume another check"
         );
 
-        let full_store =
-            MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
+        let full_store = with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
         assert!(full_store.check(&first).unwrap().permits_request());
         let capacity = full_store.check(&second).unwrap();
         assert!(matches!(
             capacity.view(),
             DecisionView::Denied {
-                denial: DenialView::StorageCapacity { .. },
+                denial: Denial::StorageCapacity { .. },
             }
         ));
     }
 
     #[test]
     fn mixed_shadow_and_enforced_batches_fail_before_consumption() {
-        let store =
-            MemoryStore::with_clock(MemoryStoreConfig::new(4).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(4).unwrap(), ManualClock::default());
         let enforced = policy("auth.login", "client", 1, Duration::from_mins(1));
         let shadow = policy("auth.reset", "client", 1, Duration::from_mins(1))
             .with_quota_mode(QuotaMode::Shadow);
         let result = store.check_all(&[
-            Check::new(&enforced, subject(1)),
-            Check::new(&shadow, subject(2)),
+            Check::new(subject(1).bind(&enforced)),
+            Check::new(subject(2).bind(&shadow)),
         ]);
 
         assert!(matches!(
             result,
-            Err(MemoryStoreError::InvalidBatch(
+            Err(MemoryBatchError::InvalidBatch(
                 BatchError::MixedQuotaModes { index: 1, .. }
             ))
         ));
@@ -1054,26 +1125,25 @@ mod tests {
     #[test]
     fn observer_reports_outcomes_cleanup_and_capacity_headroom() {
         let observer = Arc::new(RecordingObserver::default());
-        let store =
-            MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default())
-                .with_observer(observer.clone());
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default())
+            .with_observer(observer.clone());
         let limited = policy("auth.login", "client", 1, Duration::from_mins(1));
 
         assert!(
             store
-                .check(&Check::new(&limited, subject(1)))
+                .check(&Check::new(subject(1).bind(&limited)))
                 .unwrap()
                 .permits_request()
         );
         assert!(
             !store
-                .check(&Check::new(&limited, subject(1)))
+                .check(&Check::new(subject(1).bind(&limited)))
                 .unwrap()
                 .permits_request()
         );
         assert!(
             !store
-                .check(&Check::new(&limited, subject(2)))
+                .check(&Check::new(subject(2).bind(&limited)))
                 .unwrap()
                 .permits_request()
         );
@@ -1098,7 +1168,12 @@ mod tests {
         assert_eq!(
             observations
                 .iter()
-                .filter(|event| matches!(event, RecordedObservation::Cleanup(8, Some(0))))
+                .filter(|event| {
+                    matches!(
+                        event,
+                        RecordedObservation::Cleanup(8, CleanupOutcome::Confirmed { removed: 0 })
+                    )
+                })
                 .count(),
             3
         );
@@ -1118,18 +1193,18 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let store = Arc::new(
-            MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default())
+            with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default())
                 .with_observer(observer.clone()),
         );
         *observer.store.lock().unwrap() = Some(Arc::downgrade(&store));
         let limited = policy("auth.login", "client", 1, Duration::from_mins(1));
-        let check = Check::new(&limited, subject(1));
+        let check = Check::new(subject(1).bind(&limited));
 
         assert!(store.check(&check).unwrap().permits_request());
         assert_eq!(observer.calls.load(Ordering::Relaxed), 3);
 
         let panicking_store =
-            MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default())
+            with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default())
                 .with_observer(Arc::new(PanickingObserver));
         assert!(panicking_store.check(&check).unwrap().permits_request());
         assert!(!panicking_store.check(&check).unwrap().permits_request());
@@ -1153,21 +1228,21 @@ mod tests {
             .unwrap();
         let single_clock = ManualClock::default();
         let batch_clock = ManualClock::default();
-        let single_store = MemoryStore::with_clock(config.clone(), single_clock.clone());
-        let batch_store = MemoryStore::with_clock(config, batch_clock.clone());
+        let single_store = with_clock(config.clone(), single_clock.clone());
+        let batch_store = with_clock(config, batch_clock.clone());
         let policy = policy("auth.login", "client", 5, Duration::from_millis(10));
         let steps = [
             Step {
                 now: Duration::ZERO,
                 subject: 1,
                 cost: 2,
-                expected: Decision::allowed(Allowance::new(5, 3, Duration::from_millis(10))),
+                expected: Decision::allowed(allowance(5, 3, Duration::from_millis(10))),
             },
             Step {
                 now: Duration::from_millis(3),
                 subject: 1,
                 cost: 2,
-                expected: Decision::allowed(Allowance::new(5, 1, Duration::from_millis(7))),
+                expected: Decision::allowed(allowance(5, 1, Duration::from_millis(7))),
             },
             Step {
                 now: Duration::from_millis(3),
@@ -1179,46 +1254,46 @@ mod tests {
                 now: Duration::from_millis(9),
                 subject: 1,
                 cost: 1,
-                expected: Decision::allowed(Allowance::new(5, 0, Duration::from_millis(1))),
+                expected: Decision::allowed(allowance(5, 0, Duration::from_millis(1))),
             },
             Step {
                 now: Duration::from_millis(10),
                 subject: 1,
                 cost: 3,
-                expected: Decision::allowed(Allowance::new(5, 2, Duration::from_millis(10))),
+                expected: Decision::allowed(allowance(5, 2, Duration::from_millis(10))),
             },
             Step {
                 now: Duration::from_millis(8),
                 subject: 1,
                 cost: 1,
-                expected: Decision::allowed(Allowance::new(5, 1, Duration::from_millis(10))),
+                expected: Decision::allowed(allowance(5, 1, Duration::from_millis(10))),
             },
             Step {
                 now: Duration::from_millis(10),
                 subject: 2,
                 cost: 1,
-                expected: Decision::allowed(Allowance::new(5, 4, Duration::from_millis(10))),
+                expected: Decision::allowed(allowance(5, 4, Duration::from_millis(10))),
             },
             Step {
                 now: Duration::from_millis(10),
                 subject: 3,
                 cost: 1,
-                expected: Decision::denied(Denial::storage_capacity(Some(Duration::from_millis(
-                    10,
-                )))),
+                expected: Decision::denied(storage_capacity(Some(Duration::from_millis(10)))),
             },
             Step {
                 now: Duration::from_millis(20),
                 subject: 3,
                 cost: 1,
-                expected: Decision::allowed(Allowance::new(5, 4, Duration::from_millis(10))),
+                expected: Decision::allowed(allowance(5, 4, Duration::from_millis(10))),
             },
         ];
 
         for (index, step) in steps.into_iter().enumerate() {
             single_clock.set(step.now);
             batch_clock.set(step.now);
-            let check = Check::with_cost(&policy, subject(step.subject), step.cost).unwrap();
+            let check = Check::new(subject(step.subject).bind(&policy))
+                .with_cost(step.cost)
+                .unwrap();
 
             let single = single_store.check(&check).unwrap();
             let batch = batch_store
@@ -1237,37 +1312,39 @@ mod tests {
     #[test]
     fn windows_remain_exact_across_the_u64_millisecond_boundary() {
         let clock = WideManualClock::new(u128::from(u64::MAX));
-        let store = MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), clock.clone());
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), clock.clone());
         let policy = policy("auth.login", "client", MAX_LIMIT, MAX_WINDOW);
-        let check = Check::with_cost(&policy, subject(1), MAX_LIMIT).unwrap();
+        let check = Check::new(subject(1).bind(&policy))
+            .with_cost(MAX_LIMIT)
+            .unwrap();
 
         let first = store.check(&check).unwrap();
         assert_eq!(
             first,
-            Decision::allowed(Allowance::new(MAX_LIMIT, 0, MAX_WINDOW))
+            Decision::allowed(allowance(MAX_LIMIT, 0, MAX_WINDOW))
         );
 
         let denied = store.check(&check).unwrap();
-        assert_eq!(denied, Decision::quota_denied(quota(MAX_LIMIT, MAX_WINDOW)));
+        assert_eq!(denied, Decision::denied(quota(MAX_LIMIT, MAX_WINDOW)));
 
         clock.advance(u128::from(MAX_WINDOW_MILLIS - 1));
         let nearly_reset = store.check(&check).unwrap();
         assert_eq!(
             nearly_reset,
-            Decision::quota_denied(quota(MAX_LIMIT, Duration::from_millis(1)))
+            Decision::denied(quota(MAX_LIMIT, Duration::from_millis(1)))
         );
 
         clock.advance(1);
         let reset = store.check(&check).unwrap();
         assert_eq!(
             reset,
-            Decision::allowed(Allowance::new(MAX_LIMIT, 0, MAX_WINDOW))
+            Decision::allowed(allowance(MAX_LIMIT, 0, MAX_WINDOW))
         );
     }
 
     #[test]
     fn policy_configuration_changes_use_independent_counters() {
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(2)
                 .unwrap()
                 .with_shard_count(1)
@@ -1280,13 +1357,13 @@ mod tests {
 
         assert!(
             store
-                .check(&Check::new(&strict, key))
+                .check(&Check::new(key.bind(&strict)))
                 .unwrap()
                 .permits_request()
         );
         assert!(
             store
-                .check(&Check::new(&relaxed, key))
+                .check(&Check::new(key.bind(&relaxed)))
                 .unwrap()
                 .permits_request()
         );
@@ -1295,7 +1372,7 @@ mod tests {
 
     #[test]
     fn capacity_exhaustion_does_not_evict_an_active_entry() {
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(1)
                 .unwrap()
                 .with_shard_count(1)
@@ -1306,41 +1383,40 @@ mod tests {
 
         assert!(
             store
-                .check(&Check::new(&policy, subject(1)))
+                .check(&Check::new(subject(1).bind(&policy)))
                 .unwrap()
                 .permits_request()
         );
-        let denied = store.check(&Check::new(&policy, subject(2))).unwrap();
+        let denied = store.check(&Check::new(subject(2).bind(&policy))).unwrap();
         assert_eq!(
             denied,
-            Decision::denied(Denial::storage_capacity(Some(Duration::from_mins(1))))
+            Decision::denied(storage_capacity(Some(Duration::from_mins(1))))
         );
         assert_eq!(store.stats().unwrap().entries(), 1);
     }
 
     #[test]
     fn default_configuration_can_use_its_entire_capacity() {
-        let store =
-            MemoryStore::with_clock(MemoryStoreConfig::new(64).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(64).unwrap(), ManualClock::default());
         let policy = policy("auth.login", "client", 10, Duration::from_mins(1));
 
         for byte in 0..64 {
             assert!(
                 store
-                    .check(&Check::new(&policy, subject(byte)))
+                    .check(&Check::new(subject(byte).bind(&policy)))
                     .unwrap()
                     .permits_request()
             );
         }
 
-        let denied = store.check(&Check::new(&policy, subject(64))).unwrap();
+        let denied = store.check(&Check::new(subject(64).bind(&policy))).unwrap();
         assert!(!denied.permits_request());
         assert_eq!(store.stats().unwrap().entries(), 64);
     }
 
     #[test]
     fn a_cross_shard_batch_preserves_input_order_and_updates_each_shard() {
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(4)
                 .unwrap()
                 .with_shard_count(2)
@@ -1351,18 +1427,19 @@ mod tests {
         let shard_zero = subjects_for_shard(&store, &policy, 0, 1)[0];
         let shard_one = subjects_for_shard(&store, &policy, 1, 2);
         let checks = [
-            Check::with_cost(&policy, shard_one[0], 2).unwrap(),
-            Check::with_cost(&policy, shard_zero, 3).unwrap(),
-            Check::with_cost(&policy, shard_one[1], 4).unwrap(),
+            Check::new(shard_one[0].bind(&policy)).with_cost(2).unwrap(),
+            Check::new(shard_zero.bind(&policy)).with_cost(3).unwrap(),
+            Check::new(shard_one[1].bind(&policy)).with_cost(4).unwrap(),
         ];
 
         assert_eq!(
             store.check_all(&checks),
             Ok(BatchDecision::allowed(vec![
-                Allowance::new(10, 8, Duration::from_mins(1)),
-                Allowance::new(10, 7, Duration::from_mins(1)),
-                Allowance::new(10, 6, Duration::from_mins(1)),
-            ]))
+                allowance(10, 8, Duration::from_mins(1)),
+                allowance(10, 7, Duration::from_mins(1)),
+                allowance(10, 6, Duration::from_mins(1)),
+            ])
+            .unwrap())
         );
         assert_eq!(store.shards.shard(0).lock().unwrap().used(), 1);
         assert_eq!(store.shards.shard(1).lock().unwrap().used(), 2);
@@ -1370,7 +1447,7 @@ mod tests {
 
     #[test]
     fn a_full_shard_denies_a_batch_while_another_shard_has_room() {
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(6)
                 .unwrap()
                 .with_shard_count(2)
@@ -1384,37 +1461,36 @@ mod tests {
         for key in &crowded[..2] {
             assert!(
                 store
-                    .check(&Check::new(&policy, *key))
+                    .check(&Check::new((*key).bind(&policy)))
                     .unwrap()
                     .permits_request()
             );
         }
         let checks = [
-            Check::new(&policy, other),
-            Check::new(&policy, crowded[2]),
-            Check::new(&policy, crowded[3]),
+            Check::new(other.bind(&policy)),
+            Check::new(crowded[2].bind(&policy)),
+            Check::new(crowded[3].bind(&policy)),
         ];
 
         assert_eq!(
             store.check_all(&checks),
-            Ok(BatchDecision::denied(
-                2,
-                3,
-                Denial::storage_capacity(Some(Duration::from_mins(1))),
-            ))
+            Ok(
+                BatchDecision::denied(2, 3, storage_capacity(Some(Duration::from_mins(1))))
+                    .unwrap()
+            )
         );
         assert_eq!(store.shards.shard(0).lock().unwrap().used(), 2);
         assert_eq!(store.shards.shard(1).lock().unwrap().used(), 0);
 
         assert!(
             store
-                .check(&Check::new(&policy, crowded[2]))
+                .check(&Check::new(crowded[2].bind(&policy)))
                 .unwrap()
                 .permits_request()
         );
         assert!(
             store
-                .check(&Check::new(&policy, other))
+                .check(&Check::new(other.bind(&policy)))
                 .unwrap()
                 .permits_request()
         );
@@ -1422,7 +1498,7 @@ mod tests {
 
     #[test]
     fn an_unsatisfiable_per_shard_batch_returns_a_structural_error() {
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(4)
                 .unwrap()
                 .with_shard_count(2)
@@ -1432,25 +1508,21 @@ mod tests {
         let policy = policy("auth.login", "client", 2, Duration::from_mins(1));
         let keys = subjects_for_shard(&store, &policy, 0, 3);
         let other = subjects_for_shard(&store, &policy, 1, 1)[0];
-        let other_check = Check::new(&policy, other);
+        let other_check = Check::new(other.bind(&policy));
         assert_eq!(
             store.check(&other_check),
-            Ok(Decision::allowed(Allowance::new(
-                2,
-                1,
-                Duration::from_mins(1)
-            )))
+            Ok(Decision::allowed(allowance(2, 1, Duration::from_mins(1))))
         );
         let checks = [
             other_check,
-            Check::new(&policy, keys[0]),
-            Check::new(&policy, keys[1]),
-            Check::new(&policy, keys[2]),
+            Check::new(keys[0].bind(&policy)),
+            Check::new(keys[1].bind(&policy)),
+            Check::new(keys[2].bind(&policy)),
         ];
 
         assert_eq!(
             store.check_all(&checks),
-            Err(MemoryStoreError::BatchExceedsShardCapacity {
+            Err(MemoryBatchError::BatchExceedsShardCapacity {
                 shard_index: 0,
                 key_count: 3,
                 capacity: 2,
@@ -1459,11 +1531,7 @@ mod tests {
         assert_eq!(store.stats().unwrap().entries(), 1);
         assert_eq!(
             store.check(&other_check),
-            Ok(Decision::allowed(Allowance::new(
-                2,
-                0,
-                Duration::from_mins(1)
-            )))
+            Ok(Decision::allowed(allowance(2, 0, Duration::from_mins(1))))
         );
     }
 
@@ -1476,13 +1544,13 @@ mod tests {
             .unwrap()
             .with_max_expired_removals_per_check(1)
             .unwrap();
-        let store = MemoryStore::with_clock(config, clock.clone());
+        let store = with_clock(config, clock.clone());
         let policy = policy("auth.login", "client", 10, Duration::from_secs(1));
 
         for byte in 1..=3 {
             assert!(
                 store
-                    .check(&Check::new(&policy, subject(byte)))
+                    .check(&Check::new(subject(byte).bind(&policy)))
                     .unwrap()
                     .permits_request()
             );
@@ -1491,7 +1559,7 @@ mod tests {
 
         assert!(
             store
-                .check(&Check::new(&policy, subject(4)))
+                .check(&Check::new(subject(4).bind(&policy)))
                 .unwrap()
                 .permits_request()
         );
@@ -1499,7 +1567,7 @@ mod tests {
 
         assert!(
             store
-                .check(&Check::new(&policy, subject(5)))
+                .check(&Check::new(subject(5).bind(&policy)))
                 .unwrap()
                 .permits_request()
         );
@@ -1509,7 +1577,7 @@ mod tests {
     #[test]
     fn a_cross_shard_batch_attributes_cleanup_to_each_checks_target() {
         let clock = ManualClock::default();
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(8)
                 .unwrap()
                 .with_shard_count(2)
@@ -1525,7 +1593,7 @@ mod tests {
         for key in shard_zero[..4].iter().chain(&shard_one[..4]) {
             assert!(
                 store
-                    .check(&Check::new(&policy, *key))
+                    .check(&Check::new((*key).bind(&policy)))
                     .unwrap()
                     .permits_request()
             );
@@ -1533,9 +1601,9 @@ mod tests {
         clock.advance(Duration::from_secs(1));
 
         let checks = [
-            Check::new(&policy, shard_zero[4]),
-            Check::new(&policy, shard_one[4]),
-            Check::new(&policy, shard_zero[5]),
+            Check::new(shard_zero[4].bind(&policy)),
+            Check::new(shard_one[4].bind(&policy)),
+            Check::new(shard_zero[5].bind(&policy)),
         ];
         let cleanup_batch = store.check_all(&checks).unwrap();
         assert!(
@@ -1565,20 +1633,20 @@ mod tests {
             .unwrap()
             .with_max_expired_removals_per_check(1)
             .unwrap();
-        let store = MemoryStore::with_clock(config, clock.clone());
+        let store = with_clock(config, clock.clone());
         let policy = policy("auth.login", "client", 10, Duration::from_secs(1));
 
         for byte in 1..=3 {
             assert!(
                 store
-                    .check(&Check::new(&policy, subject(byte)))
+                    .check(&Check::new(subject(byte).bind(&policy)))
                     .unwrap()
                     .permits_request()
             );
         }
         clock.advance(Duration::from_secs(1));
 
-        let checks = [4, 5, 6].map(|byte| Check::new(&policy, subject(byte)));
+        let checks = [4, 5, 6].map(|byte| Check::new(subject(byte).bind(&policy)));
         let result = store.check_all(&checks).unwrap();
         assert!(matches!(
             result.view(),
@@ -1590,7 +1658,7 @@ mod tests {
     #[test]
     fn auxiliary_expiry_index_remains_bounded_across_many_windows() {
         let clock = ManualClock::default();
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(1)
                 .unwrap()
                 .with_shard_count(1)
@@ -1598,7 +1666,7 @@ mod tests {
             clock.clone(),
         );
         let policy = policy("auth.login", "client", 1, Duration::from_millis(1));
-        let check = Check::new(&policy, subject(1));
+        let check = Check::new(subject(1).bind(&policy));
 
         for _ in 0..1_000 {
             assert!(store.check(&check).unwrap().permits_request());
@@ -1614,7 +1682,7 @@ mod tests {
     fn targeted_expired_refresh_keeps_indexes_aligned_for_single_and_batch() {
         for use_batch in [false, true] {
             let clock = ManualClock::default();
-            let store = MemoryStore::with_clock(
+            let store = with_clock(
                 MemoryStoreConfig::new(2)
                     .unwrap()
                     .with_shard_count(1)
@@ -1624,8 +1692,8 @@ mod tests {
                 clock.clone(),
             );
             let policy = policy("auth.login", "client", 10, Duration::from_millis(2));
-            let earlier = Check::new(&policy, subject(1));
-            let target = Check::new(&policy, subject(2));
+            let earlier = Check::new(subject(1).bind(&policy));
+            let target = Check::new(subject(2).bind(&policy));
 
             assert!(store.check(&earlier).unwrap().permits_request());
             clock.advance(Duration::from_millis(1));
@@ -1643,7 +1711,7 @@ mod tests {
             };
             assert_eq!(
                 decision,
-                Decision::allowed(Allowance::new(10, 9, Duration::from_millis(2)))
+                Decision::allowed(allowance(10, 9, Duration::from_millis(2)))
             );
 
             let key = target.counter_key();
@@ -1657,7 +1725,7 @@ mod tests {
 
     #[test]
     fn a_denied_batch_does_not_consume_other_checks() {
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(8)
                 .unwrap()
                 .with_shard_count(1)
@@ -1666,8 +1734,8 @@ mod tests {
         );
         let exhausted = policy("auth.login", "client", 1, Duration::from_mins(1));
         let untouched = policy("auth.login", "identity", 1, Duration::from_mins(1));
-        let exhausted_check = Check::new(&exhausted, subject(1));
-        let untouched_check = Check::new(&untouched, subject(2));
+        let exhausted_check = Check::new(subject(1).bind(&exhausted));
+        let untouched_check = Check::new(subject(2).bind(&untouched));
 
         assert!(store.check(&exhausted_check).unwrap().permits_request());
         let result = store
@@ -1684,7 +1752,7 @@ mod tests {
 
         assert!(
             store
-                .check(&Check::new(&untouched, subject(2)))
+                .check(&Check::new(subject(2).bind(&untouched)))
                 .unwrap()
                 .permits_request()
         );
@@ -1692,20 +1760,19 @@ mod tests {
 
     #[test]
     fn duplicate_keys_are_rejected_before_consumption() {
-        let store =
-            MemoryStore::with_clock(MemoryStoreConfig::new(8).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(8).unwrap(), ManualClock::default());
         let alpha = policy("auth.alpha", "client", 2, Duration::from_mins(1));
         let beta = policy("auth.beta", "client", 2, Duration::from_mins(1));
         let checks = [
-            Check::new(&beta, subject(1)),
-            Check::new(&beta, subject(1)),
-            Check::new(&alpha, subject(2)),
-            Check::new(&alpha, subject(2)),
+            Check::new(subject(1).bind(&beta)),
+            Check::new(subject(1).bind(&beta)),
+            Check::new(subject(2).bind(&alpha)),
+            Check::new(subject(2).bind(&alpha)),
         ];
 
         assert_eq!(
             store.check_all(&checks),
-            Err(MemoryStoreError::InvalidBatch(BatchError::DuplicateKey {
+            Err(MemoryBatchError::InvalidBatch(BatchError::DuplicateKey {
                 first_index: 0,
                 duplicate_index: 1,
             }))
@@ -1715,7 +1782,7 @@ mod tests {
 
     #[test]
     fn concurrent_checks_never_over_admit() {
-        let store = Arc::new(MemoryStore::with_clock(
+        let store = Arc::new(with_clock(
             MemoryStoreConfig::new(8).unwrap(),
             ManualClock::default(),
         ));
@@ -1727,7 +1794,7 @@ mod tests {
                 let policy = Arc::clone(&policy);
                 thread::spawn(move || {
                     store
-                        .check(&Check::new(&policy, subject(1)))
+                        .check(&Check::new(subject(1).bind(&policy)))
                         .unwrap()
                         .permits_request()
                 })
@@ -1743,7 +1810,7 @@ mod tests {
         const THREAD_COUNT: usize = 8;
         const CALLS_PER_THREAD: usize = 64;
 
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(2)
                 .unwrap()
                 .with_shard_count(2)
@@ -1773,7 +1840,8 @@ mod tests {
                         } else {
                             [second, first]
                         };
-                        let checks = subjects.map(|subject| Check::new(policy.as_ref(), subject));
+                        let checks =
+                            subjects.map(|subject| Check::new(subject.bind(policy.as_ref())));
                         let result = store.check_all(&checks).unwrap();
                         assert!(
                             matches!(
@@ -1802,7 +1870,7 @@ mod tests {
         assert_eq!(store.stats().unwrap().entries(), 2);
         for key in [first, second] {
             assert_eq!(
-                store.check(&Check::new(policy.as_ref(), key)),
+                store.check(&Check::new(key.bind(policy.as_ref()))),
                 Ok(Decision::denied(quota(limit, Duration::from_mins(1))))
             );
         }
@@ -1811,7 +1879,7 @@ mod tests {
     #[test]
     fn a_poisoned_default_shard_remains_fail_closed() {
         let clock = PanicOnceClock::default();
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(1)
                 .unwrap()
                 .with_shard_count(1)
@@ -1819,8 +1887,8 @@ mod tests {
             clock.clone(),
         );
         let policy = policy("auth.login", "client", 1, Duration::from_mins(1));
-        let exhausted = Check::new(&policy, subject(1));
-        let new_key = Check::new(&policy, subject(2));
+        let exhausted = Check::new(subject(1).bind(&policy));
+        let new_key = Check::new(subject(2).bind(&policy));
 
         assert!(store.check(&exhausted).unwrap().permits_request());
         clock.panic_once();
@@ -1829,24 +1897,18 @@ mod tests {
         }));
         assert!(panic_result.is_err());
 
-        let poisoned = Err(MemoryStoreError::PoisonedShard { shard_index: 0 });
+        let poisoned = Err(PoisonedShardError { shard_index: 0 });
         assert_eq!(store.check(&exhausted), poisoned);
         assert_eq!(store.check(&new_key), poisoned);
         assert_eq!(store.check(&exhausted), poisoned);
-        assert_eq!(
-            store.stats(),
-            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
-        );
-        assert_eq!(
-            store.clear(),
-            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
-        );
+        assert_eq!(store.stats(), Err(PoisonedShardError { shard_index: 0 }));
+        assert_eq!(store.clear(), Err(PoisonedShardError { shard_index: 0 }));
     }
 
     #[test]
     fn batch_preflight_preserves_validation_capacity_and_lock_precedence() {
         let clock = PanicOnceClock::default();
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(1)
                 .unwrap()
                 .with_shard_count(1)
@@ -1857,9 +1919,9 @@ mod tests {
         );
         let policy = policy("auth.preflight", "client", 1, Duration::from_mins(1));
         let checks = [
-            Check::new(&policy, subject(1)),
-            Check::new(&policy, subject(2)),
-            Check::new(&policy, subject(3)),
+            Check::new(subject(1).bind(&policy)),
+            Check::new(subject(2).bind(&policy)),
+            Check::new(subject(3).bind(&policy)),
         ];
 
         clock.panic_once();
@@ -1868,24 +1930,27 @@ mod tests {
         }));
         assert!(panic_result.is_err());
 
-        assert_eq!(store.check_all(&[]), Ok(BatchDecision::allowed(Vec::new())));
+        assert_eq!(
+            store.check_all(&[]),
+            Err(MemoryBatchError::InvalidBatch(BatchError::EmptyBatch))
+        );
         assert_eq!(
             store.check_all(&[checks[0], checks[0]]),
-            Err(MemoryStoreError::InvalidBatch(BatchError::DuplicateKey {
+            Err(MemoryBatchError::InvalidBatch(BatchError::DuplicateKey {
                 first_index: 0,
                 duplicate_index: 1,
             }))
         );
         assert_eq!(
             store.check_all(&checks),
-            Err(MemoryStoreError::InvalidBatch(BatchError::BatchTooLarge {
+            Err(MemoryBatchError::InvalidBatch(BatchError::BatchTooLarge {
                 actual: 3,
                 maximum: 2,
             }))
         );
         assert_eq!(
             store.check_all(&checks[..2]),
-            Err(MemoryStoreError::BatchExceedsShardCapacity {
+            Err(MemoryBatchError::BatchExceedsShardCapacity {
                 shard_index: 0,
                 key_count: 2,
                 capacity: 1,
@@ -1893,15 +1958,17 @@ mod tests {
         );
         assert_eq!(
             store.check_all(&checks[..1]),
-            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+            Err(MemoryBatchError::PoisonedShard(PoisonedShardError {
+                shard_index: 0
+            }))
         );
     }
 
     #[test]
-    fn failed_checks_keep_policy_metadata_but_failed_batches_remain_anonymous() {
+    fn failed_checks_and_one_check_batches_keep_policy_metadata() {
         let clock = PanicOnceClock::default();
         let observer = Arc::new(AdmissionMetadataObserver::default());
-        let store = MemoryStore::with_clock(
+        let store = with_clock(
             MemoryStoreConfig::new(1)
                 .unwrap()
                 .with_shard_count(1)
@@ -1910,7 +1977,7 @@ mod tests {
         )
         .with_observer(observer.clone());
         let policy = policy("auth.observed-failure", "client", 1, Duration::from_mins(1));
-        let check = Check::new(&policy, subject(1));
+        let check = Check::new(subject(1).bind(&policy));
 
         clock.panic_once();
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1919,31 +1986,28 @@ mod tests {
         assert!(panic_result.is_err());
         assert_eq!(
             store.check(&check),
-            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+            Err(PoisonedShardError { shard_index: 0 })
         );
         assert_eq!(
             store.check_all(&[check]),
-            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+            Err(MemoryBatchError::PoisonedShard(PoisonedShardError {
+                shard_index: 0
+            }))
         );
 
         assert_eq!(
             observer.admissions.lock().unwrap().as_slice(),
             [
                 RecordedAdmissionMetadata {
-                    operation: AdmissionOperation::Check,
-                    batch_size: 1,
-                    has_policy_id: true,
-                    has_scope_id: true,
-                    has_policy_fingerprint: true,
+                    operation: RecordedOperation::Check,
                     outcome: AdmissionOutcome::Failed,
                     consumption: ConsumptionStatus::NotConsumed,
                 },
                 RecordedAdmissionMetadata {
-                    operation: AdmissionOperation::Batch,
-                    batch_size: 1,
-                    has_policy_id: false,
-                    has_scope_id: false,
-                    has_policy_fingerprint: false,
+                    operation: RecordedOperation::Batch {
+                        batch_size: 1,
+                        has_policy: true,
+                    },
                     outcome: AdmissionOutcome::Failed,
                     consumption: ConsumptionStatus::NotConsumed,
                 },
@@ -1954,7 +2018,7 @@ mod tests {
     #[test]
     fn explicit_recovery_resets_only_poisoned_shards_behind_an_arc() {
         let clock = PanicOnceClock::default();
-        let store = Arc::new(MemoryStore::with_clock(
+        let store = Arc::new(with_clock(
             MemoryStoreConfig::new(4)
                 .unwrap()
                 .with_shard_count(2)
@@ -1964,8 +2028,8 @@ mod tests {
         let policy = policy("auth.login", "client", 1, Duration::from_mins(1));
         let reset_subject = subjects_for_shard(&store, &policy, 0, 1)[0];
         let retained_subject = subjects_for_shard(&store, &policy, 1, 1)[0];
-        let reset_check = Check::new(&policy, reset_subject);
-        let retained_check = Check::new(&policy, retained_subject);
+        let reset_check = Check::new(reset_subject.bind(&policy));
+        let retained_check = Check::new(retained_subject.bind(&policy));
 
         assert!(store.check(&reset_check).unwrap().permits_request());
         assert!(store.check(&retained_check).unwrap().permits_request());
@@ -1978,7 +2042,7 @@ mod tests {
 
         assert_eq!(
             store.check(&reset_check),
-            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+            Err(PoisonedShardError { shard_index: 0 })
         );
         assert!(!store.check(&retained_check).unwrap().permits_request());
         assert!(format!("{store:?}").contains("poisoned_shards: 1"));
@@ -2004,7 +2068,7 @@ mod tests {
     #[test]
     fn recovery_reopens_every_shard_poisoned_by_an_unwinding_batch() {
         let clock = PanicOnceClock::default();
-        let store = Arc::new(MemoryStore::with_clock(
+        let store = Arc::new(with_clock(
             MemoryStoreConfig::new(2)
                 .unwrap()
                 .with_shard_count(2)
@@ -2015,8 +2079,8 @@ mod tests {
         let shard_zero = subjects_for_shard(&store, &policy, 0, 1)[0];
         let shard_one = subjects_for_shard(&store, &policy, 1, 1)[0];
         let checks = [
-            Check::new(&policy, shard_one),
-            Check::new(&policy, shard_zero),
+            Check::new(shard_one.bind(&policy)),
+            Check::new(shard_zero.bind(&policy)),
         ];
 
         clock.panic_once();
@@ -2027,11 +2091,11 @@ mod tests {
         assert!(panic_result.is_err());
         assert_eq!(
             store.check(&checks[0]),
-            Err(MemoryStoreError::PoisonedShard { shard_index: 1 })
+            Err(PoisonedShardError { shard_index: 1 })
         );
         assert_eq!(
             store.check(&checks[1]),
-            Err(MemoryStoreError::PoisonedShard { shard_index: 0 })
+            Err(PoisonedShardError { shard_index: 0 })
         );
 
         assert_eq!(store.recover_poisoned(), 2);

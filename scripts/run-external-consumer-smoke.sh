@@ -62,6 +62,23 @@ trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$VENDOR_DIR"
 cp -R "$SMOKE_SOURCE_DIR" "$CONSUMER_DIR"
+mkdir -p "$CONSUMER_DIR/src/bin"
+perl -0ne '
+  sub rustdoc_unhide {
+    my ($example) = @_;
+    $example =~ s/^# //mg;
+    $example =~ s/^#$//mg;
+    $example =~ s/^##/#/mg;
+    return $example;
+  }
+  my $probe = "# let hidden = true;\n#\n#[derive(Debug)]\n#![allow(dead_code)]\n##[escaped]\n";
+  my $expected = "let hidden = true;\n\n#[derive(Debug)]\n#![allow(dead_code)]\n#[escaped]\n";
+  rustdoc_unhide($probe) eq $expected
+    or die "README rustdoc hidden-line extraction self-check failed\n";
+  /<!-- runlimit-readme-gcra:start -->\s*```rust\n(.*?)\n```\s*<!-- runlimit-readme-gcra:end -->/s
+    or die "README GCRA example markers or fenced Rust block are missing\n";
+  print rustdoc_unhide($1);
+' "$ROOT_DIR/README.md" >"$CONSUMER_DIR/src/bin/readme_gcra.rs"
 
 CORE_VERSION="$(crate_version runlimit-core)"
 MEMORY_VERSION="$(crate_version runlimit-memory)"
@@ -227,6 +244,7 @@ RUNLIMIT_KEY_SECRET="runlimit-packaged-smoke-secret-at-least-32-bytes" \
     --manifest-path "$CONSUMER_DIR/Cargo.toml" \
     --config "$PATCH_CONFIG" \
     --locked \
+    --bin runlimit-external-consumer-smoke \
     --quiet
 
 echo "Packaged-source external-consumer smoke test passed with Rust ${MSRV_TOOLCHAIN}."

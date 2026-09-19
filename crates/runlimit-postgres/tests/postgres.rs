@@ -10,10 +10,10 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionOutcome, Allowance, BatchDecision, BatchDecisionView, Check, ConsumptionStatus,
-    Decision, DecisionView, Denial, DenialView, FixedWindowPolicy, Limiter, MAX_LIMIT, MAX_WINDOW,
-    MAX_WINDOW_MILLIS, Observation, Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId,
-    SubjectKey,
+    AdmissionOutcome, Allowance, BatchDecision, BatchDecisionView, Capacity, Check, CleanupOutcome,
+    ConsumptionStatus, Decision, DecisionView, Denial, FixedWindowPolicy, Limiter, MAX_LIMIT,
+    MAX_WINDOW, MAX_WINDOW_MILLIS, Observation, Observer, PolicyId, QuotaDenial, QuotaMode,
+    ScopeId, SubjectKey,
 };
 use runlimit_memory::{Clock, MemoryStore, MemoryStoreConfig};
 use runlimit_postgres::{
@@ -40,6 +40,23 @@ const PUBLISHED_CREATE_MIGRATION_SHA384: [u8; 48] = [
 ];
 static NEXT_POLICY: AtomicU64 = AtomicU64::new(0);
 
+fn capacity(value: u64) -> Capacity {
+    Capacity::new(value).expect("test capacity is valid")
+}
+
+fn allowance(capacity_value: u64, available: u64, replenishes_after: Duration) -> Allowance {
+    Allowance::new(capacity(capacity_value), available, replenishes_after)
+        .expect("test allowance is valid")
+}
+
+fn quota(capacity_value: u64, retry_after: Duration) -> QuotaDenial {
+    QuotaDenial::new(capacity(capacity_value), retry_after)
+}
+
+fn storage_capacity() -> Denial {
+    Denial::StorageCapacity { retry_after: None }
+}
+
 fn available(decision: &Decision) -> u64 {
     match decision.view() {
         DecisionView::Allowed { allowance } => allowance.available(),
@@ -58,10 +75,10 @@ fn shape(decision: &Decision) -> String {
             allowance.capacity()
         ),
         DecisionView::Denied {
-            denial: DenialView::QuotaExceeded(quota),
+            denial: Denial::QuotaExceeded(quota),
         } => format!("quota denied at {}", quota.capacity()),
         DecisionView::Denied {
-            denial: DenialView::StorageCapacity { .. },
+            denial: Denial::StorageCapacity { .. },
         } => "capacity denied".to_owned(),
         DecisionView::ShadowDenied { denial } => format!("shadow denied at {}", denial.capacity()),
     }
@@ -70,7 +87,7 @@ fn shape(decision: &Decision) -> String {
 #[derive(Default)]
 struct RecordingObserver {
     admissions: Mutex<Vec<(AdmissionOutcome, ConsumptionStatus)>>,
-    cleanups: Mutex<Vec<(usize, Option<u64>, ConsumptionStatus)>>,
+    cleanups: Mutex<Vec<(usize, CleanupOutcome)>>,
 }
 
 impl Observer for RecordingObserver {
@@ -81,11 +98,11 @@ impl Observer for RecordingObserver {
                 .lock()
                 .unwrap()
                 .push((admission.outcome(), admission.consumption())),
-            Observation::Cleanup(cleanup) => self.cleanups.lock().unwrap().push((
-                cleanup.requested(),
-                cleanup.removed(),
-                cleanup.consumption(),
-            )),
+            Observation::Cleanup(cleanup) => self
+                .cleanups
+                .lock()
+                .unwrap()
+                .push((cleanup.requested(), cleanup.outcome())),
             // The PostgreSQL backend has no local capacity to report.
             Observation::Capacity(_) => {}
         }
@@ -380,44 +397,46 @@ struct TransitionStep {
     expected: Decision,
 }
 
-const FIXED_WINDOW_TRANSITIONS: [TransitionStep; 6] = [
-    TransitionStep {
-        name: "new window",
-        at_millis: 0,
-        cost: 2,
-        expected: Decision::allowed(Allowance::new(5, 3, Duration::from_secs(10))),
-    },
-    TransitionStep {
-        name: "live increment",
-        at_millis: 3_000,
-        cost: 2,
-        expected: Decision::allowed(Allowance::new(5, 1, Duration::from_secs(7))),
-    },
-    TransitionStep {
-        name: "live denial",
-        at_millis: 3_000,
-        cost: 2,
-        expected: Decision::quota_denied(QuotaDenial::new(5, Duration::from_secs(7))),
-    },
-    TransitionStep {
-        name: "exact fill after denial",
-        at_millis: 9_000,
-        cost: 1,
-        expected: Decision::allowed(Allowance::new(5, 0, Duration::from_secs(1))),
-    },
-    TransitionStep {
-        name: "full-window denial",
-        at_millis: 9_000,
-        cost: 1,
-        expected: Decision::quota_denied(QuotaDenial::new(5, Duration::from_secs(1))),
-    },
-    TransitionStep {
-        name: "exact-expiry renewal",
-        at_millis: 10_000,
-        cost: 3,
-        expected: Decision::allowed(Allowance::new(5, 2, Duration::from_secs(10))),
-    },
-];
+fn fixed_window_transitions() -> [TransitionStep; 6] {
+    [
+        TransitionStep {
+            name: "new window",
+            at_millis: 0,
+            cost: 2,
+            expected: Decision::allowed(allowance(5, 3, Duration::from_secs(10))),
+        },
+        TransitionStep {
+            name: "live increment",
+            at_millis: 3_000,
+            cost: 2,
+            expected: Decision::allowed(allowance(5, 1, Duration::from_secs(7))),
+        },
+        TransitionStep {
+            name: "live denial",
+            at_millis: 3_000,
+            cost: 2,
+            expected: Decision::denied(quota(5, Duration::from_secs(7))),
+        },
+        TransitionStep {
+            name: "exact fill after denial",
+            at_millis: 9_000,
+            cost: 1,
+            expected: Decision::allowed(allowance(5, 0, Duration::from_secs(1))),
+        },
+        TransitionStep {
+            name: "full-window denial",
+            at_millis: 9_000,
+            cost: 1,
+            expected: Decision::denied(quota(5, Duration::from_secs(1))),
+        },
+        TransitionStep {
+            name: "exact-expiry renewal",
+            at_millis: 10_000,
+            cost: 3,
+            expected: Decision::allowed(allowance(5, 2, Duration::from_secs(10))),
+        },
+    ]
+}
 
 async fn delete_counter(pool: &PgPool, policy: &FixedWindowPolicy, subject: SubjectKey) -> u64 {
     sqlx::query(
@@ -587,7 +606,7 @@ EXECUTE FUNCTION {schema}.sleep_during_cleanup();
 async fn cleanup_uses_an_indexable_cutoff_and_skips_locked_rows() {
     let fixture = IsolatedSchema::for_cleanup_test(4).await;
     let pool = fixture.primary_pool.clone();
-    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
     let locked_policy = unique_policy("cleanup-locked-expired", 1, Duration::from_secs(1));
     let expired_policy = unique_policy("cleanup-expired", 1, Duration::from_secs(1));
     let active_policy = unique_policy("cleanup-active", 1, Duration::from_hours(1));
@@ -709,7 +728,7 @@ EXECUTE FUNCTION {schema}.sleep_before_delete();
     let short_config = PostgresConfig::new()
         .with_operation_timeout(Duration::from_millis(100))
         .expect("short nonzero timeout is valid");
-    let limiter = PostgresLimiter::with_config(pool.clone(), short_config);
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(short_config);
     let error = limiter
         .cleanup_expired(1)
         .await
@@ -732,7 +751,7 @@ EXECUTE FUNCTION {schema}.sleep_before_delete();
     let cancellation_config = PostgresConfig::new()
         .with_operation_timeout(Duration::from_secs(5))
         .expect("long cleanup timeout is valid");
-    let cancellable_limiter = PostgresLimiter::with_config(pool.clone(), cancellation_config);
+    let cancellable_limiter = PostgresLimiter::new(pool.clone()).with_config(cancellation_config);
     let cancelled = tokio::time::timeout(
         Duration::from_millis(100),
         cancellable_limiter.cleanup_expired(1),
@@ -796,7 +815,7 @@ async fn pool_wait_does_not_spend_admission_or_cleanup_operation_budget() {
         .expect("one-second pool budget is valid")
         .with_operation_timeout(Duration::from_millis(250))
         .expect("250-millisecond operation budget is valid");
-    let limiter = PostgresLimiter::with_config(pool.clone(), config);
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(config);
 
     let held_connection = pool
         .acquire()
@@ -809,7 +828,7 @@ async fn pool_wait_does_not_spend_admission_or_cleanup_operation_budget() {
     let admission = tokio::spawn(async move {
         waiting_barrier.wait().await;
         waiting_limiter
-            .check(&Check::new(&waiting_policy, subject))
+            .check(&Check::new(subject.bind(&waiting_policy)))
             .await
     });
     admission_barrier.wait().await;
@@ -1158,10 +1177,10 @@ ORDER BY key_columns.position
 
     let policy = unique_policy("counter-key-metadata", 3, Duration::from_mins(1));
     let subject = key(155);
-    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
     assert!(
         limiter
-            .check(&Check::new(&policy, subject))
+            .check(&Check::new(subject.bind(&policy)))
             .await
             .expect("admit metadata test check")
             .permits_request()
@@ -1205,33 +1224,34 @@ async fn configured_capacity_denies_only_new_keys_in_the_full_shard() {
         .with_maximum_rows_per_shard(2)
         .expect("two rows per shard is valid");
     let observer = Arc::new(RecordingObserver::default());
-    let limiter =
-        PostgresLimiter::with_config(pool.clone(), config).with_observer(observer.clone());
+    let limiter = PostgresLimiter::new(pool.clone())
+        .with_config(config)
+        .with_observer(observer.clone());
 
     let first = limiter
-        .check(&Check::new(&policy, first_subject))
+        .check(&Check::new(first_subject.bind(&policy)))
         .await
         .expect("first key is admitted");
     let second = limiter
-        .check(&Check::new(&policy, second_subject))
+        .check(&Check::new(second_subject.bind(&policy)))
         .await
         .expect("second key is admitted");
     let denied = limiter
-        .check(&Check::new(&policy, denied_subject))
+        .check(&Check::new(denied_subject.bind(&policy)))
         .await
         .expect("capacity exhaustion is a decision");
     let existing = limiter
-        .check(&Check::new(&policy, first_subject))
+        .check(&Check::new(first_subject.bind(&policy)))
         .await
         .expect("an existing key remains usable");
     let other = limiter
-        .check(&Check::new(&policy, other_subject))
+        .check(&Check::new(other_subject.bind(&policy)))
         .await
         .expect("another shard retains capacity");
 
     assert!(first.permits_request());
     assert!(second.permits_request());
-    assert_eq!(denied, Decision::denied(Denial::storage_capacity(None)));
+    assert_eq!(denied, Decision::denied(storage_capacity()));
     assert!(existing.permits_request());
     assert!(other.permits_request());
     assert_eq!(
@@ -1272,14 +1292,15 @@ async fn expired_rows_hold_capacity_until_cleanup_commits() {
         .with_maximum_rows_per_shard(1)
         .expect("one row per shard is valid");
     let observer = Arc::new(RecordingObserver::default());
-    let limiter =
-        PostgresLimiter::with_config(pool.clone(), config).with_observer(observer.clone());
+    let limiter = PostgresLimiter::new(pool.clone())
+        .with_config(config)
+        .with_observer(observer.clone());
 
     let full = limiter
-        .check(&Check::new(&policy, replacement_subject))
+        .check(&Check::new(replacement_subject.bind(&policy)))
         .await
         .expect("an expired stored row still occupies capacity");
-    assert_eq!(full, Decision::denied(Denial::storage_capacity(None)));
+    assert_eq!(full, Decision::denied(storage_capacity()));
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 1);
 
     assert_eq!(
@@ -1288,12 +1309,12 @@ async fn expired_rows_hold_capacity_until_cleanup_commits() {
     );
     assert_eq!(
         observer.cleanups.lock().unwrap().as_slice(),
-        [(1, Some(1), ConsumptionStatus::Consumed)]
+        [(1, CleanupOutcome::Confirmed { removed: 1 })]
     );
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
 
     let replacement = limiter
-        .check(&Check::new(&policy, replacement_subject))
+        .check(&Check::new(replacement_subject.bind(&policy)))
         .await
         .expect("cleanup releases the shard slot");
     assert!(replacement.permits_request());
@@ -1317,25 +1338,25 @@ async fn capacity_denied_batch_rolls_back_and_remains_enforced_in_shadow_mode() 
     let config = test_config()
         .with_maximum_rows_per_shard(1)
         .expect("one row per shard is valid");
-    let limiter = PostgresLimiter::with_config(pool.clone(), config);
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(config);
 
     let result = limiter
         .check_all(&[
-            Check::new(&policy, first_subject),
-            Check::new(&policy, second_subject),
+            Check::new(first_subject.bind(&policy)),
+            Check::new(second_subject.bind(&policy)),
         ])
         .await
         .expect("capacity exhaustion is a batch decision");
     assert_eq!(
         result,
-        BatchDecision::denied(1, 2, Denial::storage_capacity(None))
+        BatchDecision::denied(1, 2, storage_capacity()).unwrap()
     );
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
     assert!(!counter_exists(&pool, &policy, first_subject).await);
     assert!(!counter_exists(&pool, &policy, second_subject).await);
 
     let admitted = limiter
-        .check(&Check::new(&policy, first_subject))
+        .check(&Check::new(first_subject.bind(&policy)))
         .await
         .expect("rolled-back capacity remains available");
     assert!(admitted.permits_request());
@@ -1354,21 +1375,21 @@ async fn shadow_quota_denial_is_reported_without_consuming_more_quota() {
         unique_policy("shadow-quota", 1, Duration::from_mins(1)).with_quota_mode(QuotaMode::Shadow);
     let earlier_subject = key_in_capacity_shard(&policy, 30, 1);
     let exhausted_subject = key_in_capacity_shard(&policy, 30, 2);
-    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
 
     let allowed = limiter
-        .check(&Check::new(&policy, exhausted_subject))
+        .check(&Check::new(exhausted_subject.bind(&policy)))
         .await
         .expect("first shadow-policy check is consumed");
     let single_shadow_denial = limiter
-        .check(&Check::new(&policy, exhausted_subject))
+        .check(&Check::new(exhausted_subject.bind(&policy)))
         .await
         .expect("single shadow quota exhaustion is a decision");
     assert!(allowed.permits_request());
     assert!(single_shadow_denial.permits_request());
     assert!(matches!(
         single_shadow_denial.view(),
-        DecisionView::ShadowDenied { denial } if denial.capacity() == 1
+        DecisionView::ShadowDenied { denial } if denial.capacity().get() == 1
     ));
     assert_eq!(
         stored_counter_usage(&pool, &policy, exhausted_subject).await,
@@ -1377,8 +1398,8 @@ async fn shadow_quota_denial_is_reported_without_consuming_more_quota() {
 
     let batch_shadow_denial = limiter
         .check_all(&[
-            Check::new(&policy, earlier_subject),
-            Check::new(&policy, exhausted_subject),
+            Check::new(earlier_subject.bind(&policy)),
+            Check::new(exhausted_subject.bind(&policy)),
         ])
         .await
         .expect("shadow quota exhaustion is a batch decision");
@@ -1389,7 +1410,7 @@ async fn shadow_quota_denial_is_reported_without_consuming_more_quota() {
             index: 1,
             batch_size,
             denial,
-        } if batch_size.get() == 2 && denial.capacity() == 1
+        } if batch_size.get() == 2 && denial.capacity().get() == 1
     ));
     assert!(!counter_exists(&pool, &policy, earlier_subject).await);
     assert_eq!(
@@ -1474,10 +1495,10 @@ async fn database_trigger_rejects_storage_key_updates_without_ledger_drift() {
     let replacement_shard = 34;
     let original_subject = key_in_capacity_shard(&policy, original_shard, 1);
     let replacement_subject = key_in_capacity_shard(&policy, replacement_shard, 2);
-    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
 
     let admitted = limiter
-        .check(&Check::new(&policy, original_subject))
+        .check(&Check::new(original_subject.bind(&policy)))
         .await
         .expect("create the original counter");
     assert!(admitted.permits_request());
@@ -1534,6 +1555,144 @@ WHERE config_fingerprint = $1 AND subject_key = $2
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn malformed_upsert_response_is_rejected_before_commit() {
+    let fixture = IsolatedSchema::for_cleanup_test(2).await;
+    let setup_pool = fixture.admin_pool.clone();
+    let pool = fixture.primary_pool.clone();
+    let schema = fixture.schema.clone();
+    let policy = unique_policy("malformed-response-rollback", 10, Duration::from_mins(1));
+    let shard = 41;
+    let subject = key_in_capacity_shard(&policy, shard, 1);
+    let corruption_sql = format!(
+        r"
+CREATE FUNCTION {schema}.corrupt_returned_usage()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    NEW.used := 11;
+    RETURN NEW;
+END
+$function$;
+
+CREATE TRIGGER corrupt_returned_usage
+BEFORE INSERT ON {schema}.runlimit_fixed_windows
+FOR EACH ROW
+EXECUTE FUNCTION {schema}.corrupt_returned_usage();
+"
+    );
+    sqlx::raw_sql(AssertSqlSafe(corruption_sql))
+        .execute(&setup_pool)
+        .await
+        .expect("install malformed-response trigger");
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
+
+    let error = limiter
+        .check(&Check::new(subject.bind(&policy)))
+        .await
+        .expect_err("usage above the policy limit is a storage invariant failure");
+    let CheckError::StorageInvariant(invariant) = &error else {
+        panic!("expected a storage invariant");
+    };
+    assert_eq!(invariant.detail(), "stored usage exceeds its policy limit");
+    assert!(std::error::Error::source(invariant).is_none());
+    assert_eq!(error.consumption(), ConsumptionStatus::NotConsumed);
+    assert!(!counter_exists(&pool, &policy, subject).await);
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
+
+    sqlx::query(AssertSqlSafe(format!(
+        "DROP TRIGGER corrupt_returned_usage ON {schema}.runlimit_fixed_windows"
+    )))
+    .execute(&setup_pool)
+    .await
+    .expect("drop malformed-response trigger");
+    sqlx::query(AssertSqlSafe(format!(
+        "DROP FUNCTION {schema}.corrupt_returned_usage()"
+    )))
+    .execute(&setup_pool)
+    .await
+    .expect("drop malformed-response function");
+
+    let admitted = limiter
+        .check(&Check::new(subject.bind(&policy)))
+        .await
+        .expect("the rolled-back malformed response leaves quota unconsumed");
+    assert!(matches!(
+        admitted.view(),
+        DecisionView::Allowed { allowance } if allowance.available() == 9
+    ));
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 1);
+    assert_eq!(delete_counter(&pool, &policy, subject).await, 1);
+
+    drop(limiter);
+    fixture.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
+async fn undecodable_upsert_field_is_storage_invariant_before_commit() {
+    let fixture = IsolatedSchema::for_cleanup_test(2).await;
+    let setup_pool = fixture.admin_pool.clone();
+    let pool = fixture.primary_pool.clone();
+    let schema = fixture.schema.clone();
+    let policy = unique_policy("undecodable-response-rollback", 10, Duration::from_mins(1));
+    let shard = 43;
+    let subject = key_in_capacity_shard(&policy, shard, 1);
+
+    // Keep the SQL operation valid while changing the returned field's wire
+    // type. The update reaches RETURNING, but shaping it as an i64 must fail
+    // before commit and roll back both the counter and capacity reservation.
+    sqlx::query(AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.runlimit_fixed_windows ALTER COLUMN used TYPE NUMERIC"
+    )))
+    .execute(&setup_pool)
+    .await
+    .expect("make returned usage undecodable as an i64");
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
+
+    let error = limiter
+        .check(&Check::new(subject.bind(&policy)))
+        .await
+        .expect_err("an undecodable returned field is a storage invariant failure");
+    let CheckError::StorageInvariant(invariant) = &error else {
+        panic!("expected a storage invariant");
+    };
+    assert_eq!(
+        invariant.detail(),
+        "batch update returned undecodable usage"
+    );
+    assert!(
+        std::error::Error::source(invariant)
+            .is_some_and(|source| source.downcast_ref::<sqlx::Error>().is_some())
+    );
+    assert_eq!(error.consumption(), ConsumptionStatus::NotConsumed);
+    assert!(!counter_exists(&pool, &policy, subject).await);
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
+
+    sqlx::query(AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.runlimit_fixed_windows ALTER COLUMN used TYPE BIGINT USING used::BIGINT"
+    )))
+    .execute(&setup_pool)
+    .await
+    .expect("restore the migration-defined usage type");
+
+    let admitted = limiter
+        .check(&Check::new(subject.bind(&policy)))
+        .await
+        .expect("the rolled-back undecodable response leaves quota unconsumed");
+    assert!(matches!(
+        admitted.view(),
+        DecisionView::Allowed { allowance } if allowance.available() == 9
+    ));
+    assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 1);
+    assert_eq!(delete_counter(&pool, &policy, subject).await, 1);
+
+    drop(limiter);
+    fixture.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn failed_insert_rolls_back_capacity_trigger_accounting() {
     let fixture = IsolatedSchema::for_cleanup_test(2).await;
     let setup_pool = fixture.admin_pool.clone();
@@ -1566,9 +1725,9 @@ EXECUTE FUNCTION {schema}.fail_after_capacity_accounting();
     let config = test_config()
         .with_maximum_rows_per_shard(1)
         .expect("one row per shard is valid");
-    let limiter = PostgresLimiter::with_config(pool.clone(), config);
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(config);
 
-    let failed = limiter.check(&Check::new(&policy, subject)).await;
+    let failed = limiter.check(&Check::new(subject.bind(&policy))).await;
     assert!(matches!(failed, Err(CheckError::DefinitelyNotConsumed(_))));
     assert_eq!(capacity_row_count(&pool, i16::from(shard)).await, 0);
     assert!(!counter_exists(&pool, &policy, subject).await);
@@ -1587,7 +1746,7 @@ EXECUTE FUNCTION {schema}.fail_after_capacity_accounting();
     .expect("drop post-accounting failure function");
 
     let admitted = limiter
-        .check(&Check::new(&policy, subject))
+        .check(&Check::new(subject.bind(&policy)))
         .await
         .expect("rolled-back trigger accounting releases the slot");
     assert!(admitted.permits_request());
@@ -1616,8 +1775,8 @@ async fn concurrent_replicas_never_exceed_configured_shard_capacity() {
     let config = test_config()
         .with_maximum_rows_per_shard(CAPACITY)
         .expect("test shard capacity is valid");
-    let first = PostgresLimiter::with_config(first_pool.clone(), config);
-    let second = PostgresLimiter::with_config(second_pool.clone(), config);
+    let first = PostgresLimiter::new(first_pool.clone()).with_config(config);
+    let second = PostgresLimiter::new(second_pool.clone()).with_config(config);
     let barrier = Arc::new(Barrier::new(usize::from(ATTEMPTS) + 1));
     let mut tasks = Vec::with_capacity(usize::from(ATTEMPTS));
 
@@ -1634,7 +1793,9 @@ async fn concurrent_replicas_never_exceed_configured_shard_capacity() {
             barrier.wait().await;
             (
                 subject,
-                limiter.check(&Check::new(policy.as_ref(), subject)).await,
+                limiter
+                    .check(&Check::new(subject.bind(policy.as_ref())))
+                    .await,
             )
         }));
     }
@@ -1648,7 +1809,7 @@ async fn concurrent_replicas_never_exceed_configured_shard_capacity() {
         if decision.permits_request() {
             allowed += 1;
         } else {
-            assert_eq!(decision, Decision::denied(Denial::storage_capacity(None)));
+            assert_eq!(decision, Decision::denied(storage_capacity()));
             capacity_denied += 1;
         }
     }
@@ -1684,16 +1845,16 @@ async fn concurrent_replicas_never_exceed_configured_shard_capacity() {
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn single_quota_denial_and_anchored_reset() {
     let pool = test_pool(4).await;
-    let limiter = PostgresLimiter::with_config(pool, test_config());
+    let limiter = PostgresLimiter::new(pool).with_config(test_config());
     let policy = unique_policy("single", 2, Duration::from_millis(250));
-    let check = Check::new(&policy, key(1));
+    let check = Check::new(key(1).bind(&policy));
 
     let first = limiter.check(&check).await.expect("first check succeeds");
     assert!(first.permits_request());
     assert_eq!(available(&first), 1);
     assert!(matches!(
         first.view(),
-        DecisionView::Allowed { allowance } if !allowance.replenishes_after().is_zero()
+        DecisionView::Allowed { allowance } if !allowance.replenishes_after().duration().is_zero()
     ));
 
     let second = limiter.check(&check).await.expect("second check succeeds");
@@ -1702,14 +1863,14 @@ async fn single_quota_denial_and_anchored_reset() {
 
     let denied = limiter.check(&check).await.expect("denial is a decision");
     let DecisionView::Denied {
-        denial: DenialView::QuotaExceeded(quota),
+        denial: Denial::QuotaExceeded(quota),
     } = denied.view()
     else {
         panic!("expected a quota denial, got {denied:?}")
     };
     let retry_after = quota.retry_after().duration();
     assert!(!retry_after.is_zero());
-    assert!(retry_after <= policy.window());
+    assert!(retry_after <= policy.window().duration());
 
     sleep(retry_after + Duration::from_millis(20)).await;
     let reset = limiter
@@ -1724,10 +1885,12 @@ async fn single_quota_denial_and_anchored_reset() {
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn portable_policy_upper_bounds_are_stored_exactly() {
     let pool = test_pool(1).await;
-    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
     let policy = unique_policy("portable-maximum", MAX_LIMIT, MAX_WINDOW);
     let subject = key(7);
-    let check = Check::with_cost(&policy, subject, MAX_LIMIT).unwrap();
+    let check = Check::new(subject.bind(&policy))
+        .with_cost(MAX_LIMIT)
+        .unwrap();
 
     let allowed = limiter.check(&check).await.expect("maximum check succeeds");
 
@@ -1760,7 +1923,7 @@ WHERE
     assert!(matches!(
         allowed.view(),
         DecisionView::Allowed { allowance }
-            if allowance.capacity() == MAX_LIMIT && allowance.available() == 0
+            if allowance.capacity().get() == MAX_LIMIT && allowance.available() == 0
     ));
     assert_eq!(stored_used, i64::MAX);
     assert_eq!(
@@ -1770,8 +1933,8 @@ WHERE
     assert!(matches!(
         denied.view(),
         DecisionView::Denied {
-            denial: DenialView::QuotaExceeded(quota),
-        } if quota.capacity() == MAX_LIMIT
+            denial: Denial::QuotaExceeded(quota),
+        } if quota.capacity().get() == MAX_LIMIT
     ));
     assert_eq!(deleted_rows, 1);
 }
@@ -1780,11 +1943,11 @@ WHERE
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn denied_batch_rolls_back_every_counter() {
     let pool = test_pool(4).await;
-    let limiter = PostgresLimiter::with_config(pool, test_config());
+    let limiter = PostgresLimiter::new(pool).with_config(test_config());
     let first_policy = unique_policy("batch-first", 2, Duration::from_secs(5));
     let saturated_policy = unique_policy("batch-saturated", 1, Duration::from_secs(5));
-    let first_check = Check::new(&first_policy, key(2));
-    let saturated_check = Check::new(&saturated_policy, key(3));
+    let first_check = Check::new(key(2).bind(&first_policy));
+    let saturated_check = Check::new(key(3).bind(&saturated_policy));
 
     assert!(
         limiter
@@ -1814,13 +1977,13 @@ async fn denied_batch_rolls_back_every_counter() {
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn earliest_denial_skips_a_later_failing_statement() {
     let pool = test_pool(4).await;
-    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
     let denied_policy = unique_policy("batch-a-denied", 1, Duration::from_secs(5));
     let failing_policy = unique_policy("batch-z-errors", 10, Duration::from_secs(5));
     let denied_subject = key(8);
     let failing_subject = key(9);
-    let denied_check = Check::new(&denied_policy, denied_subject);
-    let failing_check = Check::new(&failing_policy, failing_subject);
+    let denied_check = Check::new(denied_subject.bind(&denied_policy));
+    let failing_check = Check::new(failing_subject.bind(&failing_policy));
 
     let saturated = limiter
         .check(&denied_check)
@@ -1906,8 +2069,8 @@ async fn search_path_clock_shadow_cannot_hijack_admission_or_cleanup_time() {
     let schema = fixture.schema.clone();
     let policy = unique_policy("clock-shadow", 1, Duration::from_hours(1));
     let subject = key(10);
-    let check = Check::new(&policy, subject);
-    let setup_limiter = PostgresLimiter::with_config(table_pool.clone(), test_config());
+    let check = Check::new(subject.bind(&policy));
+    let setup_limiter = PostgresLimiter::new(table_pool.clone()).with_config(test_config());
     let first = setup_limiter
         .check(&check)
         .await
@@ -1930,7 +2093,7 @@ $function$
     .expect("create malicious clock shadow");
 
     let shadowed_pool = fixture.additional_pool(2).await;
-    let limiter = PostgresLimiter::with_config(shadowed_pool.clone(), test_config());
+    let limiter = PostgresLimiter::new(shadowed_pool.clone()).with_config(test_config());
 
     let denied = limiter
         .check(&check)
@@ -1963,18 +2126,19 @@ $function$
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn memory_and_postgres_share_fixed_window_transition_semantics() {
     let postgres_pool = test_pool(2).await;
-    let postgres = PostgresLimiter::with_config(postgres_pool.clone(), test_config());
+    let postgres = PostgresLimiter::new(postgres_pool.clone()).with_config(test_config());
     let memory_clock = ConformanceClock::default();
-    let memory = MemoryStore::with_clock(
-        MemoryStoreConfig::new(1).expect("test memory capacity is valid"),
-        memory_clock.clone(),
-    );
+    let memory =
+        MemoryStore::builder(MemoryStoreConfig::new(1).expect("test memory capacity is valid"))
+            .with_clock(memory_clock.clone())
+            .build();
     let policy = unique_policy("fixed-window-conformance", 5, Duration::from_secs(10));
     let subject = key(11);
 
     let observations = async {
-        let mut observations = Vec::with_capacity(FIXED_WINDOW_TRANSITIONS.len());
-        for step in FIXED_WINDOW_TRANSITIONS {
+        let transitions = fixed_window_transitions();
+        let mut observations = Vec::with_capacity(transitions.len());
+        for step in transitions {
             memory_clock.set(step.at_millis);
             if step.at_millis == 10_000 {
                 sqlx::query(
@@ -1992,7 +2156,7 @@ WHERE
                 .await?;
             }
 
-            let check = Check::with_cost(&policy, subject, step.cost)?;
+            let check = Check::new(subject.bind(&policy)).with_cost(step.cost)?;
             let memory_decision = memory.check(&check)?;
             let postgres_decision = postgres.check(&check).await?;
             observations.push((step, memory_decision, postgres_decision));
@@ -2025,17 +2189,17 @@ WHERE
             step.name
         );
         let postgres_duration = match postgres_decision.view() {
-            DecisionView::Allowed { allowance } => allowance.replenishes_after(),
+            DecisionView::Allowed { allowance } => allowance.replenishes_after().duration(),
             DecisionView::Denied {
-                denial: DenialView::QuotaExceeded(quota),
+                denial: Denial::QuotaExceeded(quota),
             }
             | DecisionView::ShadowDenied { denial: quota } => quota.retry_after().duration(),
             DecisionView::Denied {
-                denial: DenialView::StorageCapacity { .. },
+                denial: Denial::StorageCapacity { .. },
             } => panic!("the transition sequence never exhausts storage capacity"),
         };
         assert!(
-            postgres_duration <= policy.window(),
+            postgres_duration <= policy.window().duration(),
             "PostgreSQL returned an overlong duration at the '{}' transition",
             step.name
         );
@@ -2050,11 +2214,12 @@ WHERE
 async fn unpolled_limiter_futures_consume_no_quota() {
     let pool = test_pool(2).await;
     let observer = Arc::new(RecordingObserver::default());
-    let limiter =
-        PostgresLimiter::with_config(pool.clone(), test_config()).with_observer(observer.clone());
+    let limiter = PostgresLimiter::new(pool.clone())
+        .with_config(test_config())
+        .with_observer(observer.clone());
     let policy = unique_policy("lazy-limiter", 1, Duration::from_mins(1));
     let subject = key(12);
-    let check = Check::new(&policy, subject);
+    let check = Check::new(subject.bind(&policy));
     let checks = [check];
 
     // Go through the trait, not the inherent methods, because the contract
@@ -2096,7 +2261,7 @@ async fn unpolled_limiter_futures_consume_no_quota() {
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn set_based_batch_preserves_caller_order_and_array_alignment() {
     let pool = test_pool(4).await;
-    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
     let policies = (0_u64..32)
         .map(|index| {
             unique_policy(
@@ -2111,12 +2276,9 @@ async fn set_based_batch_preserves_caller_order_and_array_alignment() {
         .enumerate()
         .rev()
         .map(|(index, policy)| {
-            Check::with_cost(
-                policy,
-                key(100 + u8::try_from(index).unwrap()),
-                u64::try_from(index % 7 + 1).unwrap(),
-            )
-            .unwrap()
+            Check::new(key(100 + u8::try_from(index).unwrap()).bind(policy))
+                .with_cost(u64::try_from(index % 7 + 1).unwrap())
+                .unwrap()
         })
         .collect::<Vec<_>>();
 
@@ -2168,7 +2330,10 @@ ORDER BY input.input_position
     assert_eq!(allowances.len(), checks.len());
     for (allowance, check) in allowances.iter().zip(&checks) {
         assert_eq!(allowance.capacity(), check.policy().limit());
-        assert_eq!(allowance.available(), check.policy().limit() - check.cost());
+        assert_eq!(
+            allowance.available(),
+            check.policy().limit().get() - check.cost()
+        );
     }
 
     assert_eq!(stored_usage.len(), checks.len());
@@ -2179,7 +2344,7 @@ ORDER BY input.input_position
         assert_eq!(u64::try_from(*used).unwrap(), check.cost());
         assert_eq!(
             u64::try_from(*window_millis).unwrap(),
-            check.policy().window_millis()
+            check.policy().window().millis()
         );
     }
     assert_eq!(deleted_rows, u64::try_from(checks.len()).unwrap());
@@ -2198,8 +2363,8 @@ async fn opposite_order_batches_across_pools_do_not_deadlock_or_over_admit() {
         .connect(&database_url)
         .await
         .expect("connect second replica pool");
-    let first_limiter = PostgresLimiter::with_config(first_pool.clone(), test_config());
-    let second_limiter = PostgresLimiter::with_config(second_pool, test_config());
+    let first_limiter = PostgresLimiter::new(first_pool.clone()).with_config(test_config());
+    let second_limiter = PostgresLimiter::new(second_pool).with_config(test_config());
     let policy_a = Arc::new(unique_policy(
         "opposite-order-a",
         ROUNDS * 2,
@@ -2223,8 +2388,8 @@ async fn opposite_order_batches_across_pools_do_not_deadlock_or_over_admit() {
         let first_task_b = Arc::clone(&policy_b);
         let first_task = tokio::spawn(async move {
             let checks = [
-                Check::new(first_task_a.as_ref(), subject_a),
-                Check::new(first_task_b.as_ref(), subject_b),
+                Check::new(subject_a.bind(first_task_a.as_ref())),
+                Check::new(subject_b.bind(first_task_b.as_ref())),
             ];
             first_task_barrier.wait().await;
             first_task_limiter.check_all(&checks).await
@@ -2236,8 +2401,8 @@ async fn opposite_order_batches_across_pools_do_not_deadlock_or_over_admit() {
         let second_task_b = Arc::clone(&policy_b);
         let second_task = tokio::spawn(async move {
             let checks = [
-                Check::new(second_task_b.as_ref(), subject_b),
-                Check::new(second_task_a.as_ref(), subject_a),
+                Check::new(subject_b.bind(second_task_b.as_ref())),
+                Check::new(subject_a.bind(second_task_a.as_ref())),
             ];
             second_task_barrier.wait().await;
             second_task_limiter.check_all(&checks).await
@@ -2251,8 +2416,8 @@ async fn opposite_order_batches_across_pools_do_not_deadlock_or_over_admit() {
     let stored_b = stored_counter_usage(&first_pool, &policy_b, subject_b).await;
     let after_capacity = first_limiter
         .check_all(&[
-            Check::new(&policy_a, subject_a),
-            Check::new(&policy_b, subject_b),
+            Check::new(subject_a.bind(&policy_a)),
+            Check::new(subject_b.bind(&policy_b)),
         ])
         .await;
 
@@ -2292,8 +2457,8 @@ async fn concurrent_pools_never_over_admit() {
         .connect(&database_url)
         .await
         .expect("connect second replica pool");
-    let first_limiter = PostgresLimiter::with_config(first_pool, test_config());
-    let second_limiter = PostgresLimiter::with_config(second_pool, test_config());
+    let first_limiter = PostgresLimiter::new(first_pool).with_config(test_config());
+    let second_limiter = PostgresLimiter::new(second_pool).with_config(test_config());
     let policy = Arc::new(unique_policy("concurrent", 12, Duration::from_secs(10)));
     let barrier = Arc::new(Barrier::new(49));
     let mut tasks = Vec::with_capacity(48);
@@ -2309,7 +2474,7 @@ async fn concurrent_pools_never_over_admit() {
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
             limiter
-                .check(&Check::new(&policy, key(4)))
+                .check(&Check::new(key(4).bind(&policy)))
                 .await
                 .expect("concurrent check completes")
                 .permits_request()
@@ -2329,14 +2494,14 @@ async fn concurrent_pools_never_over_admit() {
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn concurrent_fresh_single_checks_advance_the_waiters_snapshot() {
     let pool = test_pool(6).await;
-    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
     let policy = Arc::new(unique_policy(
         "concurrent-fresh-single",
         1,
         Duration::from_secs(10),
     ));
     let subject = key(156);
-    let check = Check::new(policy.as_ref(), subject);
+    let check = Check::new(subject.bind(policy.as_ref()));
     let logical_lock_id = advisory_lock_id(&check);
 
     let mut blocker = pool.begin().await.expect("begin logical-lock blocker");
@@ -2355,7 +2520,7 @@ async fn concurrent_fresh_single_checks_advance_the_waiters_snapshot() {
         tasks.push(tokio::spawn(async move {
             task_barrier.wait().await;
             task_limiter
-                .check(&Check::new(task_policy.as_ref(), subject))
+                .check(&Check::new(subject.bind(task_policy.as_ref())))
                 .await
         }));
     }
@@ -2388,7 +2553,7 @@ async fn concurrent_fresh_single_checks_advance_the_waiters_snapshot() {
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
     let pool = test_pool(8).await;
-    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
     let target_policy = Arc::new(unique_policy(
         "mixed-fresh-target",
         1,
@@ -2401,7 +2566,7 @@ async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
     ));
     let target_subject = key(157);
     let companion_subject = key(158);
-    let target_check = Check::new(target_policy.as_ref(), target_subject);
+    let target_check = Check::new(target_subject.bind(target_policy.as_ref()));
     let logical_lock_id = advisory_lock_id(&target_check);
 
     let mut blocker = pool.begin().await.expect("begin mixed-path lock blocker");
@@ -2417,8 +2582,8 @@ async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
     let batch = tokio::spawn(async move {
         batch_limiter
             .check_all(&[
-                Check::new(batch_target_policy.as_ref(), target_subject),
-                Check::new(batch_companion_policy.as_ref(), companion_subject),
+                Check::new(target_subject.bind(batch_target_policy.as_ref())),
+                Check::new(companion_subject.bind(batch_companion_policy.as_ref())),
             ])
             .await
     });
@@ -2428,7 +2593,7 @@ async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
     let single_policy = Arc::clone(&target_policy);
     let single = tokio::spawn(async move {
         single_limiter
-            .check(&Check::new(single_policy.as_ref(), target_subject))
+            .check(&Check::new(target_subject.bind(single_policy.as_ref())))
             .await
     });
     wait_for_advisory_waiters(&pool, "WITH RECURSIVE acquired(position, locked)", 2).await;
@@ -2463,7 +2628,7 @@ async fn fresh_single_waiting_behind_a_batch_advances_its_snapshot() {
 #[ignore = "requires RUNLIMIT_POSTGRES_TEST_DATABASE_URL"]
 async fn contended_check_samples_time_after_row_lock() {
     let pool = test_pool(6).await;
-    let limiter = PostgresLimiter::with_config(pool.clone(), test_config());
+    let limiter = PostgresLimiter::new(pool.clone()).with_config(test_config());
     let policy = Arc::new(unique_policy(
         "lock-crosses-expiry",
         1,
@@ -2472,7 +2637,7 @@ async fn contended_check_samples_time_after_row_lock() {
     let subject = key(5);
 
     let first = limiter
-        .check(&Check::new(&policy, subject))
+        .check(&Check::new(subject.bind(&policy)))
         .await
         .expect("first check succeeds");
     assert!(first.permits_request());
@@ -2499,7 +2664,7 @@ FOR UPDATE
     let waiting_policy = Arc::clone(&policy);
     let waiting = tokio::spawn(async move {
         waiting_limiter
-            .check(&Check::new(waiting_policy.as_ref(), subject))
+            .check(&Check::new(subject.bind(waiting_policy.as_ref())))
             .await
     });
 
@@ -2528,9 +2693,9 @@ async fn successive_lock_waits_share_the_remaining_server_deadline() {
     let observer = fixture.additional_pool(1).await;
     let policy = unique_policy("successive-locks", 2, Duration::from_secs(10));
     let subject = key(97);
-    let normal = PostgresLimiter::with_config(tested_pool.clone(), test_config());
+    let normal = PostgresLimiter::new(tested_pool.clone()).with_config(test_config());
     normal
-        .check(&Check::new(&policy, subject))
+        .check(&Check::new(subject.bind(&policy)))
         .await
         .expect("seed row");
     let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -2539,7 +2704,7 @@ async fn successive_lock_waits_share_the_remaining_server_deadline() {
         .expect("tested backend");
     let mut logical = blockers.begin().await.expect("logical blocker");
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(advisory_lock_id(&Check::new(&policy, subject)))
+        .bind(advisory_lock_id(&Check::new(subject.bind(&policy))))
         .execute(&mut *logical)
         .await
         .expect("hold logical lock");
@@ -2550,10 +2715,13 @@ async fn successive_lock_waits_share_the_remaining_server_deadline() {
     let config = PostgresConfig::new()
         .with_operation_timeout(Duration::from_secs(1))
         .unwrap();
-    let limiter = PostgresLimiter::with_config(tested_pool.clone(), config);
+    let limiter = PostgresLimiter::new(tested_pool.clone()).with_config(config);
     let owned_policy = policy.clone();
-    let request =
-        tokio::spawn(async move { limiter.check(&Check::new(&owned_policy, subject)).await });
+    let request = tokio::spawn(async move {
+        limiter
+            .check(&Check::new(subject.bind(&owned_policy)))
+            .await
+    });
     wait_for_advisory_waiters(&observer, "WITH RECURSIVE acquired", 1).await;
     // Spend most of the operation budget on the first lock. The next statement
     // must receive only the remainder, not a fresh one-second server timeout.
@@ -2565,7 +2733,7 @@ async fn successive_lock_waits_share_the_remaining_server_deadline() {
         .expect("request task")
         .expect_err("row remains locked");
     assert!(matches!(error, CheckError::TimedOutBeforeCommit { .. }));
-    assert!(!error.may_have_consumed_quota());
+    assert_eq!(error.consumption(), ConsumptionStatus::NotConsumed);
     tokio::time::timeout(Duration::from_millis(250), async {
         loop {
             let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')")
@@ -2587,10 +2755,10 @@ async fn successive_lock_waits_share_the_remaining_server_deadline() {
 async fn row_lock_timeout_releases_single_connection_pool_slot_without_consuming_quota() {
     let blocker_pool = test_pool(1).await;
     let tested_pool = test_pool(1).await;
-    let normal_limiter = PostgresLimiter::with_config(blocker_pool.clone(), test_config());
+    let normal_limiter = PostgresLimiter::new(blocker_pool.clone()).with_config(test_config());
     let policy = unique_policy("lock-timeout", 2, Duration::from_secs(5));
     let subject = key(6);
-    let check = Check::new(&policy, subject);
+    let check = Check::new(subject.bind(&policy));
 
     let first = normal_limiter
         .check(&check)
@@ -2621,13 +2789,13 @@ FOR UPDATE
     let short_config = PostgresConfig::new()
         .with_operation_timeout(Duration::from_millis(75))
         .expect("short nonzero timeout is valid");
-    let short_limiter = PostgresLimiter::with_config(tested_pool.clone(), short_config);
+    let short_limiter = PostgresLimiter::new(tested_pool.clone()).with_config(short_config);
     let error = short_limiter
         .check(&check)
         .await
         .expect_err("row lock must outlive the operation deadline");
     assert!(matches!(error, CheckError::TimedOutBeforeCommit { .. }));
-    assert!(!error.may_have_consumed_quota());
+    assert_eq!(error.consumption(), ConsumptionStatus::NotConsumed);
 
     let probe: i32 = tokio::time::timeout(
         Duration::from_millis(500),
@@ -2638,7 +2806,7 @@ FOR UPDATE
     .expect("replacement tested-pool query succeeds");
     assert_eq!(probe, 1);
 
-    let cancellable_limiter = PostgresLimiter::with_config(tested_pool.clone(), test_config());
+    let cancellable_limiter = PostgresLimiter::new(tested_pool.clone()).with_config(test_config());
     let cancelled =
         tokio::time::timeout(Duration::from_millis(75), cancellable_limiter.check(&check)).await;
     assert!(

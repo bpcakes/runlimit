@@ -53,7 +53,7 @@ If either quota is unavailable, neither counter is consumed.
 use std::{env, error::Error, time::Duration};
 
 use runlimit_core::{
-    BatchDecisionView, Check, DenialView, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
+    BatchDecisionView, Check, Denial, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
 };
 use runlimit_memory::{MemoryStore, MemoryStoreConfig};
 
@@ -81,10 +81,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let config = MemoryStoreConfig::new(50_000)?.with_shard_count(64)?;
     let limiter = MemoryStore::new(config);
-    let checks = [
-        Check::new(&client_policy, client),
-        Check::new(&identity_policy, identity),
-    ];
+    let checks = [Check::new(client), Check::new(identity)];
 
     let decision = limiter.check_all(&checks)?;
     match decision.view() {
@@ -94,7 +91,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         BatchDecisionView::Denied {
             index,
-            denial: DenialView::QuotaExceeded(quota),
+            denial: Denial::QuotaExceeded(quota),
             ..
         } => {
             let seconds = quota.retry_after().seconds();
@@ -102,7 +99,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         BatchDecisionView::Denied {
             index,
-            denial: DenialView::StorageCapacity { .. },
+            denial: Denial::StorageCapacity { .. },
             ..
         } => println!("check {index} denied; backend storage is full"),
         BatchDecisionView::ShadowDenied { index, .. } => {
@@ -126,12 +123,12 @@ cargo check \
 
 ## Decision model
 
-`Decision::view()` returns an exhaustive `DecisionView`. An enforced denial
-carries an exhaustive `DenialView` naming its reason, so every outcome and
-every reason is a named match arm and none of them hides behind an `Option`:
+`Decision::view()` returns an exhaustive `DecisionView`. An enforced denial is
+an exhaustive `Denial` enum naming its reason, so every outcome and every
+reason is a named match arm and none of them hides behind an `Option`:
 
 ```rust
-use runlimit_core::{Decision, DecisionView, DenialView};
+use runlimit_core::{Decision, DecisionView, Denial};
 
 fn describe(decision: &Decision) -> String {
     match decision.view() {
@@ -146,10 +143,10 @@ fn describe(decision: &Decision) -> String {
             denial.retry_after().seconds(),
         ),
         DecisionView::Denied {
-            denial: DenialView::QuotaExceeded(quota),
+            denial: Denial::QuotaExceeded(quota),
         } => format!("rejected; retry after {}s", quota.retry_after().seconds()),
         DecisionView::Denied {
-            denial: DenialView::StorageCapacity { retry_after },
+            denial: Denial::StorageCapacity { retry_after },
         } => match retry_after {
             Some(retry_after) => format!("rejected; backend full for {}s", retry_after.seconds()),
             None => "rejected; backend full".to_owned(),
@@ -160,16 +157,23 @@ fn describe(decision: &Decision) -> String {
 
 This example is exercised in `crates/runlimit-core/tests/readme_decision_model.rs`.
 
-Every outcome carries a validated value type. `Allowance` validates capacity
-and available quota where it is constructed, only a validated `QuotaDenial` can
-be shadowed, and an allowed batch is a `Vec<Allowance>`, so a denied member is
-not representable. Serialization does not perform further metadata validation.
+Every outcome carries a validated value type. Quotas and capacities are
+`Capacity` values and periods are `QuotaPeriod` values, validated once when a
+policy is built and never re-checked downstream; `RateLimitPolicy` returns
+them, so a third-party policy cannot report a zero or oversized number.
+`QuotaDenial::new` takes a `Capacity` and cannot fail. `Allowance::new` checks
+the one remaining relation, that `available` does not exceed the capacity, and
+returns a `Result`; there is no panicking spelling. Only a validated
+`QuotaDenial` can be shadowed, and an allowed batch is a nonempty
+`Vec<Allowance>`, so a denied member is not representable. Serialization does
+not perform further metadata validation.
 
-Retry durations are `RetryAfter` values. `RetryAfter::seconds()` rounds up to
-the whole seconds an HTTP `Retry-After` header needs, and
-`RetryAfter::duration()` keeps the exact backend measurement. A quota denial
-always has one; a storage-capacity denial reports one only when the backend
-knows its earliest expiry.
+Backend-measured durations are `Delay` values: a quota denial's `retry_after`
+and an allowance's `replenishes_after` both feed the same whole-second header
+fields, so both carry the same rounding rule. `Delay::seconds()` rounds up to
+the whole seconds an HTTP `Retry-After` or `RateLimit` field needs, and
+`Delay::duration()` keeps the exact backend measurement. A storage-capacity
+denial reports a delay only when the backend knows its earliest expiry.
 
 `permits_request()` is the only boolean admission predicate: it is true for
 allowed and shadow-denied decisions and false for every enforced denial. When
@@ -191,7 +195,7 @@ use runlimit_core::{BatchDecision, Check, Limiter};
 async fn admit<L: Limiter>(
     limiter: &L,
     checks: &[Check<'_, L::Policy>],
-) -> Result<BatchDecision, L::Error> {
+) -> Result<BatchDecision, L::CheckAllError> {
     limiter.check_all(checks).await
 }
 ```
@@ -199,7 +203,9 @@ async fn admit<L: Limiter>(
 `Limiter` uses static dispatch with no required future boxing and returns
 `Send` futures. It is intentionally not object-safe; use a generic parameter
 for test-time backend substitution, or implement `Limiter` on an
-application-owned enum for runtime selection.
+application-owned enum for runtime selection. Single checks and batches have
+separate error types, `L::CheckError` and `L::CheckAllError`, so a single
+check's error never carries a variant that only a batch can produce.
 
 The inherent `MemoryStore::check` and `MemoryStore::check_all` APIs remain
 synchronous. In generic code the trait methods are selected automatically. To
@@ -219,7 +225,13 @@ trusted metadata, enforced denials, and backend failures.
 
 The adapter does not interpret `Forwarded`, `X-Forwarded-For`, `ConnectInfo`,
 cookies, or application identities. Establish trust and normalize identities
-at the application boundary, then return an opaque `SubjectKey`.
+at the application boundary. A closure extractor returns an already-opaque
+`SubjectKey`, which the adapter binds to its configured policy. A named
+`ExtractSubjectKey` implementation that calls `KeyHasher::hash_for` explicitly
+converts the result with `PolicySubject::into_unbound_subject_key`; the adapter
+then binds that key to its configured policy. The extractor can choose the
+opaque subject identity, but its result type cannot replace the policy the
+layer evaluates and records.
 
 The rejection mapper receives an exhaustive `RateLimitRejection`: a key
 extraction error, an enforced `Denial`, or a backend error. Allowed and
@@ -247,13 +259,14 @@ which policies an application should disclose. Policy periods advertised in
 rounded up. Encoding also rejects quota values outside RFC 9651's Structured
 Field integer range.
 
-Axum's admitted and rejected values remain narrower than `Decision`, so
-middleware cannot accidentally enforce a shadow denial. Convert them only at
-the HTTP-metadata boundary: use `Decision::from(admission.decision())` for an
-`Admission`, or `Decision::denied(denial)` inside the rejection mapper, then
-pass the resulting decision to `draft_11::service_limit`. A storage-capacity
-denial has no quota service metadata, so `service_limit` returns
-`EncodingError::UnsupportedDecision` for it.
+`draft_11::service_limit` accepts only the states a `RateLimit` field can
+describe: an `Allowance`, a `QuotaDenial`, or an `Admitted` outcome, each of
+which converts into `draft_11::QuotaState`. A handler passes
+`admission.decision()` straight through; a shadow denial then exposes the
+service value that enforcement would have applied. A rejection mapper matches
+its `Denial` and passes the `QuotaDenial` from the `QuotaExceeded` arm. A
+storage-capacity denial has no quota service metadata and is not accepted, so
+it cannot become an encoding error in the response path.
 
 ## Optional Serde support
 
@@ -286,8 +299,12 @@ as calendar minutes.
 
 - Denied checks do not consume quota.
 - A batch is all-or-nothing and allowed decisions retain input order.
+- An empty batch is rejected with `BatchError::EmptyBatch` rather than
+  vacuously allowed, so a caller that filtered every check out fails closed
+  instead of admitting the request without evaluating any policy.
 - Every check in a batch uses the same quota mode. A mixed enforced/shadow
-  batch is rejected before backend work begins.
+  batch is rejected before backend work begins; see the shadow-mode section
+  for the rollout consequence.
 - A denied batch names the failing input index and the batch size. The index
   is validated below the size at construction and on deserialization.
 - Duplicate storage keys in a batch are rejected as caller errors.
@@ -302,7 +319,7 @@ as calendar minutes.
   exact at evaluation time. PostgreSQL measures elapsed evaluation time with
   its authoritative database clock and can conservatively overstate the
   remaining time at the caller by commit and transport latency. Use
-  `RetryAfter::seconds()` for an HTTP `Retry-After` value rounded up to the next
+  `Delay::seconds()` for an HTTP `Retry-After` value rounded up to the next
   whole second.
 
 The memory and PostgreSQL backends intentionally implement these same
@@ -313,10 +330,11 @@ semantics.
 `GcraPolicy` and `GcraStore` provide a continuously replenished quota without
 fixed-window boundary bursts:
 
+<!-- runlimit-readme-gcra:start -->
 ```rust
-use std::time::Duration;
+use std::{env, time::Duration};
 
-use runlimit_core::{Check, GcraPolicy, PolicyId, ScopeId, SubjectKey};
+use runlimit_core::{Check, GcraPolicy, KeyHasher, PolicyId, ScopeId};
 use runlimit_memory::{GcraStore, MemoryStoreConfig};
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -327,15 +345,16 @@ let policy = GcraPolicy::new(
     Duration::from_secs(1),   // during this period
     20,                       // maximum immediate burst
 )?;
+let key_hasher = KeyHasher::new(env::var("RUNLIMIT_KEY_SECRET")?.as_bytes())?;
 let limiter = GcraStore::new(MemoryStoreConfig::new(50_000)?);
 let decision = limiter.check(&Check::new(
-    &policy,
-    SubjectKey::from_digest([7; 32]),
+    key_hasher.hash_for(&policy, b"client-network:192.0.2.4"),
 ))?;
 assert!(decision.permits_request());
 # Ok(())
 # }
 ```
+<!-- runlimit-readme-gcra:end -->
 
 The backend uses exact scaled-integer arithmetic rather than a floating-point
 token count. Policy periods must be exact whole milliseconds; reported retry
@@ -357,22 +376,39 @@ enforcement would have applied. A shadow denial does not consume quota.
 Storage-capacity denials and backend errors always remain fail-closed.
 
 Quota mode is deliberately excluded from the policy fingerprint, so switching
-a warmed policy to enforcement keeps its counter state. Atomic batches reject
-mixed enforcement and shadow modes; a denied or shadow-denied batch consumes
-nothing.
+a warmed policy to enforcement keeps its counter state.
+
+Atomic batches reject mixed enforcement and shadow modes with
+`BatchError::MixedQuotaModes`, and a denied or shadow-denied batch consumes
+nothing. This has an operational consequence for the most natural rollout
+step, shadowing one new policy inside an existing multi-policy batch: that
+batch fails closed until every policy in it shares a mode. The rule exists
+because a batch is all-or-nothing. If a shadow policy could be exhausted inside
+an enforced batch, the shadow denial would have to either consume the enforced
+members, breaking "shadow denials consume nothing", or consume none of them,
+silently stopping the enforced policies from counting whenever the shadow one
+is exhausted. To roll out a new policy in shadow mode next to enforced ones,
+check it separately with its own `check()` call, or shadow every policy in the
+batch together and switch them to enforcement together.
 
 ## Operational observations
 
 `MemoryStore`, `GcraStore`, and `PostgresLimiter` accept an optional
 `runlimit_core::Observer`. Admission observations classify outcome, quota
 consumption certainty, and elapsed time; cleanup observations report bounded
-work. `Observation`, `AdmissionOperation`, `AdmissionOutcome`, and
-`ConsumptionStatus` are exhaustive enums, so an observer that maps outcomes to
-metrics names every variant and a new outcome is a compile error rather than
-a silently unmetered wildcard arm. The memory stores also report per-shard capacity headroom. Observations
-intentionally omit subject keys, backend error text, and other sensitive
-high-cardinality values. When relevant to a single check, admission observations
-include the policy fingerprint alongside its policy and scope identifiers.
+work. `Observation`, `AdmissionOperation`, `AdmissionOutcome`,
+`ConsumptionStatus`, and `CleanupOutcome` are exhaustive enums, so an observer
+that maps outcomes to metrics names every variant and a new outcome is a
+compile error rather than a silently unmetered wildcard arm. The memory stores
+also report per-shard capacity headroom. Observations intentionally omit
+subject keys, backend error text, and other sensitive high-cardinality values.
+
+`AdmissionOperation::Check` always carries an `AdmissionPolicy` with the
+policy identifier, scope, and fingerprint together; `AdmissionOperation::Batch`
+carries the batch size and the policy of the one relevant check when a batch
+singles one out. A cleanup observation's `CleanupOutcome` says whether the
+pass confirmed a removal count, definitely had no effect, or failed with an
+unknown effect; it never borrows the quota-consumption vocabulary.
 
 Callbacks run synchronously after memory locks are released or database
 transactions are finalized. Keep them fast and hand expensive export work to
@@ -384,9 +420,21 @@ quota.
 ## Subject keys and secret rotation
 
 Applications normalize subjects before passing them to Runlimit. Construct
-stored keys with `KeyHasher`, which uses domain-separated HMAC-SHA-256 and
-requires a secret of at least 32 bytes. Raw emails, account IDs, session IDs,
-and IP addresses should not enter storage, logs, metrics labels, or errors.
+stored keys with `KeyHasher::hash_for`, which uses HMAC-SHA-256 domain-separated
+by the policy the key will be checked against and requires a secret of at
+least 32 bytes. It is the only derivation method and returns a `PolicySubject`
+that retains the exact policy reference. `Check::new` accepts only that bound
+value, so the normal derivation-to-check path has no second policy argument
+that can disagree with the derivation namespace. Adapter and backend APIs can
+deliberately expose an unbound key: `PolicySubject::into_unbound_subject_key`,
+`Check::subject`, and `CounterKey::subject` all return a `SubjectKey` that can
+then be explicitly rebound. Those are escape hatches, not part of the normal
+construction path. `SubjectKey::from_digest` bypasses derivation entirely and
+exists only for tests and for input that is already an opaque, secret-keyed
+32-byte digest; bind it explicitly with `SubjectKey::bind` before constructing
+a check, and never feed it raw or padded identities.
+Raw emails, account IDs, session IDs, and IP addresses should not enter
+storage, logs, metrics labels, or errors.
 `KeyHasher` precomputes key-equivalent HMAC state instead of retaining the raw
 secret or rebuilding the key schedule for every subject. Treat a live hasher
 and its clones as secret material; their debug output is redacted and their
@@ -414,17 +462,17 @@ same time can each admit traffic against different counters.
   deadline; a GCRA entry expires when its full capacity has replenished.
 - An atomic batch targeting more distinct keys at one shard than that shard can
   ever hold returns
-  `MemoryStoreError::BatchExceedsShardCapacity { shard_index, key_count,
+  `MemoryBatchError::BatchExceedsShardCapacity { shard_index, key_count,
   capacity }`. This is a structural error: waiting for expiry cannot make the
   batch fit.
 - A new key that cannot fit in its shard is denied with
-  `Denial::storage_capacity`, optionally including the earliest known retry
-  duration when the same operation may fit after existing entries expire.
+  `Denial::StorageCapacity`, optionally including the earliest known retry
+  delay when the same operation may fit after existing entries expire.
 
 If application code panics while holding a shard lock, that shard remains
-poisoned. Every later operation touching it returns
-`MemoryStoreError::PoisonedShard` without resetting its counters. With the
-default one-shard configuration, this makes the entire store unavailable.
+poisoned. Every later operation touching it returns `PoisonedShardError`
+without resetting its counters. With the default one-shard configuration, this
+makes the entire store unavailable.
 Keep admissions failed closed and alert operators. As an explicit availability
 tradeoff, `recover_poisoned()` on either store atomically empties only poisoned
 shards, clears their poison flags, preserves healthy-shard counters, and
@@ -432,11 +480,20 @@ returns the number recovered. Resetting those counters can admit requests that
 their lost state would have denied; replacing the store is a broader reset
 with the same security consequence for every shard.
 
-Treat every `MemoryStoreError` or `GcraStoreError` as an admission failure; both
-are distinct from a normal quota denial returned in a `Decision` or
-`BatchDecision`. `GcraStoreError::Store` wraps the bounded-storage failures
-shared with `MemoryStore`, while GCRA-specific arithmetic failures remain in
-the GCRA error contract.
+Treat every error from a store as an admission failure; they are distinct
+from a normal quota denial returned in a `Decision` or `BatchDecision`. Each
+operation has an error type that lists only the failures it can produce: a
+single `MemoryStore` check fails only with `PoisonedShardError`, a batch with
+`MemoryBatchError`, a single `GcraStore` check with `GcraCheckError`, and a
+GCRA batch with `GcraBatchError`, whose `Store` variant wraps the
+bounded-storage failures shared with `MemoryStore`.
+
+Both stores use `new(config)` with the system clock. Deterministic tests choose
+their clock before the store exists with
+`MemoryStore::builder(config).with_clock(clock).build()` or the corresponding
+`GcraStore` builder. A built store cannot replace its clock because its stored
+timestamps belong to that clock's coordinate system. `with_observer` remains a
+store builder because attaching telemetry does not reinterpret quota state.
 
 ## PostgreSQL backend
 
@@ -464,10 +521,11 @@ ensure unrelated roles cannot execute the advisory-lock functions.
 
 Version 0.2 hard-bounds PostgreSQL cardinality with 256 persistent capacity
 shards. `PostgresConfig::maximum_rows_per_shard` defaults to 4,096 and can be
-lowered or raised through the database-enforced maximum of 65,536. Admission
-locks the affected ledger shards and reserves all missing batch keys in the
-same transaction as quota consumption. A full shard denies new keys with
-`Denial::storage_capacity`; existing keys remain usable and active rows are
+lowered or raised through the database-enforced maximum of 65,536; apply it
+with `PostgresLimiter::new(pool).with_config(config)`. Admission locks the
+affected ledger shards and reserves all missing batch keys in the same
+transaction as quota consumption. A full shard denies new keys with
+`Denial::StorageCapacity`; existing keys remain usable and active rows are
 never evicted. The migration's trigger-maintained ledger also caps inserts
 from older replicas at 65,536 rows per shard during a rolling deployment.
 
@@ -559,11 +617,17 @@ Database integration tests should use a disposable PostgreSQL instance.
 
 Database errors must fail closed. `runlimit_postgres::CheckError` distinguishes
 operations that definitely did not consume quota from commit outcomes that may
-have consumed it. Inspect `may_have_consumed_quota()` for observability and do
-not blindly retry an unknown commit as part of a non-idempotent operation.
-When a read-only denial has already been produced, a rollback failure does not
-replace it with an error; Runlimit returns the denial and discards that
-connection.
+have consumed it, and `CheckError::consumption()` reports that certainty as a
+`ConsumptionStatus`. Do not blindly retry an unknown commit as part of a
+non-idempotent operation. A single check goes straight to the database and
+returns `CheckError`; a batch returns `BatchCheckError`, which adds the
+structural `InvalidBatch` failure that only a batch can produce. A timeout
+names the `CheckPhase` it interrupted, and every phase precedes commit, so a
+timeout never consumed quota. A decision is always built from the database
+response before commit or rollback, so a malformed response is a pre-commit
+failure rather than a decision that may already have consumed quota. When a
+read-only denial has already been produced, a rollback failure does not replace
+it with an error; Runlimit returns the denial and discards that connection.
 `MaintenanceError` makes the corresponding distinction for cleanup; inspect
 `may_have_removed_rows()` before deciding whether an unconfirmed cleanup needs
 to be retried.

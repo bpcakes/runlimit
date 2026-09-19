@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{CounterKey, FixedWindowPolicy, RateLimitPolicy, SubjectKey};
+use crate::{Capacity, CounterKey, FixedWindowPolicy, PolicySubject, RateLimitPolicy, SubjectKey};
 
 /// One proposed quota charge against a policy and opaque subject.
 ///
@@ -24,7 +24,13 @@ impl<P: RateLimitPolicy + ?Sized> Clone for Check<'_, P> {
 
 impl<'a, P: RateLimitPolicy + ?Sized> Check<'a, P> {
     /// Constructs a check with the default cost of 1.
-    pub const fn new(policy: &'a P, subject: SubjectKey) -> Self {
+    ///
+    /// The [`PolicySubject`] already carries the exact policy used for subject
+    /// derivation, so this constructor has no independent policy argument that
+    /// could accidentally disagree with it. A caller can leave this safe path
+    /// only through an explicitly unbound [`SubjectKey`].
+    pub const fn new(subject: PolicySubject<'a, P>) -> Self {
+        let (policy, subject) = subject.into_parts();
         Self {
             policy,
             subject,
@@ -32,26 +38,12 @@ impl<'a, P: RateLimitPolicy + ?Sized> Check<'a, P> {
         }
     }
 
-    /// Validates and constructs a check with a custom cost.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `cost` is zero or exceeds the policy capacity.
-    pub fn with_cost(policy: &'a P, subject: SubjectKey, cost: u64) -> Result<Self, CheckError> {
-        validate_cost(policy, cost)?;
-        Ok(Self {
-            policy,
-            subject,
-            cost,
-        })
-    }
-
     /// Returns this check with a validated custom cost.
     ///
     /// # Errors
     ///
     /// Returns an error when `cost` is zero or exceeds the policy capacity.
-    pub fn try_with_cost(mut self, cost: u64) -> Result<Self, CheckError> {
+    pub fn with_cost(mut self, cost: u64) -> Result<Self, CheckError> {
         validate_cost(self.policy, cost)?;
         self.cost = cost;
         Ok(self)
@@ -62,7 +54,12 @@ impl<'a, P: RateLimitPolicy + ?Sized> Check<'a, P> {
         self.policy
     }
 
-    /// Returns the opaque subject key evaluated by this check.
+    /// Returns an unbound copy of the opaque subject key evaluated by this
+    /// check.
+    ///
+    /// This accessor exists for backend and adapter integration. Binding the
+    /// returned key to another policy is an explicit escape from the
+    /// derivation-to-check guarantee described by [`Check::new`].
     pub const fn subject(&self) -> SubjectKey {
         self.subject
     }
@@ -82,11 +79,9 @@ fn validate_cost<P: RateLimitPolicy + ?Sized>(policy: &P, cost: u64) -> Result<(
     if cost == 0 {
         return Err(CheckError::ZeroCost);
     }
-    if cost > policy.capacity() {
-        return Err(CheckError::CostExceedsCapacity {
-            cost,
-            capacity: policy.capacity(),
-        });
+    let capacity = policy.capacity();
+    if cost > capacity.get() {
+        return Err(CheckError::CostExceedsCapacity { cost, capacity });
     }
     Ok(())
 }
@@ -103,7 +98,7 @@ pub enum CheckError {
         /// Requested cost.
         cost: u64,
         /// Maximum cost accepted by the policy.
-        capacity: u64,
+        capacity: Capacity,
     },
 }
 
@@ -112,7 +107,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{Check, CheckError};
-    use crate::{FixedWindowPolicy, PolicyId, ScopeId, SubjectKey};
+    use crate::{Capacity, FixedWindowPolicy, PolicyId, ScopeId, SubjectKey};
 
     fn policy() -> FixedWindowPolicy {
         FixedWindowPolicy::new(
@@ -128,7 +123,7 @@ mod tests {
     fn defaults_to_one_unit_of_cost() {
         let policy = policy();
         let subject = SubjectKey::from_digest([1; 32]);
-        let check = Check::new(&policy, subject);
+        let check = Check::new(subject.bind(&policy));
 
         assert_eq!(check.policy(), &policy);
         assert_eq!(check.subject(), subject);
@@ -140,13 +135,19 @@ mod tests {
         let policy = policy();
         let subject = SubjectKey::from_digest([2; 32]);
 
-        assert_eq!(Check::with_cost(&policy, subject, 3).unwrap().cost(), 3);
         assert_eq!(
-            Check::new(&policy, subject)
-                .try_with_cost(policy.limit())
+            Check::new(subject.bind(&policy))
+                .with_cost(3)
                 .unwrap()
                 .cost(),
-            policy.limit()
+            3
+        );
+        assert_eq!(
+            Check::new(subject.bind(&policy))
+                .with_cost(policy.limit().get())
+                .unwrap()
+                .cost(),
+            policy.limit().get()
         );
     }
 
@@ -155,7 +156,7 @@ mod tests {
         let policy = policy();
 
         assert_eq!(
-            Check::with_cost(&policy, SubjectKey::from_digest([3; 32]), 0),
+            Check::new(SubjectKey::from_digest([3; 32]).bind(&policy)).with_cost(0),
             Err(CheckError::ZeroCost)
         );
     }
@@ -165,10 +166,10 @@ mod tests {
         let policy = policy();
 
         assert_eq!(
-            Check::with_cost(&policy, SubjectKey::from_digest([4; 32]), 9),
+            Check::new(SubjectKey::from_digest([4; 32]).bind(&policy)).with_cost(9),
             Err(CheckError::CostExceedsCapacity {
                 cost: 9,
-                capacity: 8
+                capacity: Capacity::new(8).unwrap(),
             })
         );
     }

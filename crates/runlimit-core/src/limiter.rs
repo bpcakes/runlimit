@@ -9,6 +9,10 @@ use crate::{BatchDecision, Check, Decision, RateLimitPolicy};
 /// can await them on a multithreaded executor without Runlimit depending on a
 /// particular async runtime.
 ///
+/// Single checks and batches have separate error types. A single check has
+/// no batch structure to validate, so its error type never carries a variant
+/// such as a duplicate key that only a batch can produce.
+///
 /// This trait uses return-position `impl Future` for static dispatch without
 /// requiring a boxed future. It is intentionally not object-safe. Applications
 /// that need runtime backend selection can implement `Limiter` for an
@@ -19,8 +23,12 @@ pub trait Limiter: Send + Sync {
     /// Policy algorithm supported by this backend.
     type Policy: RateLimitPolicy;
 
-    /// Backend-specific operational failure.
-    type Error: Error + Send + Sync + 'static;
+    /// Backend-specific failure of a single check.
+    type CheckError: Error + Send + Sync + 'static;
+
+    /// Backend-specific failure of an atomic batch, including structural
+    /// batch validation.
+    type CheckAllError: Error + Send + Sync + 'static;
 
     /// Evaluates and, when allowed, consumes one check.
     ///
@@ -29,17 +37,19 @@ pub trait Limiter: Send + Sync {
     fn check(
         &self,
         check: &Check<'_, Self::Policy>,
-    ) -> impl Future<Output = Result<Decision, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Decision, Self::CheckError>> + Send;
 
-    /// Evaluates a batch atomically.
+    /// Evaluates a nonempty batch atomically.
     ///
     /// If any check is denied, no check consumes quota. An allowed batch
-    /// carries one allowance per check in the caller's input order.
+    /// carries one allowance per check in the caller's input order. An empty
+    /// batch is rejected with [`crate::BatchError::EmptyBatch`] rather than
+    /// vacuously allowed.
     ///
     /// Implementations must not evaluate the checks or consume quota until the
     /// returned future is first polled.
     fn check_all(
         &self,
         checks: &[Check<'_, Self::Policy>],
-    ) -> impl Future<Output = Result<BatchDecision, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<BatchDecision, Self::CheckAllError>> + Send;
 }

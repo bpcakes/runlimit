@@ -24,10 +24,13 @@ use axum::{
 };
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use runlimit_axum::{Admission, Admissions, RateLimitLayer, RateLimitRejection, RejectionKind};
+use runlimit_axum::{
+    Admission, Admissions, ExtractSubjectKey, RateLimitLayer, RateLimitRejection, RejectionKind,
+};
 use runlimit_core::{
-    Admitted, AdmittedView, Allowance, BatchDecision, Check, Decision, Denial, FixedWindowPolicy,
-    Limiter, PolicyId, QuotaDenial, ScopeId, SubjectKey,
+    Admitted, AdmittedView, Allowance, BatchDecision, Capacity, Check, Decision, Denial,
+    FixedWindowPolicy, KeyHasher, Limiter, PolicyId, QuotaDenial, QuotaMode, RateLimitPolicy,
+    ScopeId, SubjectKey,
 };
 use tower::{Layer, Service, ServiceExt, service_fn};
 
@@ -35,6 +38,7 @@ use tower::{Layer, Service, ServiceExt, service_fn};
 enum StubOutcome {
     Decision(Decision),
     BackendError,
+    DecisionFromPolicyMode,
 }
 
 #[derive(Clone)]
@@ -60,6 +64,14 @@ impl StubLimiter {
             outcome: StubOutcome::BackendError,
         }
     }
+
+    fn deciding_from_policy_mode() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            subjects: Arc::new(Mutex::new(Vec::new())),
+            outcome: StubOutcome::DecisionFromPolicyMode,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,24 +87,32 @@ impl Error for StubError {}
 
 impl Limiter for StubLimiter {
     type Policy = FixedWindowPolicy;
-    type Error = StubError;
+    type CheckError = StubError;
+    type CheckAllError = StubError;
 
     fn check(
         &self,
         check: &Check<'_, Self::Policy>,
-    ) -> impl Future<Output = Result<Decision, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Decision, Self::CheckError>> + Send {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.subjects.lock().unwrap().push(check.subject());
         ready(match self.outcome {
             StubOutcome::Decision(decision) => Ok(decision),
             StubOutcome::BackendError => Err(StubError),
+            StubOutcome::DecisionFromPolicyMode => {
+                let denial = QuotaDenial::new(check.policy().capacity(), Duration::from_secs(1));
+                Ok(match check.policy().quota_mode() {
+                    QuotaMode::Enforce => Decision::denied(denial),
+                    QuotaMode::Shadow => Decision::shadow_denied(denial),
+                })
+            }
         })
     }
 
     fn check_all(
         &self,
         _checks: &[Check<'_, Self::Policy>],
-    ) -> impl Future<Output = Result<BatchDecision, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<BatchDecision, Self::CheckAllError>> + Send {
         ready(Err(StubError))
     }
 }
@@ -111,12 +131,62 @@ fn policy_for_scope(scope: &str, limit: u64) -> FixedWindowPolicy {
     .unwrap()
 }
 
+fn allowance(capacity: u64, available: u64) -> Allowance {
+    Allowance::new(
+        Capacity::new(capacity).unwrap(),
+        available,
+        Duration::from_mins(1),
+    )
+    .unwrap()
+}
+
 fn allowed(capacity: u64, available: u64) -> Decision {
-    Decision::allowed(Allowance::new(capacity, available, Duration::from_mins(1)))
+    Decision::allowed(allowance(capacity, available))
+}
+
+fn quota(capacity: u64, retry_after: Duration) -> QuotaDenial {
+    QuotaDenial::new(Capacity::new(capacity).unwrap(), retry_after)
 }
 
 fn subject(byte: u8) -> SubjectKey {
     SubjectKey::from_digest([byte; 32])
+}
+
+struct HashedExtractor(KeyHasher);
+
+impl<B> ExtractSubjectKey<FixedWindowPolicy, B> for HashedExtractor {
+    type Error = Infallible;
+
+    fn extract_subject_key(
+        &self,
+        _request: &Request<B>,
+        policy: &FixedWindowPolicy,
+    ) -> Result<SubjectKey, Self::Error> {
+        Ok(self
+            .0
+            .hash_for(policy, b"normalized-client")
+            .into_unbound_subject_key())
+    }
+}
+
+struct AlternatePolicyExtractor {
+    hasher: KeyHasher,
+    alternate_policy: FixedWindowPolicy,
+}
+
+impl<B> ExtractSubjectKey<FixedWindowPolicy, B> for AlternatePolicyExtractor {
+    type Error = Infallible;
+
+    fn extract_subject_key(
+        &self,
+        _request: &Request<B>,
+        _configured_policy: &FixedWindowPolicy,
+    ) -> Result<SubjectKey, Self::Error> {
+        Ok(self
+            .hasher
+            .hash_for(&self.alternate_policy, b"normalized-client")
+            .into_unbound_subject_key())
+    }
 }
 
 fn response(status: StatusCode) -> Response {
@@ -162,7 +232,7 @@ async fn layer_composes_with_an_axum_router() {
                 move |Extension(admissions): Extension<Admissions>| async move {
                     assert_eq!(
                         expect_single_admission(&admissions, &policy()),
-                        Admitted::allowed(Allowance::new(8, 7, Duration::from_mins(1)))
+                        Admitted::allowed(allowance(8, 7))
                     );
                     StatusCode::NO_CONTENT
                 },
@@ -176,6 +246,89 @@ async fn layer_composes_with_an_axum_router() {
         .unwrap();
 
     assert_eq!(result.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn named_extractor_forwards_the_exact_derived_subject() {
+    let configured_policy = policy();
+    let hasher = KeyHasher::new([0x42; 32]).unwrap();
+    let expected_subject = hasher
+        .hash_for(&configured_policy, b"normalized-client")
+        .into_unbound_subject_key();
+    let limiter = StubLimiter::returning(allowed(8, 7));
+    let calls = Arc::clone(&limiter.calls);
+    let observed_subjects = Arc::clone(&limiter.subjects);
+    let layer = RateLimitLayer::new(
+        limiter,
+        configured_policy,
+        HashedExtractor(hasher),
+        |_rejection: RateLimitRejection<Infallible, StubError>| {
+            panic!("the derived subject must be accepted")
+        },
+    );
+    let inner = service_fn(|_request: Request<Body>| {
+        ready(Ok::<_, Infallible>(response(StatusCode::NO_CONTENT)))
+    });
+
+    let result = layer
+        .layer(inner)
+        .oneshot(Request::new(Body::empty()))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status(), StatusCode::NO_CONTENT);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        observed_subjects.lock().unwrap().as_slice(),
+        &[expected_subject]
+    );
+}
+
+#[tokio::test]
+async fn named_extractor_cannot_replace_the_layer_policy() {
+    let configured_policy = policy();
+    let alternate_policy = policy().with_quota_mode(QuotaMode::Shadow);
+    let hasher = KeyHasher::new([0x24; 32]).unwrap();
+    let expected_subject = hasher
+        .hash_for(&alternate_policy, b"normalized-client")
+        .into_unbound_subject_key();
+    let limiter = StubLimiter::deciding_from_policy_mode();
+    let observed_subjects = Arc::clone(&limiter.subjects);
+    let inner_calls = Arc::new(AtomicUsize::new(0));
+    let inner_calls_for_service = Arc::clone(&inner_calls);
+    let inner = service_fn(move |_request: Request<Body>| {
+        inner_calls_for_service.fetch_add(1, Ordering::Relaxed);
+        ready(Ok::<_, Infallible>(response(StatusCode::NO_CONTENT)))
+    });
+    let layer = RateLimitLayer::new(
+        limiter,
+        configured_policy,
+        AlternatePolicyExtractor {
+            hasher,
+            alternate_policy,
+        },
+        |rejection: RateLimitRejection<Infallible, StubError>| match rejection {
+            RateLimitRejection::Key(never) => match never {},
+            RateLimitRejection::Denied(Denial::QuotaExceeded(_)) => {
+                response(StatusCode::TOO_MANY_REQUESTS)
+            }
+            RateLimitRejection::Denied(Denial::StorageCapacity { .. })
+            | RateLimitRejection::Backend(StubError) => panic!("unexpected rejection"),
+        },
+    );
+
+    let result = layer
+        .layer(inner)
+        .oneshot(Request::new(Body::empty()))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(inner_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        observed_subjects.lock().unwrap().as_slice(),
+        &[expected_subject]
+    );
 }
 
 #[tokio::test]
@@ -194,7 +347,7 @@ async fn allowed_request_proceeds_with_an_admission_extension() {
             assert!(matches!(
                 expect_single_admission(admissions, &policy()).view(),
                 AdmittedView::Allowed { allowance }
-                    if allowance.capacity() == 8 && allowance.available() == 7
+                    if allowance.capacity().get() == 8 && allowance.available() == 7
             ));
             assert!(request.extensions().get::<Decision>().is_none());
             Ok::<_, Infallible>(response(StatusCode::NO_CONTENT))
@@ -222,7 +375,7 @@ async fn allowed_request_proceeds_with_an_admission_extension() {
 
 #[tokio::test]
 async fn enforced_denial_is_mapped_and_short_circuits_inner_service() {
-    let denial = QuotaDenial::new(8, Duration::from_secs(17));
+    let denial = quota(8, Duration::from_secs(17));
     let limiter = StubLimiter::returning(Decision::denied(denial));
     let inner_calls = Arc::new(AtomicUsize::new(0));
     let inner_calls_for_service = Arc::clone(&inner_calls);
@@ -239,7 +392,7 @@ async fn enforced_denial_is_mapped_and_short_circuits_inner_service() {
             match rejection {
                 RateLimitRejection::Key(never) => match never {},
                 RateLimitRejection::Denied(mapped) => {
-                    assert_eq!(mapped, Denial::quota_exceeded(denial));
+                    assert_eq!(mapped, Denial::QuotaExceeded(denial));
                 }
                 RateLimitRejection::Backend(StubError) => {
                     panic!("a denied request must not be reported as a backend failure")
@@ -261,7 +414,7 @@ async fn enforced_denial_is_mapped_and_short_circuits_inner_service() {
 
 #[tokio::test]
 async fn shadow_denial_proceeds_with_an_admission_extension() {
-    let denial = QuotaDenial::new(8, Duration::from_secs(17));
+    let denial = quota(8, Duration::from_secs(17));
     let limiter = StubLimiter::returning(Decision::shadow_denied(denial));
     let inner = service_fn(move |request: Request<Body>| async move {
         let admissions = request
@@ -300,7 +453,7 @@ async fn stacked_layers_record_every_admission_in_evaluation_order() {
         |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, &'static str>(subject(11)),
         |rejection| map_rejection(&rejection),
     );
-    let shadow_denial = QuotaDenial::new(8, Duration::from_secs(3));
+    let shadow_denial = quota(8, Duration::from_secs(3));
     let identity_layer = RateLimitLayer::new(
         StubLimiter::returning(Decision::shadow_denied(shadow_denial)),
         identity_policy.clone(),
@@ -324,20 +477,13 @@ async fn stacked_layers_record_every_admission_in_evaluation_order() {
             assert_eq!(
                 recorded,
                 vec![
-                    (
-                        "client",
-                        Admitted::allowed(Allowance::new(40, 39, Duration::from_mins(1)))
-                    ),
+                    ("client", Admitted::allowed(allowance(40, 39))),
                     ("identity", Admitted::shadow_denied(shadow_denial)),
                 ]
             );
             assert_eq!(
                 admissions.get(&client_policy).map(Admission::decision),
-                Some(Admitted::allowed(Allowance::new(
-                    40,
-                    39,
-                    Duration::from_mins(1)
-                )))
+                Some(Admitted::allowed(allowance(40, 39)))
             );
             assert_eq!(
                 admissions.get(&identity_policy).map(Admission::decision),
@@ -365,8 +511,8 @@ async fn stacked_layers_record_every_admission_in_evaluation_order() {
 #[tokio::test]
 async fn identical_policy_layers_keep_both_admissions_and_lookup_the_outermost() {
     let policy = policy_for_scope("shared", 8);
-    let outer_admitted = Admitted::allowed(Allowance::new(8, 7, Duration::from_mins(1)));
-    let inner_denial = QuotaDenial::new(8, Duration::from_secs(3));
+    let outer_admitted = Admitted::allowed(allowance(8, 7));
+    let inner_denial = quota(8, Duration::from_secs(3));
     let inner_admitted = Admitted::shadow_denied(inner_denial);
     let outer = RateLimitLayer::new(
         StubLimiter::returning(Decision::from(outer_admitted)),
@@ -420,7 +566,9 @@ async fn inner_layer_denial_rejects_a_request_the_outer_layer_admitted() {
         |_rejection| panic!("the outer layer admits every request"),
     );
     let inner_layer = RateLimitLayer::new(
-        StubLimiter::returning(Decision::denied(Denial::storage_capacity(None))),
+        StubLimiter::returning(Decision::denied(Denial::StorageCapacity {
+            retry_after: None,
+        })),
         policy_for_scope("identity", 8),
         |_request: &Request<Body>, _policy: &FixedWindowPolicy| Ok::<_, &'static str>(subject(14)),
         |rejection| map_rejection(&rejection),
@@ -638,10 +786,7 @@ async fn rejected_request_body_is_never_polled() {
         ready(Ok::<_, Infallible>(response(StatusCode::NO_CONTENT)))
     });
     let layer = RateLimitLayer::new(
-        StubLimiter::returning(Decision::denied(QuotaDenial::new(
-            8,
-            Duration::from_secs(5),
-        ))),
+        StubLimiter::returning(Decision::denied(quota(8, Duration::from_secs(5)))),
         policy(),
         |_request: &Request<ProbeBody>, _policy: &FixedWindowPolicy| {
             Ok::<_, Infallible>(subject(8))
@@ -716,7 +861,7 @@ fn debug_output_is_useful_without_formatting_callback_state() {
 #[test]
 fn admissions_can_be_assembled_for_handler_tests() {
     let policy = policy();
-    let admitted = Admitted::allowed(Allowance::new(8, 7, Duration::from_mins(1)));
+    let admitted = Admitted::allowed(allowance(8, 7));
     let mut admissions = Admissions::new();
     assert!(admissions.is_empty());
     assert!(admissions.get(&policy).is_none());

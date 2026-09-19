@@ -252,7 +252,6 @@ impl<'de> serde::Deserialize<'de> for PostgresConfig {
 
 /// Invalid `PostgreSQL` backend configuration.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum PostgresConfigError {
     /// A zero per-shard maximum would reject every new storage key.
     #[error("maximum_rows_per_shard must be greater than zero")]

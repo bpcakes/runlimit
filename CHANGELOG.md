@@ -20,22 +20,152 @@ The format is based on [Keep a Changelog], and this project adheres to
   allowed or shadow-denied outcome, and `Decision::admit()`, which splits a
   decision into `Result<Admitted, Denial>` without loss. Code that receives an
   `Admitted` value never re-checks enforcement.
+- **Breaking:** add validated `Capacity` and `QuotaPeriod` newtypes.
+  `RateLimitPolicy::quota()` and `capacity()` return `Capacity` and
+  `quota_period()` returns `QuotaPeriod`, so a third-party policy cannot report
+  a zero or oversized value and nothing downstream re-validates one.
+  `FixedWindowPolicy::limit()` and `window()` and `GcraPolicy::quota()`,
+  `period()`, and `burst_capacity()` return the same types;
+  `window_millis()` and `period_millis()` are replaced by
+  `QuotaPeriod::millis()`. `CheckError::CostExceedsCapacity` carries a
+  `Capacity`.
+- **Breaking:** custom check cost now has one construction path:
+  `Check::new(policy_subject).with_cost(cost)`. The associated
+  `Check::with_cost(policy, subject, cost)` constructor and the duplicate
+  `try_with_cost` builder are removed; `with_cost` is the fallible,
+  self-consuming builder.
 - **Breaking:** make `Allowance` public and use it wherever a check is known to
-  be allowed. `Allowance::new` and `try_new` validate capacity and available
-  quota; `Decision::allowed` takes an `Allowance` and `Decision::try_allowed`
-  is removed. `DecisionView::Allowed` and `AdmittedView::Allowed` carry an
-  `allowance` field, `BatchDecisionView::Allowed` carries `allowances:
-  &[Allowance]`, `BatchDecision::allowed` takes `Vec<Allowance>` and cannot
-  fail, and `try_into_allowed()` returns `Vec<Allowance>`. A denied member of
-  an allowed batch is no longer representable, so `BatchDecision::try_allowed`
-  and `DecisionError::DeniedDecisionInAllowedBatch` are removed. The Serde
+  be allowed. `Allowance::new(Capacity, available, replenishes_after)` returns
+  `Result` and checks only that `available` does not exceed the capacity;
+  there is no panicking constructor and no `try_new`. `QuotaDenial::new`
+  takes a `Capacity` and cannot fail, so `QuotaDenial::try_new` and
+  `DecisionError::InvalidCapacity` are removed. `Decision::allowed` takes an
+  `Allowance` and `Decision::try_allowed` is removed. `DecisionView::Allowed`
+  and `AdmittedView::Allowed` carry an `allowance` field,
+  `BatchDecisionView::Allowed` carries `allowances: &[Allowance]`, and
+  `try_into_allowed()` returns `Vec<Allowance>`. A denied member of an allowed
+  batch is no longer representable, so `BatchDecision::try_allowed` and
+  `DecisionError::DeniedDecisionInAllowedBatch` are removed. The Serde
   `allowed` batch object carries `allowances`, a list of `Allowance` objects
   with `capacity`, `available`, and `replenishes_after`, instead of
   `decisions`; `Allowance` also serializes on its own.
+- **Breaking:** `BatchDecision::allowed`, `denied`, and `shadow_denied` return
+  `Result<_, DecisionError>`; the panicking spellings and the `try_denied` and
+  `try_shadow_denied` siblings are removed. `allowed` rejects an empty list
+  with the new `DecisionError::EmptyBatch`, and `denied` and `shadow_denied`
+  take `(index, batch_size, denial)` and return
+  `DecisionError::DeniedIndexOutOfRange` when `index` is not below
+  `batch_size`. `BatchDecisionView::Denied` and `ShadowDenied` expose
+  `batch_size` as a `NonZeroUsize`, `try_into_single_decision` converts a
+  denial only when its batch size is one, and the Serde `denied` and
+  `shadow_denied` batch objects gain a required `batch_size` field that
+  deserialization validates the index against.
+- **Breaking:** empty batches are rejected. `validate_batch` and every
+  backend's `check_all` return `BatchError::EmptyBatch` for an empty slice
+  instead of an allowed batch with no allowances, so a caller that filtered
+  every check out fails closed.
+- **Breaking:** `Denial` is the exhaustive denial enum, with variants
+  `QuotaExceeded(QuotaDenial)` and `StorageCapacity { retry_after }`. The
+  opaque `Denial` value, `DenialView`, `Denial::view()`,
+  `Denial::quota_exceeded()`, `Denial::storage_capacity()`, and
+  `Decision::quota_denied()` are removed; `Decision::denied` accepts anything
+  convertible into `Denial`. `DecisionView::Denied` and
+  `BatchDecisionView::Denied` carry a `Denial` by value, and `DecisionView` no
+  longer has a lifetime. Every denial reason is a named match arm, so a future
+  reason fails to compile in every consumer instead of landing in a fallback
+  branch.
+- **Breaking:** add `Delay`, the one type for backend-measured durations that
+  feed whole-second header fields. `QuotaDenial::retry_after()` and
+  `Allowance::replenishes_after()` both return it, and
+  `Denial::StorageCapacity` carries an optional one. `Delay::seconds()` rounds
+  up for `Retry-After` and `RateLimit` fields and `Delay::duration()` keeps
+  the exact measurement; the removed `retry_after_seconds()` accessors and
+  `runlimit-http`'s private rounding are gone.
+- **Breaking:** remove `DenialKind` and the reason-agnostic accessors
+  `Denial::kind()`, `quota()`, `capacity()`, `retry_after()`, and
+  `retry_after_seconds()`. Match `Denial` instead.
+- **Breaking:** remove the optional accessors `Decision::capacity()`,
+  `available()`, `replenishes_after()`, `retry_after()`,
+  `retry_after_seconds()`, `denial()`, and `quota_denial()`, and
+  `BatchDecision::allowed_decisions()`, `denied_index()`, `denial()`, and
+  `quota_denial()`. Match `DecisionView` and `BatchDecisionView` instead;
+  `try_into_allowed()` and `try_into_single_decision()` remain. Shadow outcomes
+  store `QuotaDenial` directly, making shadowed storage-capacity denials
+  unrepresentable internally, and the Serde `shadow_denied` object now parses
+  only a `quota_exceeded` denial instead of parsing any denial and rejecting a
+  `storage_capacity` reason afterwards. The Serde wire representation of
+  single decisions is otherwise unchanged.
+- **Breaking:** observations expose their enums instead of optional
+  accessors. `AdmissionOperation::Check` carries an `AdmissionPolicy` with
+  the policy identifier, scope, and fingerprint together, and
+  `AdmissionOperation::Batch` carries `batch_size` and the relevant
+  `Option<AdmissionPolicy>`; `AdmissionObservation::batch_size()`,
+  `policy_id()`, `scope_id()`, and `policy_fingerprint()` are removed.
+  `AdmissionObservation::failed_batch(checks, consumption, elapsed)` is the
+  only failed-batch factory: it derives the batch size from the input and
+  includes policy metadata exactly when the batch contains one check.
+  `CleanupObservation::new(requested, CleanupOutcome, elapsed)` replaces the
+  `confirmed`, `definitely_no_effect`, and `outcome_unknown` factories, and
+  `CleanupObservation::outcome()` replaces `removed()` and `consumption()`,
+  which had reused `ConsumptionStatus::Consumed` to mean "rows were deleted".
 - **Breaking:** `Observation`, `AdmissionOperation`, `AdmissionOutcome`, and
-  `ConsumptionStatus` are no longer `#[non_exhaustive]`. An observer names
-  every variant, so a new outcome is a compile error instead of a silently
-  unmetered wildcard arm.
+  `ConsumptionStatus` are no longer `#[non_exhaustive]`, and neither is any
+  other public enum: `DecisionError`, `runlimit_postgres::CheckError`,
+  `MaintenanceError`, `PostgresConfigError`, and `EncodingError` drop the
+  attribute too. A consumer names every variant, so a new outcome or error is
+  a compile error instead of a silently unmetered or mishandled wildcard arm.
+- **Breaking:** `Limiter` has separate `CheckError` and `CheckAllError`
+  associated types in place of `Error`, so a single check's error type never
+  carries a batch-only variant. `runlimit-axum`'s `RateLimitRejection` is
+  parameterized by `L::CheckError`.
+- **Breaking (`runlimit-memory`):** each operation has an error type listing
+  only the failures it can produce. `MemoryStore::check`, `stats`, and `clear`
+  return `PoisonedShardError`; `MemoryStore::check_all` returns
+  `MemoryBatchError` with `InvalidBatch`, `BatchExceedsShardCapacity`, and
+  `PoisonedShard`; `GcraStore::check` returns `GcraCheckError` and
+  `GcraStore::check_all` returns `GcraBatchError`. `MemoryStoreError` and
+  `GcraStoreError` are removed. Custom clocks are selected before construction
+  with `MemoryStore::builder(config).with_clock(clock).build()` or the
+  corresponding `GcraStore` builder, so a built store cannot reinterpret live
+  timestamps under another clock. `with_observer` remains a store builder.
+- **Breaking (`runlimit-postgres`):** a single check is shaped directly from
+  the database response instead of being converted from a batch of one, and
+  every decision is built before commit or rollback. `CheckError::InvalidBatch`,
+  `ResponseInvariant`, and `CommittedResponseInvariant` are removed;
+  `check_all` returns the new `BatchCheckError` with `InvalidBatch` and
+  `Check(CheckError)` variants. `CheckError::consumption()` and
+  `BatchCheckError::consumption()` return a `ConsumptionStatus` and replace
+  `may_have_consumed_quota()`. `CheckError::TimedOutBeforeCommit` and
+  `MaintenanceError::TimedOutBeforeCommit` carry a typed `CheckPhase` or
+  `CleanupPhase` instead of a string. `PostgresLimiter::with_config` is a
+  builder on `PostgresLimiter::new(pool)`. Query-result fields that cannot be
+  decoded into the protocol's expected types are reported as pre-commit
+  `StorageInvariant` failures and leave quota definitely unconsumed. Their
+  `StorageInvariantError` payload preserves the originating SQLx decode error;
+  its constructors remain backend-owned so callers cannot fabricate or erase
+  that distinction.
+- **Breaking (`runlimit-http`):** `draft_11::service_limit` takes anything
+  convertible into the new `QuotaState`, an `Allowance`, a `QuotaDenial`, or
+  an `Admitted` outcome, instead of a `Decision`, so a storage-capacity denial
+  cannot reach it. `EncodingError::UnsupportedDecision`, `ZeroQuotaPeriod`,
+  and `InvalidHeaderValue` are removed as unreachable.
+- **Breaking:** `KeyHasher::hash(policy_id, scope_id, subject)` is removed;
+  `KeyHasher::hash_for(&policy, subject)` is the only derivation and returns a
+  `PolicySubject` retaining that exact policy reference. `Check::new` accepts
+  only this bound value, so the normal construction path has no independent
+  policy argument to substitute. `PolicySubject::into_unbound_subject_key`
+  explicitly leaves that path for adapter boundaries; `Check::subject` and
+  `CounterKey::subject` likewise expose an unbound key that can be rebound.
+  `SubjectKey::from_digest` remains a test and already-opaque-digest escape
+  hatch; callers must bind it explicitly before constructing a check. The
+  packaged external-consumer smoke test extracts and compiles the exact README
+  GCRA example.
+- **Breaking (`runlimit-axum`):** `ExtractSubjectKey::extract_subject_key`
+  returns only a `SubjectKey`, not a `PolicySubject`. `RateLimitLayer` binds
+  that opaque key to its configured policy, making it impossible for an
+  extractor to replace the policy the layer evaluates while the admission
+  records another. Named extractors using `KeyHasher::hash_for` explicitly
+  call `PolicySubject::into_unbound_subject_key` at this adapter boundary.
 - **Breaking (`runlimit-axum`):** `RateLimitRejection` is no longer
   `#[non_exhaustive]`, and `RateLimitRejection::Denied` carries a
   `runlimit_core::Denial` instead of a `Decision`, so a rejection mapper names
@@ -47,39 +177,11 @@ The format is based on [Keep a Changelog], and this project adheres to
   stacked layers no longer overwrite each other's decision. Look a layer's
   outcome up with `Admissions::get(&policy)` or iterate them in evaluation
   order. Code passing adapter outcomes to
-  `runlimit_http::draft_11::service_limit` converts an admitted outcome with
-  `Decision::from(admission.decision())` and an enforced denial with
-  `Decision::denied(denial)`.
-- **Breaking:** add `DenialView` and `Denial::view()`. `DecisionView::Denied`
-  and `BatchDecisionView::Denied` carry a `DenialView` by value, and
-  `DecisionView` no longer has a lifetime. Every denial reason is a named match
-  arm, so a future reason fails to compile in every consumer instead of landing
-  in a fallback branch.
-- **Breaking:** add `RetryAfter`. `QuotaDenial::retry_after()` returns it and
-  `DenialView::StorageCapacity` carries an optional one. `RetryAfter::seconds()`
-  replaces the removed `retry_after_seconds()` accessors and rounds up for
-  `Retry-After` headers; `RetryAfter::duration()` keeps the exact measurement.
-- **Breaking:** remove `DenialKind` and the reason-agnostic accessors
-  `Denial::kind()`, `quota()`, `capacity()`, `retry_after()`, and
-  `retry_after_seconds()`. Match `Denial::view()` instead.
-- **Breaking:** remove the optional accessors `Decision::capacity()`,
-  `available()`, `replenishes_after()`, `retry_after()`,
-  `retry_after_seconds()`, `denial()`, and `quota_denial()`, and
-  `BatchDecision::allowed_decisions()`, `denied_index()`, `denial()`, and
-  `quota_denial()`. Match `DecisionView` and `BatchDecisionView` instead;
-  `try_into_allowed()` and `try_into_single_decision()` remain. Shadow outcomes
-  store `QuotaDenial` directly, making shadowed storage-capacity denials
-  unrepresentable internally. The Serde wire representation of single
-  decisions remains unchanged.
-- **Breaking:** batch denials carry their batch size. `BatchDecision::denied`
-  and `shadow_denied` take `(index, batch_size, denial)` and panic when
-  `index` is not below `batch_size`; the new `try_denied` and
-  `try_shadow_denied` return `DecisionError::DeniedIndexOutOfRange` instead.
-  `BatchDecisionView::Denied` and `ShadowDenied` expose `batch_size` as a
-  `NonZeroUsize`, `try_into_single_decision` converts a denial only when its
-  batch size is one, and the Serde `denied` and `shadow_denied` batch objects
-  gain a required `batch_size` field that deserialization validates the index
-  against.
+  `runlimit_http::draft_11::service_limit` passes `admission.decision()`
+  directly and, in a rejection mapper, the `QuotaDenial` from a matched
+  `Denial::QuotaExceeded`.
+- Document why atomic batches reject mixed quota modes and how to shadow one
+  policy of a multi-policy batch during a rollout.
 - **Breaking:** upgrade `runlimit-postgres` to SQLx 0.9.0. Applications passing
   SQLx pools or handling SQLx errors must also upgrade to SQLx 0.9.
 - Raise the workspace minimum supported Rust version from 1.88 to 1.94.

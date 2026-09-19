@@ -3,8 +3,8 @@
 //! [`RateLimitLayer`] evaluates one [`runlimit_core::Check`] before calling the
 //! wrapped service. Applications supply both trust-sensitive operations:
 //!
-//! - a synchronous [`ExtractSubjectKey`] implementation that derives an opaque
-//!   [`runlimit_core::SubjectKey`] from the request; and
+//! - a synchronous [`ExtractSubjectKey`] implementation that supplies an
+//!   opaque subject key from the request; and
 //! - a rejection mapper that converts extraction failures, enforced denials,
 //!   and backend failures into an Axum [`Response`].
 //!
@@ -45,10 +45,19 @@ use tower::{Layer, Service};
 /// application identity is normalized. Closures with the matching signature
 /// implement this trait automatically.
 ///
-/// Extractors should return only opaque [`SubjectKey`] values. In particular,
-/// raw identities should not cross into a Runlimit backend or generic error
-/// and telemetry paths.
-pub trait ExtractSubjectKey<P, B>: Send + Sync {
+/// Every implementation returns only an already-opaque, secret-keyed
+/// [`SubjectKey`]. The layer, not the extractor, binds that key to its
+/// configured policy before constructing a check. Consequently an extractor
+/// can choose the subject identity but cannot replace the policy evaluated or
+/// recorded by the layer.
+///
+/// A named implementation that derives keys with
+/// [`runlimit_core::KeyHasher::hash_for`] must explicitly call
+/// [`runlimit_core::PolicySubject::into_unbound_subject_key`]. This deliberate
+/// unbinding is safe at this boundary because the layer immediately binds the
+/// key to its own configured policy. Raw identities should not cross into a
+/// Runlimit backend or generic error and telemetry paths.
+pub trait ExtractSubjectKey<P: RateLimitPolicy + ?Sized, B>: Send + Sync {
     /// Application-defined extraction failure.
     type Error;
 
@@ -65,7 +74,7 @@ pub trait ExtractSubjectKey<P, B>: Send + Sync {
     ) -> Result<SubjectKey, Self::Error>;
 }
 
-impl<P, B, F, E> ExtractSubjectKey<P, B> for F
+impl<P: RateLimitPolicy + ?Sized, B, F, E> ExtractSubjectKey<P, B> for F
 where
     F: Fn(&Request<B>, &P) -> Result<SubjectKey, E> + Send + Sync,
 {
@@ -90,7 +99,9 @@ where
 /// category is a compile error in every application instead of landing in
 /// whatever response a wildcard arm returns. The denied variant carries a
 /// [`Denial`] rather than a full decision: an allowed or shadow-denied
-/// outcome is never rejected, so the mapper never handles one.
+/// outcome is never rejected, so the mapper never handles one. The backend
+/// variant carries the limiter's single-check error type
+/// ([`Limiter::CheckError`]), which never includes batch-only failures.
 pub enum RateLimitRejection<KeyError, BackendError> {
     /// The application-owned key extractor rejected the request.
     Key(KeyError),
@@ -399,7 +410,7 @@ where
     L::Policy: 'static,
     K: ExtractSubjectKey<L::Policy, B> + 'static,
     K::Error: Send + 'static,
-    R: Fn(RateLimitRejection<K::Error, L::Error>) -> Response + Send + Sync + 'static,
+    R: Fn(RateLimitRejection<K::Error, L::CheckError>) -> Response + Send + Sync + 'static,
     B: Send + 'static,
 {
     type Response = Response;
@@ -411,12 +422,9 @@ where
     }
 
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
-        let subject = self
-            .key_extractor
-            .extract_subject_key(&request, self.policy.as_ref());
-
         let limiter = Arc::clone(&self.limiter);
         let policy = Arc::clone(&self.policy);
+        let key_extractor = Arc::clone(&self.key_extractor);
         let rejection_mapper = Arc::clone(&self.rejection_mapper);
 
         let inner_clone = self.inner.clone();
@@ -424,14 +432,14 @@ where
 
         ResponseFuture {
             inner: Box::pin(async move {
-                let subject = match subject {
+                let subject = match key_extractor.extract_subject_key(&request, policy.as_ref()) {
                     Ok(subject) => subject,
                     Err(error) => {
                         return Ok(rejection_mapper(RateLimitRejection::Key(error)));
                     }
                 };
 
-                let check = Check::new(policy.as_ref(), subject);
+                let check = Check::new(subject.bind(policy.as_ref()));
                 let decision = match limiter.check(&check).await {
                     Ok(decision) => decision,
                     Err(error) => {

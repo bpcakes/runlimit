@@ -5,14 +5,14 @@ use std::{
 };
 
 use runlimit_core::{
-    AdmissionObservation, Allowance, BatchDecision, CapacityObservation, Check, CleanupObservation,
-    ConsumptionStatus, CounterKey, Decision, Denial, GcraPolicy, Limiter, Observation, Observer,
-    QuotaDenial, QuotaMode, observe_safely, validate_batch,
+    AdmissionObservation, Allowance, BatchDecision, Capacity, CapacityObservation, Check,
+    CleanupObservation, CleanupOutcome, ConsumptionStatus, CounterKey, Decision, GcraPolicy,
+    Limiter, Observation, Observer, QuotaDenial, QuotaMode, observe_safely, validate_batch,
 };
 use thiserror::Error;
 
 use crate::{
-    Clock, MemoryStoreConfig, MemoryStoreError, MemoryStoreStats, SystemClock,
+    Clock, MemoryBatchError, MemoryStoreConfig, MemoryStoreStats, PoisonedShardError, SystemClock,
     shards::{
         BatchTopology, BoundedShards, CleanupEffect, Shard, ShardEffect, collect_shard_effects,
         usize_to_u64,
@@ -42,7 +42,7 @@ impl Shard<Entry> {
         let candidate = active_tat
             .checked_add(increment)
             .ok_or(ArithmeticOverflow)?;
-        let burst_span = u128::from(check.burst_capacity)
+        let burst_span = u128::from(check.burst_capacity.get())
             .checked_mul(u128::from(check.period_millis))
             .ok_or(ArithmeticOverflow)?;
         let ceiling = scaled_now
@@ -51,10 +51,10 @@ impl Shard<Entry> {
 
         if candidate > ceiling {
             let retry_millis = div_ceil(candidate - ceiling, u128::from(check.quota));
-            return Ok(QuotaEvaluation::Denied(
-                QuotaDenial::try_new(check.burst_capacity, duration_from_millis(retry_millis))
-                    .expect("prepared policy capacities are validated"),
-            ));
+            return Ok(QuotaEvaluation::Denied(QuotaDenial::new(
+                check.burst_capacity,
+                duration_from_millis(retry_millis),
+            )));
         }
 
         let available = (ceiling - candidate) / u128::from(check.period_millis);
@@ -81,27 +81,47 @@ impl Shard<Entry> {
             allowance.expires_at_millis,
         );
 
+        // `available` is `(ceiling - candidate) / period` with
+        // `ceiling - candidate <= burst_capacity * period`, so it never exceeds
+        // the burst capacity.
         Allowance::new(
             check.burst_capacity,
             allowance.available,
             allowance.replenishes_after,
         )
+        .expect("GCRA availability is bounded by the burst capacity")
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ArithmeticOverflow;
 
-/// Failure from a GCRA memory-store admission operation.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum GcraStoreError {
-    /// The shared bounded memory store rejected the operation.
+/// Failure of a single GCRA memory-store check.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum GcraCheckError {
+    /// The target shard was poisoned and remains unavailable.
     #[error(transparent)]
-    Store(#[from] MemoryStoreError),
+    PoisonedShard(#[from] PoisonedShardError),
     /// Exact GCRA arithmetic could not represent the clock-relative state.
     #[error("GCRA arithmetic exceeded the supported exact range")]
     ArithmeticOverflow,
+}
+
+/// Failure of a GCRA memory-store atomic batch.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum GcraBatchError {
+    /// The shared bounded memory store rejected the batch.
+    #[error(transparent)]
+    Store(#[from] MemoryBatchError),
+    /// Exact GCRA arithmetic could not represent the clock-relative state.
+    #[error("GCRA arithmetic exceeded the supported exact range")]
+    ArithmeticOverflow,
+}
+
+impl From<PoisonedShardError> for GcraBatchError {
+    fn from(error: PoisonedShardError) -> Self {
+        Self::Store(MemoryBatchError::PoisonedShard(error))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,7 +145,7 @@ struct PreparedCheck {
     shard_position: usize,
     quota: u64,
     period_millis: u64,
-    burst_capacity: u64,
+    burst_capacity: Capacity,
     cost: u64,
     quota_mode: QuotaMode,
 }
@@ -136,8 +156,8 @@ impl PreparedCheck {
             input_index,
             counter_key: check.counter_key(),
             shard_position,
-            quota: check.policy().quota(),
-            period_millis: check.policy().period_millis(),
+            quota: check.policy().quota().get(),
+            period_millis: check.policy().period().millis(),
             burst_capacity: check.policy().burst_capacity(),
             cost: check.cost(),
             quota_mode: check.policy().quota_mode(),
@@ -163,6 +183,32 @@ pub struct GcraStore<C = SystemClock> {
     observer: Option<Arc<dyn Observer>>,
 }
 
+/// Builds an empty [`GcraStore`] with its clock chosen before any quota state
+/// exists.
+///
+/// Clock readings are coordinates for every timestamp stored in the shards,
+/// so the clock is part of the store's identity rather than mutable runtime
+/// configuration. A built store therefore exposes no clock-replacement API.
+///
+/// ```compile_fail,E0599
+/// use std::time::Duration;
+/// use runlimit_memory::{Clock, GcraStore, MemoryStoreConfig};
+///
+/// struct TestClock;
+/// impl Clock for TestClock {
+///     fn now(&self) -> Duration { Duration::ZERO }
+/// }
+///
+/// let store = GcraStore::new(MemoryStoreConfig::new(1)?);
+/// let store = store.with_clock(TestClock);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use]
+pub struct GcraStoreBuilder<C = SystemClock> {
+    config: MemoryStoreConfig,
+    clock: C,
+}
+
 impl<C> fmt::Debug for GcraStore<C> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let poisoned_shards = self.shards.poisoned_count();
@@ -179,36 +225,63 @@ impl<C> fmt::Debug for GcraStore<C> {
 impl GcraStore<SystemClock> {
     /// Creates a store using the system monotonic clock.
     pub fn new(config: MemoryStoreConfig) -> Self {
-        Self::with_clock(config, SystemClock::new())
+        Self::builder(config).build()
+    }
+
+    /// Begins constructing an empty store.
+    ///
+    /// Use [`GcraStoreBuilder::with_clock`] before [`GcraStoreBuilder::build`]
+    /// when deterministic time is required. Once built, the store's clock
+    /// cannot be replaced because its counters contain timestamps in that
+    /// clock's coordinate system.
+    pub fn builder(config: MemoryStoreConfig) -> GcraStoreBuilder<SystemClock> {
+        GcraStoreBuilder {
+            config,
+            clock: SystemClock::new(),
+        }
     }
 }
 
-impl<C: Clock> GcraStore<C> {
-    /// Creates a store using a caller-supplied monotonic clock.
-    pub fn with_clock(config: MemoryStoreConfig, clock: C) -> Self {
-        let shards = BoundedShards::new(&config);
-        Self {
-            config,
+impl<C> GcraStoreBuilder<C> {
+    /// Returns this builder with a caller-supplied monotonic clock.
+    pub fn with_clock<D: Clock>(self, clock: D) -> GcraStoreBuilder<D> {
+        GcraStoreBuilder {
+            config: self.config,
             clock,
+        }
+    }
+}
+
+impl<C: Clock> GcraStoreBuilder<C> {
+    /// Builds an empty store whose timestamps use the selected clock.
+    pub fn build(self) -> GcraStore<C> {
+        let shards = BoundedShards::new(&self.config);
+        GcraStore {
+            config: self.config,
+            clock: self.clock,
             shards,
             observer: None,
         }
     }
+}
 
+impl<C> GcraStore<C> {
     /// Returns this store with an operational observer.
     #[must_use]
     pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
         self.observer = Some(observer);
         self
     }
+}
 
+impl<C: Clock> GcraStore<C> {
     /// Evaluates and, when allowed, consumes one GCRA check.
     ///
     /// # Errors
     ///
     /// Fails closed when the target shard is poisoned or exact arithmetic
     /// cannot represent the caller-supplied clock value.
-    pub fn check(&self, check: &Check<'_, GcraPolicy>) -> Result<Decision, GcraStoreError> {
+    pub fn check(&self, check: &Check<'_, GcraPolicy>) -> Result<Decision, GcraCheckError> {
         let started = Instant::now();
         let result = self.check_inner(check);
         let elapsed = started.elapsed();
@@ -229,7 +302,7 @@ impl<C: Clock> GcraStore<C> {
     fn check_inner(
         &self,
         check: &Check<'_, GcraPolicy>,
-    ) -> Result<Evaluation<Decision, ShardEffect>, GcraStoreError> {
+    ) -> Result<Evaluation<Decision, ShardEffect>, GcraCheckError> {
         let counter_key = check.counter_key();
         let shard_index = self.shards.shard_index(&counter_key);
         let prepared = PreparedCheck::new(0, check, 0);
@@ -238,7 +311,7 @@ impl<C: Clock> GcraStore<C> {
         let now_millis = observed_millis.max(shard.latest_observed_millis());
         let evaluated = shard
             .evaluate(&prepared, now_millis)
-            .map_err(|ArithmeticOverflow| GcraStoreError::ArithmeticOverflow)?;
+            .map_err(|ArithmeticOverflow| GcraCheckError::ArithmeticOverflow)?;
         shard.record_observed_millis(now_millis);
         let cleanup_requested = self.config.max_expired_removals_per_check();
         let cleanup_started = Instant::now();
@@ -248,11 +321,7 @@ impl<C: Clock> GcraStore<C> {
         let decision = match evaluated {
             QuotaEvaluation::Allowed(allowance) => {
                 if !shard.contains_key(counter_key) && shard.used() >= shard.capacity() {
-                    Decision::denied(Denial::storage_capacity(
-                        shard
-                            .capacity_retry_after_millis(now_millis)
-                            .map(duration_from_millis),
-                    ))
+                    Decision::denied(shard.storage_capacity_denial(now_millis))
                 } else {
                     Decision::allowed(shard.consume(&prepared, allowance))
                 }
@@ -281,20 +350,19 @@ impl<C: Clock> GcraStore<C> {
         })
     }
 
-    /// Evaluates an atomic batch of GCRA checks.
+    /// Evaluates a nonempty atomic batch of GCRA checks.
     ///
     /// Allowed decisions preserve input order. A denied or shadow-denied batch
     /// consumes no quota.
     ///
     /// # Errors
     ///
-    /// Fails closed for invalid batches, poisoned shards, an unsatisfiable
-    /// per-shard batch, or arithmetic overflow.
-    #[allow(clippy::too_many_lines)]
+    /// Fails closed for empty or otherwise invalid batches, poisoned shards,
+    /// an unsatisfiable per-shard batch, or arithmetic overflow.
     pub fn check_all(
         &self,
         checks: &[Check<'_, GcraPolicy>],
-    ) -> Result<BatchDecision, GcraStoreError> {
+    ) -> Result<BatchDecision, GcraBatchError> {
         let started = Instant::now();
         let result = self.check_all_inner(checks);
         let elapsed = started.elapsed();
@@ -306,11 +374,7 @@ impl<C: Clock> GcraStore<C> {
                 });
             }
             Err(_) => self.observe_admission(|| {
-                AdmissionObservation::failed_batch(
-                    checks.len(),
-                    ConsumptionStatus::NotConsumed,
-                    elapsed,
-                )
+                AdmissionObservation::failed_batch(checks, ConsumptionStatus::NotConsumed, elapsed)
             }),
         }
         result.map(|evaluation| evaluation.value)
@@ -320,14 +384,8 @@ impl<C: Clock> GcraStore<C> {
     fn check_all_inner(
         &self,
         checks: &[Check<'_, GcraPolicy>],
-    ) -> Result<Evaluation<BatchDecision, Vec<ShardEffect>>, GcraStoreError> {
-        validate_batch(checks, self.config.max_batch_size()).map_err(MemoryStoreError::from)?;
-        if checks.is_empty() {
-            return Ok(Evaluation {
-                value: BatchDecision::allowed(Vec::new()),
-                effect: Vec::new(),
-            });
-        }
+    ) -> Result<Evaluation<BatchDecision, Vec<ShardEffect>>, GcraBatchError> {
+        validate_batch(checks, self.config.max_batch_size()).map_err(MemoryBatchError::from)?;
 
         let topology = BatchTopology::new(
             checks
@@ -355,7 +413,7 @@ impl<C: Clock> GcraStore<C> {
                 locked_shards[check.shard_position]
                     .1
                     .evaluate(check, now_millis)
-                    .map_err(|ArithmeticOverflow| GcraStoreError::ArithmeticOverflow)?,
+                    .map_err(|ArithmeticOverflow| GcraBatchError::ArithmeticOverflow)?,
             );
         }
         let mut cleanup_effects = Vec::with_capacity(locked_shards.len());
@@ -385,7 +443,8 @@ impl<C: Clock> GcraStore<C> {
                         BatchDecision::shadow_denied(check.input_index, checks.len(), denial)
                     } else {
                         BatchDecision::denied(check.input_index, checks.len(), denial)
-                    };
+                    }
+                    .expect("a prepared check's input index is below the batch size");
                     return Ok(Evaluation {
                         value,
                         effect: collect_shard_effects(&locked_shards, &cleanup_effects),
@@ -400,12 +459,9 @@ impl<C: Clock> GcraStore<C> {
                         value: BatchDecision::denied(
                             check.input_index,
                             checks.len(),
-                            Denial::storage_capacity(
-                                shard
-                                    .capacity_retry_after_millis(now_millis)
-                                    .map(duration_from_millis),
-                            ),
-                        ),
+                            shard.storage_capacity_denial(now_millis),
+                        )
+                        .expect("a prepared check's input index is below the batch size"),
                         effect: collect_shard_effects(&locked_shards, &cleanup_effects),
                     });
                 }
@@ -423,7 +479,8 @@ impl<C: Clock> GcraStore<C> {
             );
         }
         Ok(Evaluation {
-            value: BatchDecision::allowed(consumed),
+            value: BatchDecision::allowed(consumed)
+                .expect("batch validation rejected the empty batch"),
             effect: collect_shard_effects(&locked_shards, &cleanup_effects),
         })
     }
@@ -433,7 +490,7 @@ impl<C: Clock> GcraStore<C> {
     /// # Errors
     ///
     /// Returns an error if any shard is poisoned.
-    pub fn stats(&self) -> Result<MemoryStoreStats, MemoryStoreError> {
+    pub fn stats(&self) -> Result<MemoryStoreStats, PoisonedShardError> {
         self.shards.stats(&self.config)
     }
 
@@ -442,7 +499,7 @@ impl<C: Clock> GcraStore<C> {
     /// # Errors
     ///
     /// Returns an error if any shard is poisoned.
-    pub fn clear(&self) -> Result<(), MemoryStoreError> {
+    pub fn clear(&self) -> Result<(), PoisonedShardError> {
         self.shards.clear()
     }
 
@@ -463,9 +520,11 @@ impl<C: Clock> GcraStore<C> {
         };
         observe_safely(
             observer.as_ref(),
-            &Observation::Cleanup(CleanupObservation::confirmed(
+            &Observation::Cleanup(CleanupObservation::new(
                 effect.cleanup.requested,
-                usize_to_u64(effect.cleanup.removed),
+                CleanupOutcome::Confirmed {
+                    removed: usize_to_u64(effect.cleanup.removed),
+                },
                 effect.cleanup.elapsed,
             )),
         );
@@ -509,16 +568,17 @@ fn duration_from_millis(millis: u128) -> Duration {
 #[allow(clippy::unused_async_trait_impl)]
 impl<C: Clock> Limiter for GcraStore<C> {
     type Policy = GcraPolicy;
-    type Error = GcraStoreError;
+    type CheckError = GcraCheckError;
+    type CheckAllError = GcraBatchError;
 
-    async fn check(&self, check: &Check<'_, Self::Policy>) -> Result<Decision, Self::Error> {
+    async fn check(&self, check: &Check<'_, Self::Policy>) -> Result<Decision, Self::CheckError> {
         GcraStore::check(self, check)
     }
 
     async fn check_all(
         &self,
         checks: &[Check<'_, Self::Policy>],
-    ) -> Result<BatchDecision, Self::Error> {
+    ) -> Result<BatchDecision, Self::CheckAllError> {
         GcraStore::check_all(self, checks)
     }
 }
@@ -535,16 +595,29 @@ mod tests {
     };
 
     use runlimit_core::{
-        AdmissionOperation, AdmissionOutcome, Allowance, BatchDecision, BatchDecisionView, Check,
-        ConsumptionStatus, Decision, DecisionView, DenialView, GcraPolicy, MAX_LIMIT, Observation,
-        Observer, PolicyId, QuotaDenial, QuotaMode, ScopeId, SubjectKey,
+        AdmissionOperation, AdmissionOutcome, Allowance, BatchDecision, BatchDecisionView,
+        BatchError, Capacity, Check, CleanupOutcome, ConsumptionStatus, Decision, DecisionView,
+        Denial, GcraPolicy, MAX_LIMIT, Observation, Observer, PolicyId, QuotaDenial, QuotaMode,
+        ScopeId, SubjectKey,
     };
 
-    use super::{GcraStore, GcraStoreError};
-    use crate::{Clock, MemoryStoreConfig, MemoryStoreError};
+    use super::{GcraBatchError, GcraCheckError, GcraStore};
+    use crate::{Clock, MemoryBatchError, MemoryStoreConfig, PoisonedShardError};
 
-    fn quota(capacity: u64, retry_after: Duration) -> QuotaDenial {
-        QuotaDenial::try_new(capacity, retry_after).unwrap()
+    fn capacity(value: u64) -> Capacity {
+        Capacity::new(value).unwrap()
+    }
+
+    fn quota(capacity_value: u64, retry_after: Duration) -> QuotaDenial {
+        QuotaDenial::new(capacity(capacity_value), retry_after)
+    }
+
+    fn allowance(capacity_value: u64, available: u64, replenishes_after: Duration) -> Allowance {
+        Allowance::new(capacity(capacity_value), available, replenishes_after).unwrap()
+    }
+
+    fn with_clock<C: Clock>(config: MemoryStoreConfig, clock: C) -> GcraStore<C> {
+        GcraStore::builder(config).with_clock(clock).build()
     }
 
     #[derive(Clone, Default)]
@@ -611,7 +684,7 @@ mod tests {
             consumption: ConsumptionStatus,
         },
         Cleanup {
-            removed: Option<u64>,
+            outcome: CleanupOutcome,
         },
         Capacity {
             used: u64,
@@ -628,7 +701,7 @@ mod tests {
                     consumption: admission.consumption(),
                 },
                 Observation::Cleanup(cleanup) => Self::Cleanup {
-                    removed: cleanup.removed(),
+                    outcome: cleanup.outcome(),
                 },
                 Observation::Capacity(capacity) => Self::Capacity {
                     used: capacity.used(),
@@ -665,11 +738,9 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct RecordedAdmissionMetadata {
-        operation: AdmissionOperation,
-        has_policy_id: bool,
-        has_scope_id: bool,
-        has_policy_fingerprint: bool,
+    enum RecordedAdmissionMetadata {
+        Check,
+        Batch { has_policy: bool },
     }
 
     #[derive(Default)]
@@ -685,11 +756,11 @@ mod tests {
             self.admissions
                 .lock()
                 .unwrap()
-                .push(RecordedAdmissionMetadata {
-                    operation: admission.operation(),
-                    has_policy_id: admission.policy_id().is_some(),
-                    has_scope_id: admission.scope_id().is_some(),
-                    has_policy_fingerprint: admission.policy_fingerprint().is_some(),
+                .push(match admission.operation() {
+                    AdmissionOperation::Check { .. } => RecordedAdmissionMetadata::Check,
+                    AdmissionOperation::Batch { policy, .. } => RecordedAdmissionMetadata::Batch {
+                        has_policy: policy.is_some(),
+                    },
                 });
         }
     }
@@ -758,7 +829,7 @@ mod tests {
             }
 
             self.tokens_scaled -= requested;
-            Decision::allowed(Allowance::new(
+            Decision::allowed(allowance(
                 self.capacity,
                 u64::try_from(self.tokens_scaled / self.period_millis)
                     .expect("reference availability fits the configured capacity"),
@@ -798,8 +869,7 @@ mod tests {
             for period_millis in 1_u64..=10 {
                 for capacity in 1_u64..=5 {
                     let clock = ManualClock::default();
-                    let store =
-                        GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), clock.clone());
+                    let store = with_clock(MemoryStoreConfig::new(1).unwrap(), clock.clone());
                     let id = format!("reference.{quota}.{period_millis}.{capacity}");
                     let policy = policy(&id, quota, Duration::from_millis(period_millis), capacity);
                     let mut reference = ReferenceBucket::new(quota, period_millis, capacity);
@@ -816,7 +886,11 @@ mod tests {
                         let cost = 1 + (step * 7 + quota + period_millis) % capacity;
                         let expected = reference.check(now_millis, cost);
                         let actual = store
-                            .check(&Check::with_cost(&policy, subject(1), cost).unwrap())
+                            .check(
+                                &Check::new(subject(1).bind(&policy))
+                                    .with_cost(cost)
+                                    .unwrap(),
+                            )
                             .unwrap();
 
                         assert_eq!(
@@ -833,13 +907,13 @@ mod tests {
     #[test]
     fn quota_three_per_ten_millis_rounds_fractional_boundaries_up() {
         let clock = ManualClock::default();
-        let store = GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), clock.clone());
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), clock.clone());
         let policy = policy("api.fractional", 3, Duration::from_millis(10), 4);
         let subject = subject(1);
 
         assert_eq!(
-            store.check(&Check::with_cost(&policy, subject, 4).unwrap()),
-            Ok(Decision::allowed(Allowance::new(
+            store.check(&Check::new(subject.bind(&policy)).with_cost(4).unwrap()),
+            Ok(Decision::allowed(allowance(
                 4,
                 0,
                 Duration::from_millis(14)
@@ -847,13 +921,13 @@ mod tests {
         );
         clock.set(Duration::from_millis(3));
         assert_eq!(
-            store.check(&Check::new(&policy, subject)),
+            store.check(&Check::new(subject.bind(&policy))),
             Ok(Decision::denied(quota(4, Duration::from_millis(1))))
         );
         clock.set(Duration::from_millis(4));
         assert_eq!(
-            store.check(&Check::new(&policy, subject)),
-            Ok(Decision::allowed(Allowance::new(
+            store.check(&Check::new(subject.bind(&policy))),
+            Ok(Decision::allowed(allowance(
                 4,
                 0,
                 Duration::from_millis(13)
@@ -864,26 +938,26 @@ mod tests {
     #[test]
     fn quota_above_period_milliseconds_replenishes_multiple_units_per_tick() {
         let clock = ManualClock::default();
-        let store = GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), clock.clone());
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), clock.clone());
         let policy = policy("api.fast", 10, Duration::from_millis(1), 12);
         let subject = subject(1);
 
         assert_eq!(
-            store.check(&Check::with_cost(&policy, subject, 12).unwrap()),
-            Ok(Decision::allowed(Allowance::new(
+            store.check(&Check::new(subject.bind(&policy)).with_cost(12).unwrap()),
+            Ok(Decision::allowed(allowance(
                 12,
                 0,
                 Duration::from_millis(2)
             )))
         );
         assert_eq!(
-            store.check(&Check::new(&policy, subject)),
+            store.check(&Check::new(subject.bind(&policy))),
             Ok(Decision::denied(quota(12, Duration::from_millis(1))))
         );
         clock.set(Duration::from_millis(1));
         assert_eq!(
-            store.check(&Check::with_cost(&policy, subject, 10).unwrap()),
-            Ok(Decision::allowed(Allowance::new(
+            store.check(&Check::new(subject.bind(&policy)).with_cost(10).unwrap()),
+            Ok(Decision::allowed(allowance(
                 12,
                 0,
                 Duration::from_millis(2)
@@ -894,50 +968,42 @@ mod tests {
     #[test]
     fn weighted_burst_refills_at_exact_integer_boundaries() {
         let clock = ManualClock::default();
-        let store = GcraStore::with_clock(MemoryStoreConfig::new(8).unwrap(), clock.clone());
+        let store = with_clock(MemoryStoreConfig::new(8).unwrap(), clock.clone());
         let policy = policy("api.read", 2, Duration::from_secs(1), 4);
-        let check = Check::with_cost(&policy, subject(1), 3).unwrap();
+        let check = Check::new(subject(1).bind(&policy)).with_cost(3).unwrap();
 
         assert_eq!(
             store.check(&check),
-            Ok(Decision::allowed(Allowance::new(
+            Ok(Decision::allowed(allowance(
                 4,
                 1,
                 Duration::from_millis(1_500)
             )))
         );
         assert_eq!(
-            store.check(&Check::new(&policy, subject(1))),
-            Ok(Decision::allowed(Allowance::new(
-                4,
-                0,
-                Duration::from_secs(2)
-            )))
+            store.check(&Check::new(subject(1).bind(&policy))),
+            Ok(Decision::allowed(allowance(4, 0, Duration::from_secs(2))))
         );
         assert_eq!(
-            store.check(&Check::new(&policy, subject(1))),
+            store.check(&Check::new(subject(1).bind(&policy))),
             Ok(Decision::denied(quota(4, Duration::from_millis(500))))
         );
 
         clock.advance(Duration::from_millis(499));
         assert_eq!(
-            store.check(&Check::new(&policy, subject(1))),
+            store.check(&Check::new(subject(1).bind(&policy))),
             Ok(Decision::denied(quota(4, Duration::from_millis(1))))
         );
         clock.advance(Duration::from_millis(1));
         assert_eq!(
-            store.check(&Check::new(&policy, subject(1))),
-            Ok(Decision::allowed(Allowance::new(
-                4,
-                0,
-                Duration::from_secs(2)
-            )))
+            store.check(&Check::new(subject(1).bind(&policy))),
+            Ok(Decision::allowed(allowance(4, 0, Duration::from_secs(2))))
         );
 
         clock.advance(Duration::from_secs(2));
         assert_eq!(
-            store.check(&Check::new(&policy, subject(1))),
-            Ok(Decision::allowed(Allowance::new(
+            store.check(&Check::new(subject(1).bind(&policy))),
+            Ok(Decision::allowed(allowance(
                 4,
                 3,
                 Duration::from_millis(500)
@@ -949,9 +1015,9 @@ mod tests {
     fn regressing_clocks_cannot_refill_quota_early() {
         let clock = ManualClock::default();
         clock.set(Duration::from_secs(10));
-        let store = GcraStore::with_clock(MemoryStoreConfig::new(2).unwrap(), clock.clone());
+        let store = with_clock(MemoryStoreConfig::new(2).unwrap(), clock.clone());
         let policy = policy("api.write", 1, Duration::from_secs(1), 1);
-        let check = Check::new(&policy, subject(1));
+        let check = Check::new(subject(1).bind(&policy));
 
         assert!(store.check(&check).unwrap().permits_request());
         clock.set(Duration::from_secs(1));
@@ -968,20 +1034,20 @@ mod tests {
             .unwrap()
             .with_max_expired_removals_per_check(1)
             .unwrap();
-        let store = GcraStore::with_clock(config, clock.clone());
+        let store = with_clock(config, clock.clone());
         let policy = policy("api.read", 1, Duration::from_millis(10), 1);
 
         for byte in 1..=3 {
             assert!(
                 store
-                    .check(&Check::new(&policy, subject(byte)))
+                    .check(&Check::new(subject(byte).bind(&policy)))
                     .unwrap()
                     .permits_request()
             );
         }
         assert!(
             !store
-                .check(&Check::new(&policy, subject(4)))
+                .check(&Check::new(subject(4).bind(&policy)))
                 .unwrap()
                 .permits_request()
         );
@@ -989,7 +1055,7 @@ mod tests {
         clock.advance(Duration::from_millis(10));
         assert!(
             store
-                .check(&Check::new(&policy, subject(4)))
+                .check(&Check::new(subject(4).bind(&policy)))
                 .unwrap()
                 .permits_request()
         );
@@ -1001,15 +1067,14 @@ mod tests {
         const ATTEMPTS: usize = 32;
         const BURST: usize = 7;
 
-        let store =
-            GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
         let policy = policy(
             "api.concurrent",
             1,
             Duration::from_mins(1),
             u64::try_from(BURST).unwrap(),
         );
-        let check = Check::new(&policy, subject(1));
+        let check = Check::new(subject(1).bind(&policy));
         let barrier = Arc::new(Barrier::new(ATTEMPTS + 1));
 
         let decisions = thread::scope(|scope| {
@@ -1043,7 +1108,7 @@ mod tests {
                     matches!(
                         decision.view(),
                         DecisionView::Denied {
-                            denial: DenialView::QuotaExceeded(_),
+                            denial: Denial::QuotaExceeded(_),
                         }
                     )
                 })
@@ -1055,31 +1120,30 @@ mod tests {
 
     #[test]
     fn allowed_batches_return_exact_decisions_in_input_order() {
-        let store =
-            GcraStore::with_clock(MemoryStoreConfig::new(2).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(2).unwrap(), ManualClock::default());
         let slow = policy("api.slow", 1, Duration::from_millis(10), 3);
         let fast = policy("api.fast", 4, Duration::from_millis(10), 5);
         let checks = [
-            Check::with_cost(&fast, subject(1), 3).unwrap(),
-            Check::with_cost(&slow, subject(1), 2).unwrap(),
+            Check::new(subject(1).bind(&fast)).with_cost(3).unwrap(),
+            Check::new(subject(1).bind(&slow)).with_cost(2).unwrap(),
         ];
 
         assert_eq!(
             store.check_all(&checks),
             Ok(BatchDecision::allowed(vec![
-                Allowance::new(5, 2, Duration::from_millis(8)),
-                Allowance::new(3, 1, Duration::from_millis(20)),
-            ]))
+                allowance(5, 2, Duration::from_millis(8)),
+                allowance(3, 1, Duration::from_millis(20)),
+            ])
+            .unwrap())
         );
     }
 
     #[test]
     fn enforced_quota_denial_rolls_back_earlier_batch_members() {
-        let store =
-            GcraStore::with_clock(MemoryStoreConfig::new(3).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(3).unwrap(), ManualClock::default());
         let policy = policy("api.quota-rollback", 1, Duration::from_millis(100), 1);
-        let exhausted = Check::new(&policy, subject(1));
-        let earlier = Check::new(&policy, subject(2));
+        let exhausted = Check::new(subject(1).bind(&policy));
+        let earlier = Check::new(subject(2).bind(&policy));
         assert!(store.check(&exhausted).unwrap().permits_request());
 
         let result = store.check_all(&[earlier, exhausted]).unwrap();
@@ -1088,7 +1152,7 @@ mod tests {
             BatchDecisionView::Denied {
                 index: 1,
                 batch_size,
-                denial: DenialView::QuotaExceeded(_),
+                denial: Denial::QuotaExceeded(_),
             } if batch_size.get() == 2
         ));
         assert!(
@@ -1099,12 +1163,11 @@ mod tests {
 
     #[test]
     fn storage_capacity_denial_rolls_back_earlier_batch_members() {
-        let store =
-            GcraStore::with_clock(MemoryStoreConfig::new(2).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(2).unwrap(), ManualClock::default());
         let policy = policy("api.capacity-rollback", 1, Duration::from_millis(100), 2);
-        let earlier = Check::new(&policy, subject(1));
-        let occupying = Check::new(&policy, subject(2));
-        let new_key = Check::new(&policy, subject(3));
+        let earlier = Check::new(subject(1).bind(&policy));
+        let occupying = Check::new(subject(2).bind(&policy));
+        let new_key = Check::new(subject(3).bind(&policy));
         assert!(store.check(&earlier).unwrap().permits_request());
         assert!(store.check(&occupying).unwrap().permits_request());
 
@@ -1114,7 +1177,7 @@ mod tests {
             BatchDecisionView::Denied {
                 index: 1,
                 batch_size,
-                denial: DenialView::StorageCapacity { .. },
+                denial: Denial::StorageCapacity { .. },
             } if batch_size.get() == 2
         ));
         assert!(
@@ -1125,18 +1188,17 @@ mod tests {
 
     #[test]
     fn unsatisfiable_batch_uses_shared_topology_preflight_without_mutation() {
-        let store =
-            GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
         let policy = policy("api.unsatisfiable", 1, Duration::from_secs(1), 1);
         let checks = [
-            Check::new(&policy, subject(1)),
-            Check::new(&policy, subject(2)),
+            Check::new(subject(1).bind(&policy)),
+            Check::new(subject(2).bind(&policy)),
         ];
 
         assert_eq!(
             store.check_all(&checks),
-            Err(GcraStoreError::Store(
-                MemoryStoreError::BatchExceedsShardCapacity {
+            Err(GcraBatchError::Store(
+                MemoryBatchError::BatchExceedsShardCapacity {
                     shard_index: 0,
                     key_count: 2,
                     capacity: 1,
@@ -1148,12 +1210,11 @@ mod tests {
 
     #[test]
     fn atomic_batches_preserve_order_and_roll_back_on_shadow_denial() {
-        let store =
-            GcraStore::with_clock(MemoryStoreConfig::new(8).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(8).unwrap(), ManualClock::default());
         let shadow =
             policy("api.read", 1, Duration::from_secs(1), 1).with_quota_mode(QuotaMode::Shadow);
-        let first = Check::new(&shadow, subject(1));
-        let second = Check::new(&shadow, subject(2));
+        let first = Check::new(subject(1).bind(&shadow));
+        let second = Check::new(subject(2).bind(&shadow));
 
         assert!(store.check(&first).unwrap().permits_request());
         let result = store.check_all(&[first, second]).unwrap();
@@ -1173,22 +1234,21 @@ mod tests {
 
     #[test]
     fn storage_capacity_is_enforced_for_shadow_policies() {
-        let store =
-            GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
         let shadow =
             policy("api.read", 1, Duration::from_secs(1), 1).with_quota_mode(QuotaMode::Shadow);
 
         assert!(
             store
-                .check(&Check::new(&shadow, subject(1)))
+                .check(&Check::new(subject(1).bind(&shadow)))
                 .unwrap()
                 .permits_request()
         );
-        let decision = store.check(&Check::new(&shadow, subject(2))).unwrap();
+        let decision = store.check(&Check::new(subject(2).bind(&shadow))).unwrap();
         assert!(matches!(
             decision.view(),
             DecisionView::Denied {
-                denial: DenialView::StorageCapacity { .. },
+                denial: Denial::StorageCapacity { .. },
             }
         ));
     }
@@ -1203,9 +1263,8 @@ mod tests {
             .unwrap()
             .with_shard_count(2)
             .unwrap();
-        let store = Arc::new(
-            GcraStore::with_clock(config, ManualClock::default()).with_observer(observer.clone()),
-        );
+        let store =
+            Arc::new(with_clock(config, ManualClock::default()).with_observer(observer.clone()));
         *observer
             .store
             .lock()
@@ -1216,14 +1275,14 @@ mod tests {
             (0..=u8::MAX)
                 .map(subject)
                 .find(|subject| {
-                    let check = Check::new(&policy, *subject);
+                    let check = Check::new((*subject).bind(&policy));
                     store.shards.shard_index(&check.counter_key()) == target
                 })
                 .expect("the deterministic subject space reaches each configured shard")
         };
         let checks = [
-            Check::new(&policy, subject_for_shard(1)),
-            Check::new(&policy, subject_for_shard(0)),
+            Check::new(subject_for_shard(1).bind(&policy)),
+            Check::new(subject_for_shard(0).bind(&policy)),
         ];
 
         assert!(store.check_all(&checks).unwrap().try_into_allowed().is_ok());
@@ -1233,13 +1292,17 @@ mod tests {
                 .lock()
                 .expect("reentrant observer observations mutex remains healthy"),
             vec![
-                RecordedObservation::Cleanup { removed: Some(0) },
+                RecordedObservation::Cleanup {
+                    outcome: CleanupOutcome::Confirmed { removed: 0 },
+                },
                 RecordedObservation::Capacity {
                     used: 1,
                     capacity: 1,
                     shard_index: Some(0),
                 },
-                RecordedObservation::Cleanup { removed: Some(0) },
+                RecordedObservation::Cleanup {
+                    outcome: CleanupOutcome::Confirmed { removed: 0 },
+                },
                 RecordedObservation::Capacity {
                     used: 1,
                     capacity: 1,
@@ -1255,18 +1318,18 @@ mod tests {
 
     #[test]
     fn extreme_clock_values_fail_closed_without_mutation() {
-        let store = GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), MaximumClock);
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), MaximumClock);
         let policy = policy("api.read", MAX_LIMIT, Duration::from_millis(1), 1);
-        let check = Check::new(&policy, subject(1));
+        let check = Check::new(subject(1).bind(&policy));
 
-        assert_eq!(store.check(&check), Err(GcraStoreError::ArithmeticOverflow));
+        assert_eq!(store.check(&check), Err(GcraCheckError::ArithmeticOverflow));
         assert_eq!(store.stats().unwrap().entries(), 0);
     }
 
     #[test]
-    fn failed_gcra_checks_keep_policy_metadata_but_failed_batches_remain_anonymous() {
+    fn failed_gcra_checks_and_one_check_batches_keep_policy_metadata() {
         let observer = Arc::new(AdmissionMetadataObserver::default());
-        let store = GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), MaximumClock)
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), MaximumClock)
             .with_observer(observer.clone());
         let policy = policy(
             "api.observed-overflow",
@@ -1274,28 +1337,18 @@ mod tests {
             Duration::from_millis(1),
             1,
         );
-        let check = Check::new(&policy, subject(1));
+        let check = Check::new(subject(1).bind(&policy));
 
-        assert_eq!(store.check(&check), Err(GcraStoreError::ArithmeticOverflow));
+        assert_eq!(store.check(&check), Err(GcraCheckError::ArithmeticOverflow));
         assert_eq!(
             store.check_all(&[check]),
-            Err(GcraStoreError::ArithmeticOverflow)
+            Err(GcraBatchError::ArithmeticOverflow)
         );
         assert_eq!(
             observer.admissions.lock().unwrap().as_slice(),
             [
-                RecordedAdmissionMetadata {
-                    operation: AdmissionOperation::Check,
-                    has_policy_id: true,
-                    has_scope_id: true,
-                    has_policy_fingerprint: true,
-                },
-                RecordedAdmissionMetadata {
-                    operation: AdmissionOperation::Batch,
-                    has_policy_id: false,
-                    has_scope_id: false,
-                    has_policy_fingerprint: false,
-                },
+                RecordedAdmissionMetadata::Check,
+                RecordedAdmissionMetadata::Batch { has_policy: true },
             ]
         );
     }
@@ -1304,12 +1357,12 @@ mod tests {
     fn arithmetic_preflight_preserves_expired_entries_and_emits_only_failure() {
         let clock = SwitchableExtremeClock::default();
         let observer = Arc::new(RecordingObserver::default());
-        let store = GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), clock.clone())
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), clock.clone())
             .with_observer(observer.clone());
         let ordinary = policy("api.ordinary", 1, Duration::from_millis(1), 1);
         assert!(
             store
-                .check(&Check::new(&ordinary, subject(1)))
+                .check(&Check::new(subject(1).bind(&ordinary)))
                 .unwrap()
                 .permits_request()
         );
@@ -1318,8 +1371,8 @@ mod tests {
         clock.use_extreme_time();
         let overflowing = policy("api.overflowing", MAX_LIMIT, Duration::from_millis(1), 1);
         assert_eq!(
-            store.check(&Check::new(&overflowing, subject(2))),
-            Err(GcraStoreError::ArithmeticOverflow)
+            store.check(&Check::new(subject(2).bind(&overflowing))),
+            Err(GcraCheckError::ArithmeticOverflow)
         );
         assert_eq!(
             store.stats().unwrap().entries(),
@@ -1338,18 +1391,18 @@ mod tests {
     #[test]
     fn later_batch_overflow_supersedes_an_earlier_denial_without_effects() {
         let observer = Arc::new(RecordingObserver::default());
-        let store = GcraStore::with_clock(MemoryStoreConfig::new(2).unwrap(), MaximumClock)
+        let store = with_clock(MemoryStoreConfig::new(2).unwrap(), MaximumClock)
             .with_observer(observer.clone());
         let limited = policy("api.limited", 1, Duration::from_millis(1), 1);
-        let exhausted = Check::new(&limited, subject(1));
+        let exhausted = Check::new(subject(1).bind(&limited));
         assert!(store.check(&exhausted).unwrap().permits_request());
         observer.take();
 
         let overflowing = policy("api.overflowing", MAX_LIMIT, Duration::from_millis(1), 1);
-        let later = Check::new(&overflowing, subject(2));
+        let later = Check::new(subject(2).bind(&overflowing));
         assert_eq!(
             store.check_all(&[exhausted, later]),
-            Err(GcraStoreError::ArithmeticOverflow),
+            Err(GcraBatchError::ArithmeticOverflow),
             "a later arithmetic failure must supersede an earlier quota denial"
         );
         assert_eq!(
@@ -1367,11 +1420,50 @@ mod tests {
     }
 
     #[test]
+    fn empty_batches_fail_closed() {
+        let store = GcraStore::new(MemoryStoreConfig::new(1).unwrap());
+
+        assert_eq!(
+            store.check_all(&[]),
+            Err(GcraBatchError::Store(MemoryBatchError::InvalidBatch(
+                BatchError::EmptyBatch
+            )))
+        );
+    }
+
+    #[test]
+    fn poisoned_shards_fail_single_checks_with_the_bare_error() {
+        let store = GcraStore::new(MemoryStoreConfig::new(1).unwrap());
+        let policy = policy("api.poisoned", 1, Duration::from_secs(1), 1);
+        let check = Check::new(subject(1).bind(&policy));
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.shards.shard(0).lock().unwrap();
+            panic!("poison the only shard");
+        }));
+        assert!(panic_result.is_err());
+
+        assert_eq!(
+            store.check(&check),
+            Err(GcraCheckError::PoisonedShard(PoisonedShardError {
+                shard_index: 0
+            }))
+        );
+        assert_eq!(
+            store.check_all(&[check]),
+            Err(GcraBatchError::Store(MemoryBatchError::PoisonedShard(
+                PoisonedShardError { shard_index: 0 }
+            )))
+        );
+        assert_eq!(store.stats(), Err(PoisonedShardError { shard_index: 0 }));
+        assert_eq!(store.recover_poisoned(), 1);
+        assert!(store.check(&check).unwrap().permits_request());
+    }
+
+    #[test]
     fn generic_limiter_contract_selects_gcra_policy() {
         fn accepts_gcra_limiter<L: runlimit_core::Limiter<Policy = GcraPolicy>>(_limiter: &L) {}
 
-        let store =
-            GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
+        let store = with_clock(MemoryStoreConfig::new(1).unwrap(), ManualClock::default());
         accepts_gcra_limiter(&store);
     }
 }

@@ -1,21 +1,36 @@
 use std::{env, error::Error, time::Duration};
 
 use runlimit_core::{
-    AdmissionObservation, BatchDecisionView, Check, CleanupObservation, ConsumptionStatus,
-    DenialView, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
+    AdmissionObservation, AdmissionOperation, BatchDecisionView, Check, CleanupObservation,
+    CleanupOutcome, ConsumptionStatus, Denial, FixedWindowPolicy, KeyHasher, PolicyId, ScopeId,
 };
-use runlimit_memory::{GcraStoreError, MemoryStore, MemoryStoreConfig, MemoryStoreError};
+use runlimit_memory::{
+    GcraBatchError, GcraCheckError, MemoryBatchError, MemoryStore, MemoryStoreConfig,
+    PoisonedShardError,
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let gcra_error = GcraStoreError::from(MemoryStoreError::PoisonedShard { shard_index: 0 });
+    let gcra_error = GcraBatchError::from(MemoryBatchError::from(PoisonedShardError {
+        shard_index: 0,
+    }));
     assert!(matches!(
         gcra_error,
-        GcraStoreError::Store(MemoryStoreError::PoisonedShard { shard_index: 0 })
+        GcraBatchError::Store(MemoryBatchError::PoisonedShard(PoisonedShardError {
+            shard_index: 0
+        }))
     ));
+    for gcra_check_error in [
+        GcraCheckError::from(PoisonedShardError { shard_index: 0 }),
+        GcraCheckError::ArithmeticOverflow,
+    ] {
+        match gcra_check_error {
+            GcraCheckError::PoisonedShard(error) => assert_eq!(error.shard_index, 0),
+            GcraCheckError::ArithmeticOverflow => {}
+        }
+    }
 
-    let cleanup = CleanupObservation::outcome_unknown(100, Duration::from_millis(5));
-    assert_eq!(cleanup.removed(), None);
-    assert_eq!(cleanup.consumption(), ConsumptionStatus::PossiblyConsumed);
+    let cleanup = CleanupObservation::new(100, CleanupOutcome::Unknown, Duration::from_millis(5));
+    assert_eq!(cleanup.outcome(), CleanupOutcome::Unknown);
 
     let client_policy = FixedWindowPolicy::new(
         PolicyId::new("auth.login")?,
@@ -39,20 +54,19 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let config = MemoryStoreConfig::new(50_000)?.with_shard_count(64)?;
     let limiter = MemoryStore::new(config);
-    let checks = [
-        Check::new(&client_policy, client),
-        Check::new(&identity_policy, identity),
-    ];
-    let failed_batch = AdmissionObservation::failed_batch_for_check(
-        &checks[0],
+    let checks = [Check::new(client), Check::new(identity)];
+    let failed_batch = AdmissionObservation::failed_batch(
+        &checks[..1],
         ConsumptionStatus::NotConsumed,
         Duration::from_millis(5),
     );
-    assert_eq!(
-        failed_batch.policy_id().map(PolicyId::as_str),
-        Some("auth.login")
-    );
-    assert!(failed_batch.policy_fingerprint().is_some());
+    match failed_batch.operation() {
+        AdmissionOperation::Batch {
+            batch_size: 1,
+            policy: Some(policy),
+        } => assert_eq!(policy.id().as_str(), "auth.login"),
+        other => panic!("a one-check batch names its policy: {other:?}"),
+    }
 
     let decision = limiter.check_all(&checks)?;
     match decision.view() {
@@ -62,7 +76,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         BatchDecisionView::Denied {
             index,
-            denial: DenialView::QuotaExceeded(quota),
+            denial: Denial::QuotaExceeded(quota),
             ..
         } => {
             let seconds = quota.retry_after().seconds();
@@ -70,7 +84,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         BatchDecisionView::Denied {
             index,
-            denial: DenialView::StorageCapacity { .. },
+            denial: Denial::StorageCapacity { .. },
             ..
         } => println!("check {index} denied; backend storage is full"),
         BatchDecisionView::ShadowDenied { index, .. } => {

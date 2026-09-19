@@ -51,7 +51,9 @@ fn assert_lazy<L: Limiter>(limiter: &L, check: &Check<'_, L::Policy>, batch: boo
 }
 
 fn fixed_window(batch: bool) {
-    let store = MemoryStore::with_clock(MemoryStoreConfig::new(1).unwrap(), FrozenClock);
+    let store = MemoryStore::builder(MemoryStoreConfig::new(1).unwrap())
+        .with_clock(FrozenClock)
+        .build();
     let policy = FixedWindowPolicy::new(
         PolicyId::new("lazy").unwrap(),
         ScopeId::new("client").unwrap(),
@@ -61,13 +63,15 @@ fn fixed_window(batch: bool) {
     .unwrap();
     assert_lazy(
         &store,
-        &Check::new(&policy, SubjectKey::from_digest([1; 32])),
+        &Check::new(SubjectKey::from_digest([1; 32]).bind(&policy)),
         batch,
     );
 }
 
 fn gcra(batch: bool) {
-    let store = GcraStore::with_clock(MemoryStoreConfig::new(1).unwrap(), FrozenClock);
+    let store = GcraStore::builder(MemoryStoreConfig::new(1).unwrap())
+        .with_clock(FrozenClock)
+        .build();
     let policy = GcraPolicy::new(
         PolicyId::new("lazy").unwrap(),
         ScopeId::new("client").unwrap(),
@@ -78,7 +82,7 @@ fn gcra(batch: bool) {
     .unwrap();
     assert_lazy(
         &store,
-        &Check::new(&policy, SubjectKey::from_digest([1; 32])),
+        &Check::new(SubjectKey::from_digest([1; 32]).bind(&policy)),
         batch,
     );
 }
