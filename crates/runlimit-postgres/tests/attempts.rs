@@ -1,4 +1,7 @@
 //! Live transaction, concurrency, capacity, and fencing tests for attempts.
+#[path = "attempts/cleanup.rs"]
+mod cleanup;
+
 use runlimit_core::{
     KeyHasher, PolicyId, QuotaPeriod, ScopeId,
     attempts::{

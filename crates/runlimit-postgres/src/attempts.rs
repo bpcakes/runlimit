@@ -29,6 +29,7 @@ pub static ATTEMPTS_MIGRATOR: Migrator = sqlx::migrate!("./attempts-migrations")
 pub const CREATE_RUNLIMIT_ATTEMPTS_SQL: &str =
     include_str!("../attempts-migrations/20260921000001_create_runlimit_attempts.sql");
 const COMPLETE_SQL: &str = include_str!("attempt_complete.sql");
+const CLEANUP_SQL: &str = include_str!("attempt_cleanup.sql");
 const PHASE: CheckPhase = CheckPhase::AcquiringCounterRowLocks;
 // Stable protocol: a distinct two-integer namespace and 256 capacity shards.
 const LOCK_NAMESPACE: i32 = 0x524c_4154;
@@ -231,7 +232,8 @@ async fn admit_transaction(
             .bind(i32::from(shard)),
     )
     .await?;
-    tx.execute(PHASE, sqlx::query("DELETE FROM runlimit_attempts WHERE (config_fingerprint, subject_key) IN (SELECT config_fingerprint,subject_key FROM runlimit_attempts WHERE capacity_shard=$1 AND COALESCE(lease_until_ms,last_failure_ms)+quiet_ms <= floor(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::bigint ORDER BY COALESCE(lease_until_ms,last_failure_ms)+quiet_ms LIMIT 16 FOR UPDATE SKIP LOCKED)").bind(shard)).await?;
+    tx.execute(PHASE, sqlx::query(CLEANUP_SQL).bind(shard))
+        .await?;
     let rows = tx.fetch_all(PHASE, sqlx::query("SELECT failures,last_failure_ms,retry_at_ms,lease_until_ms FROM runlimit_attempts WHERE config_fingerprint=$1 AND subject_key=$2 FOR UPDATE").bind(fingerprint.as_slice()).bind(subject.as_slice())).await?;
     let time = tx.fetch_one(PHASE, sqlx::query("SELECT floor(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::bigint AS now_ms")).await?;
     let decode = |error| {
