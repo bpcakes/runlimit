@@ -118,7 +118,8 @@ dimensions, not raw subjects. No throughput or production readiness claim is mad
 - [x] Inspected baseline and agreed additive boundaries with Batter.
 - [x] T-01 implemented and validated (`runlimit-1u5.1`).
 - [x] T-02 implemented and validated (`runlimit-1u5.2`).
-- [ ] Full validation, native review and PR delivery.
+- [x] Full validation and clean native review through `ba58c12`.
+- [x] Delivery branch and PR [#9](https://github.com/bpcakes/runlimit/pull/9) opened.
 
 ## Surprises & Discoveries
 
@@ -164,6 +165,12 @@ bounded deletion. A forward-only index migration is included by the canonical
 migrator and tested as an upgrade from the original schema. Validation passed:
 17 attempt, 20 GCRA and 32 existing fixed-window live tests, workspace tests,
 Clippy, formatting and packaged-consumer smoke. The earlier findings did not recur.
+
+The fourth native review (`77890cd..ba58c12`) reported no findings and independently
+passed all 69 live PostgreSQL cases, workspace tests, formatting, Clippy and the
+packaged-consumer smoke. All six findings were fixed with regressions; none was
+rejected or escalated. Final tracker-only closure is reviewed over the same base.
+No merge, publication, production policy selection or consumer cutover is claimed.
 
 Storage reclamation is deliberately backend-specific: memory immediately removes
 a successful subject; PostgreSQL retains reset state until bounded quiet-period
