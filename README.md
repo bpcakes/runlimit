@@ -2,7 +2,7 @@
 
 Runlimit is a framework-neutral Rust library for keyed rate limiting. It
 provides anchored fixed windows in memory or across PostgreSQL-backed replicas,
-plus a hard-bounded process-local GCRA backend for continuously replenished
+plus hard-bounded memory and PostgreSQL GCRA backends for continuously replenished
 quotas.
 
 The 0.x API is intentionally pre-stable. Its application boundary is exercised
@@ -363,8 +363,46 @@ and full-replenishment durations round up to the next whole millisecond.
 Each key uses constant-size state, and it becomes eligible for bounded cleanup
 once its full burst capacity has replenished.
 
-`GcraStore` is process-local. `PostgresLimiter` supports fixed-window policies
-only.
+`GcraStore` is process-local. For shared continuously replenished quotas, use
+`runlimit_postgres::PostgresGcraLimiter`; `PostgresLimiter` keeps its existing
+fixed-window contract.
+
+### Durable GCRA
+
+`PostgresGcraLimiter::new(pool)` implements `Limiter<Policy = GcraPolicy>` and
+accepts the same policy-bound checks as `GcraStore`. Call its `migrate()` before
+serving traffic and schedule `cleanup_expired(maximum_rows)` to reclaim expired
+storage. Its separate `gcra-migrations` stream installs only GCRA tables;
+existing fixed-window consumers need no schema or workflow change. Strict host
+migrators may vendor `CREATE_RUNLIMIT_GCRA_SQL` instead. Shared SQLx migration
+histories require every participating migrator to ignore unrelated versions.
+
+The memory and PostgreSQL GCRA implementations share one pure, exact evaluator
+in `runlimit_core::gcra`. PostgreSQL supplies whole-millisecond time and retains
+a committed time watermark per shard, preventing backward clock adjustments
+from replenishing quota early. Delays are measured at evaluation time and may
+conservatively include later database/transport latency. Allowed batches commit
+every member together, preserve input order, and consume nothing on enforced or
+shadow denial. The existing `CheckError` and `BatchCheckError` distinguish
+definite non-consumption from uncertain commit; uncertain operations are never
+automatically replayed. Cancellation while committing is likewise uncertain.
+
+The independent GCRA v1 storage protocol has 256 shards, a database-enforced
+ceiling of 65,536 rows per shard, and configurable lower operational bounds via
+`PostgresConfig`. Admission locks affected ledger rows in ascending shard order
+before reading or writing counters, including absent keys. This deliberately
+serializes keys in the same shard. Cleanup follows the same order, skips busy
+shards, and deletes at most its requested bound. Active rows are never evicted;
+expired rows still occupy a slot until cleanup, but remain reusable for their
+existing key. The shard derivation and locking order are persistent protocol
+and cannot change in place during rolling deploys.
+
+Run the opt-in PostgreSQL GCRA suite with:
+
+```sh
+RUNLIMIT_POSTGRES_TEST_DATABASE_URL=postgresql://... \
+  cargo test -p runlimit-postgres --test gcra -- --ignored --test-threads=1
+```
 
 ## Shadow mode
 
@@ -494,6 +532,70 @@ their clock before the store exists with
 `GcraStore` builder. A built store cannot replace its clock because its stored
 timestamps belong to that clock's coordinate system. `with_observer` remains a
 store builder because attaching telemetry does not reinterpret quota state.
+
+## Outcome-aware authentication attempts
+
+`runlimit_core::attempts::AttemptPolicy` is separate from ordinary request quota
+policies. It admits at most one active attempt per opaque policy-bound subject.
+A failure or explicit abandonment increments consecutive failures and doubles
+the retry delay up to the configured cap. Full success resets retry state.
+Inactive failure state expires after the configured quiet period; application
+audit history is independent and is never deleted by Runlimit. Quiet expiry
+cannot erase an active lease, even when the lease exceeds the quiet period.
+
+Derive subjects with `KeyHasher::hash_attempt_for(&policy, normalized_subject)`.
+`MemoryAttemptLimiter` and `PostgresAttemptLimiter` return an opaque, consuming
+receipt on admission. Dropping it does not refund the attempt: its admission
+lease expires as a failure, evaluated at the lease deadline. A late success
+cannot reset a newer reservation. PostgreSQL samples its authoritative clock
+after locks; process-local storage clamps backwards clock readings. PostgreSQL
+uses server wall time, so a server clock correction can extend or shorten
+waiting periods; deploy with disciplined database time.
+
+The policy validates nonzero whole-millisecond initial delay, delay cap, quiet
+period, and admission lease. The cap must be at least the initial delay, and
+quiet expiry must be at least the cap. Failure counts saturate at `u32::MAX`;
+delay arithmetic saturates at the configured cap. Every parameter participates
+in the storage fingerprint. These are application-selected security parameters,
+not defaults chosen by the library.
+
+`runlimit_postgres::attempts::PostgresAttemptLimiter` installs only its own
+`ATTEMPTS_MIGRATOR` / `CREATE_RUNLIMIT_ATTEMPTS_SQL`. Existing fixed-window
+consumers need no new tables. PostgreSQL enforces 256 shards with at most 65,536
+slots each using a checked slot range and unique `(capacity_shard, capacity_slot)`.
+`PostgresConfig` may lower the operational bound (4,096 slots by default).
+Admission reclaims at most 16 expired rows in its shard, never live rows. Memory
+storage has an explicit total capacity and similarly bounded cleanup. Full
+storage fails closed; quotas and failure state are never evicted to admit a key.
+
+Standalone `complete` returns `AttemptCompletionResult` only after acknowledged
+commit. `CheckError` preserves uncertain-commit classification; never replay an
+uncertain admission or completion automatically. Dropping a pending future gives
+the caller no acknowledgement and can race with commit. Existing ordinary quota
+admission remains non-refundable.
+
+For session/audit atomicity, an application transaction owner such as Batter
+uses the explicitly low-level PostgreSQL seam:
+
+1. `claim_in(executor, receipt)` locks and validates the live reservation.
+2. Run authoritative application checks and writes in that transaction.
+3. `finish_in(executor, claim, final_outcome)` stages success or failure.
+4. Commit, then publish the result. Roll back on `Stale`, errors, or cancellation.
+
+A claim is fenced to the exact PostgreSQL transaction ID as well as the opaque
+receipt token. After a valid claim, time elapsed during application work does
+not expire its held row lock. Using the claim in a different transaction returns
+`Stale`. No transaction remains open during expensive credential verification.
+The low-level API cannot own commit acknowledgement; its distinct
+`StagedAttemptCompletion` is provisional. A direct `complete_in` operation is
+also available for owners whose outcome is already final. An autocommit executor
+must not be used for application atomicity.
+
+Attempt observations use their own enum and panic-isolated observer. Standalone
+owners report admitted, denied, completed, stale, and uncertain-commit outcomes;
+low-level staging deliberately emits no committed event. The host transaction
+owner is responsible for reporting its final disposition. Observations never
+include raw subjects or lease tokens.
 
 ## PostgreSQL backend
 

@@ -18,6 +18,7 @@
 //! loading, read-only [`MemoryStoreStats`] serialization, and the corresponding
 //! `runlimit-core` metadata feature.
 
+pub mod attempts;
 mod clock;
 mod config;
 mod gcra;

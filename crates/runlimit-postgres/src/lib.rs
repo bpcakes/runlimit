@@ -1,4 +1,7 @@
-//! Replica-safe `PostgreSQL` storage for Runlimit fixed-window policies.
+//! Replica-safe `PostgreSQL` storage for Runlimit quotas and outcome-aware attempts.
+//! [`PostgresGcraLimiter`] and [`attempts::PostgresAttemptLimiter`] each use
+//! independently opt-in migrations; existing fixed-window consumers need no
+//! new schema or workflow changes.
 //!
 //! [`PostgresLimiter`] implements the same anchored fixed-window model as the
 //! in-memory backend: the first admitted check starts a window, and subsequent
@@ -120,6 +123,9 @@ impl<T> ConnectionOutcome<T> {
 }
 
 mod admission;
+pub mod attempts;
+mod gcra;
+pub use gcra::{CREATE_RUNLIMIT_GCRA_SQL, GCRA_MIGRATOR, PostgresGcraLimiter};
 mod config;
 mod errors;
 mod maintenance;

@@ -124,7 +124,7 @@ jobs:
         run: >-
           cargo +stable test
           -p runlimit-postgres
-          --test postgres
+          --tests
           --locked
           --
           --ignored
@@ -133,7 +133,7 @@ jobs:
         run: >-
           cargo +stable test
           -p runlimit-postgres
-          --test postgres
+          --tests
           --all-features
           --locked
           --

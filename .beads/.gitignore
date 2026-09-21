@@ -1,4 +1,5 @@
 # Database
+*.fsqlite-migration-state
 *.db
 *.db-journal
 *.db-shm
