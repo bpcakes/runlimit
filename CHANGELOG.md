@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+### Repository location
+
+- Ongoing development has moved to the native `runlimit/` packages in
+  [Batter](https://github.com/bpcakes/batter/tree/master/runlimit). See
+  [Moving to Batter](MOVED_TO_BATTER.md) for dependency and contribution guidance.
+  This is a source-repository move, not a new crates.io release.
+
 ### Changed
 
 - **Breaking:** `permits_request()` is the only boolean admission predicate.
