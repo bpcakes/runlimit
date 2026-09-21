@@ -103,6 +103,28 @@ impl Database {
             .await
             .unwrap()
     }
+
+    async fn seed_historical_counter(&self, policy: &GcraPolicy) {
+        sqlx::query("INSERT INTO runlimit_gcra(config_fingerprint, subject_key, tat_scaled, expires_at_ms) VALUES ($1, $2, 2000, 2000)")
+            .bind(policy.fingerprint().as_bytes().as_slice())
+            .bind(subject(1, 0, policy).as_bytes().as_slice())
+            .execute(&self.pool).await.unwrap();
+        sqlx::query(
+            "UPDATE runlimit_gcra_shards SET observed_at_ms = 1000 WHERE capacity_shard = 0",
+        )
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn watermark(&self) -> i64 {
+        sqlx::query_scalar(
+            "SELECT observed_at_ms FROM runlimit_gcra_shards WHERE capacity_shard = 0",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
 }
 
 fn policy(quota: u64, millis: u64, burst: u64) -> GcraPolicy {
@@ -425,6 +447,78 @@ async fn committed_database_clock_watermark_survives_clock_regression() {
     .await
     .unwrap();
     assert_eq!(u64::try_from(observed).unwrap(), now);
+    db.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn cleanup_preserves_its_clock_observation_after_forgetting_quota_state() {
+    let db = Database::new().await;
+    let policy = policy(1, 1000, 1);
+    db.seed_historical_counter(&policy).await;
+    let before_cleanup: i64 = sqlx::query_scalar(
+        "SELECT floor(extract(epoch FROM pg_catalog.clock_timestamp()) * 1000)::BIGINT",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let limiter = db.limiter();
+    assert_eq!(limiter.cleanup_expired(1).await.unwrap(), 1);
+    assert_eq!(db.row_count().await, 0);
+    let observed = db.watermark().await;
+    assert!(
+        observed >= before_cleanup,
+        "deleting the last counter must retain cleanup's time, not its old admission time"
+    );
+    let check = Check::new(subject(1, 0, &policy).bind(&policy));
+    assert!(limiter.check(&check).await.unwrap().permits_request());
+    let expiry: i64 = sqlx::query_scalar("SELECT expires_at_ms FROM runlimit_gcra")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        expiry >= observed + 1000,
+        "a recreated counter starts from at least cleanup's logical time"
+    );
+    assert!(!limiter.check(&check).await.unwrap().permits_request());
+    db.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn cleanup_clamps_regressing_clock_and_recreated_counter_cannot_refill_twice() {
+    let db = Database::new().await;
+    let policy = policy(1, 1000, 1);
+    db.seed_historical_counter(&policy).await;
+    // Retain a future observation while the actual PostgreSQL clock is behind
+    // it. This models a backward clock adjustment without changing server time.
+    let logical_time = db.freeze_time().await;
+    let limiter = db.limiter();
+    assert_eq!(limiter.cleanup_expired(1).await.unwrap(), 1);
+    assert_eq!(u64::try_from(db.watermark().await).unwrap(), logical_time);
+    let check = Check::new(subject(1, 0, &policy).bind(&policy));
+    assert!(limiter.check(&check).await.unwrap().permits_request());
+    let expiry: i64 = sqlx::query_scalar("SELECT expires_at_ms FROM runlimit_gcra")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(u64::try_from(expiry).unwrap(), logical_time + 1000);
+    assert!(!limiter.check(&check).await.unwrap().permits_request());
+    db.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn failed_cleanup_rolls_back_watermark_and_counter_deletion_together() {
+    let db = Database::new().await;
+    let policy = policy(1, 1000, 1);
+    db.seed_historical_counter(&policy).await;
+    sqlx::raw_sql("CREATE FUNCTION fail_gcra_delete() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected cleanup failure'; END $$; CREATE TRIGGER fail_delete BEFORE DELETE ON runlimit_gcra FOR EACH ROW EXECUTE FUNCTION fail_gcra_delete();")
+        .execute(&db.pool).await.unwrap();
+    let error = db.limiter().cleanup_expired(1).await.unwrap_err();
+    assert!(!error.may_have_removed_rows());
+    assert_eq!(db.row_count().await, 1);
+    assert_eq!(db.watermark().await, 1000);
     db.teardown().await;
 }
 

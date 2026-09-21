@@ -141,6 +141,14 @@ Default-feature live coverage also passed before the final two attempt regressio
 cases were added; all-feature live coverage includes all nine. Memory attempts
 passed seven deterministic cases. Native review and PR delivery remain pending.
 
+The first native review found three implementation defects: cleanup did not
+advance the GCRA monotonic clock, lowered attempt capacity did not count retained
+high slots, and malformed attempt responses lost storage-invariant classification.
+All three received root-cause fixes and regressions. Post-fix validation passed
+formatting, workspace tests, all-target/all-feature Clippy, and 15 attempt,
+17 GCRA and 32 original fixed-window live cases. Full original-range re-review
+and PR delivery remain pending.
+
 Storage reclamation is deliberately backend-specific: memory immediately removes
 a successful subject; PostgreSQL retains reset state until bounded quiet-period
 cleanup. Both permit an immediate next attempt for that subject and preserve

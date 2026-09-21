@@ -63,9 +63,19 @@ WITH sample AS MATERIALIZED (
 SELECT capacity.capacity_shard FROM runlimit_gcra_shards AS capacity
 WHERE capacity.capacity_shard IN (SELECT capacity_shard FROM candidates)
 ORDER BY capacity.capacity_shard FOR UPDATE OF capacity SKIP LOCKED";
-const CLEANUP_DELETE: &str = r"
+const CLEANUP_ADVANCE_TIME: &str = r"
 WITH sample AS MATERIALIZED (
     SELECT floor(extract(epoch FROM pg_catalog.clock_timestamp()) * 1000)::BIGINT AS now_ms
+), clamped AS MATERIALIZED (
+    SELECT greatest((SELECT now_ms FROM sample), coalesce(max(observed_at_ms), 0)) AS now_ms
+    FROM runlimit_gcra_shards WHERE capacity_shard = ANY($1)
+)
+UPDATE runlimit_gcra_shards SET observed_at_ms = (SELECT now_ms FROM clamped)
+WHERE capacity_shard = ANY($1)";
+const CLEANUP_DELETE: &str = r"
+WITH sample AS MATERIALIZED (
+    SELECT max(observed_at_ms) AS now_ms FROM runlimit_gcra_shards
+    WHERE capacity_shard = ANY($1)
 ), expired AS MATERIALIZED (
     SELECT config_fingerprint, subject_key FROM runlimit_gcra
     WHERE capacity_shard = ANY($1) AND expires_at_ms <= (SELECT now_ms FROM sample)
@@ -536,6 +546,25 @@ async fn cleanup_transaction(
         .map(|row| row.try_get::<i16, _>("capacity_shard"))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| ConnectionOutcome::Reusable(MaintenanceError::Database(error)))?;
+    set_maintenance_server_timeouts(
+        &mut transaction,
+        deadline,
+        CleanupPhase::ConfiguringTimeouts,
+    )
+    .await?;
+    // Cleanup forgets theoretical arrival times, so its clock observation must
+    // survive the deleted rows. Keep that observation monotonic under the same
+    // shard locks as admission, and persist it in the deletion transaction.
+    // Use a separate statement: the deletion triggers also update ledger rows,
+    // and PostgreSQL does not support updating a row twice in one command.
+    maintenance_before_commit(
+        deadline,
+        CleanupPhase::DeletingExpiredWindows,
+        sqlx::query(CLEANUP_ADVANCE_TIME)
+            .bind(&shards)
+            .execute(&mut *transaction),
+    )
+    .await?;
     set_maintenance_server_timeouts(
         &mut transaction,
         deadline,

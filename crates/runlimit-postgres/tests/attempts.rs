@@ -426,3 +426,306 @@ async fn cancelled_host_transaction_does_not_reset_retry_state() {
     ));
     db.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn lowered_capacity_counts_live_slots_outside_the_new_allocation_interval() {
+    let db = Database::new().await;
+    let broad = PostgresAttemptLimiter::new(db.pool.clone()).with_config(
+        PostgresConfig::new()
+            .with_maximum_rows_per_shard(2)
+            .unwrap(),
+    );
+    let narrow = PostgresAttemptLimiter::new(db.pool.clone()).with_config(
+        PostgresConfig::new()
+            .with_maximum_rows_per_shard(1)
+            .unwrap(),
+    );
+    let p = policy();
+    let h = KeyHasher::new([7; 32]).unwrap();
+    let first = h.hash_attempt_for(&p, b"first");
+    let shard = first.into_unbound_subject_key().as_bytes()[0];
+    let others: Vec<String> = (0..10000)
+        .map(|value| value.to_string())
+        .filter(|value| {
+            h.hash_attempt_for(&p, value)
+                .into_unbound_subject_key()
+                .as_bytes()[0]
+                == shard
+        })
+        .take(2)
+        .collect();
+    drop(receipt(broad.admit(first).await.unwrap()));
+    let live = receipt(
+        broad
+            .admit(h.hash_attempt_for(&p, &others[0]))
+            .await
+            .unwrap(),
+    );
+    sqlx::query("UPDATE runlimit_attempts SET lease_until_ms=0 WHERE capacity_slot=0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // Bounded cleanup finds slot 0, but slot 1 is still live. With a new cap of
+    // one, that retained row consumes the entire capacity even outside 0..1.
+    assert!(matches!(
+        narrow
+            .admit(h.hash_attempt_for(&p, &others[1]))
+            .await
+            .unwrap(),
+        AttemptAdmission::Denied(AttemptDenial::StorageCapacity)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM runlimit_attempts WHERE lease_until_ms>0"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT capacity_slot::bigint FROM runlimit_attempts WHERE lease_until_ms>0"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(matches!(
+        narrow
+            .complete(live, AttemptOutcome::Success)
+            .await
+            .unwrap(),
+        AttemptCompletionResult::Applied(_)
+    ));
+    // Once all retained state is quiet-expired, the lower bound admits a row.
+    sqlx::query("UPDATE runlimit_attempts SET last_failure_ms=0,lease_until_ms=CASE WHEN lease_until_ms IS NULL THEN NULL ELSE 0 END").execute(&db.pool).await.unwrap();
+    drop(receipt(
+        narrow
+            .admit(h.hash_attempt_for(&p, &others[1]))
+            .await
+            .unwrap(),
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runlimit_attempts")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn malformed_admission_state_is_a_semantic_storage_invariant() {
+    let db = Database::new().await;
+    let limiter = PostgresAttemptLimiter::new(db.pool.clone());
+    let p = policy();
+    let h = KeyHasher::new([7; 32]).unwrap();
+    let s = h.hash_attempt_for(&p, b"user");
+    drop(receipt(limiter.admit(s).await.unwrap()));
+    sqlx::raw_sql("ALTER TABLE runlimit_attempts DROP CONSTRAINT runlimit_attempts_failures_check; UPDATE runlimit_attempts SET failures=-1;").execute(&db.pool).await.unwrap();
+    let error = limiter.admit(s).await.unwrap_err();
+    assert_eq!(
+        error.consumption(),
+        runlimit_core::ConsumptionStatus::NotConsumed
+    );
+    let runlimit_postgres::CheckError::StorageInvariant(error) = error else {
+        panic!("expected storage invariant")
+    };
+    assert_eq!(error.detail(), "invalid attempt failure count");
+    assert!(std::error::Error::source(&error).is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT failures FROM runlimit_attempts")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        -1
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn malformed_admission_receipt_is_a_decode_storage_invariant_and_rolls_back() {
+    let db = Database::new().await;
+    let limiter = PostgresAttemptLimiter::new(db.pool.clone());
+    let p = policy();
+    let h = KeyHasher::new([7; 32]).unwrap();
+    sqlx::raw_sql("CREATE FUNCTION corrupt_attempt_receipt() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN NEW.lease_token=NULL; NEW.lease_until_ms=NULL; RETURN NEW; END $$; CREATE TRIGGER corrupt_attempt_receipt BEFORE INSERT ON runlimit_attempts FOR EACH ROW EXECUTE FUNCTION corrupt_attempt_receipt();").execute(&db.pool).await.unwrap();
+    let error = limiter
+        .admit(h.hash_attempt_for(&p, b"user"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.consumption(),
+        runlimit_core::ConsumptionStatus::NotConsumed
+    );
+    let runlimit_postgres::CheckError::StorageInvariant(error) = error else {
+        panic!("expected storage invariant")
+    };
+    assert_eq!(error.detail(), "decode attempt admission response");
+    assert!(
+        std::error::Error::source(&error)
+            .is_some_and(|source| source.downcast_ref::<sqlx::Error>().is_some())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runlimit_attempts")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn contradictory_completion_metadata_is_storage_invariant_and_rolls_back() {
+    let db = Database::new().await;
+    let limiter = PostgresAttemptLimiter::new(db.pool.clone());
+    let p = policy();
+    let h = KeyHasher::new([7; 32]).unwrap();
+    let s = h.hash_attempt_for(&p, b"user");
+    let r = receipt(limiter.admit(s).await.unwrap());
+    sqlx::raw_sql("CREATE FUNCTION corrupt_attempt_completion() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN NEW.failures=1; RETURN NEW; END $$; CREATE TRIGGER corrupt_attempt_completion BEFORE UPDATE ON runlimit_attempts FOR EACH ROW EXECUTE FUNCTION corrupt_attempt_completion();").execute(&db.pool).await.unwrap();
+    let error = limiter
+        .complete(r, AttemptOutcome::Success)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.consumption(),
+        runlimit_core::ConsumptionStatus::NotConsumed
+    );
+    let runlimit_postgres::CheckError::StorageInvariant(error) = error else {
+        panic!("expected storage invariant")
+    };
+    assert_eq!(
+        error.detail(),
+        "attempt completion metadata contradicts its outcome"
+    );
+    assert!(std::error::Error::source(&error).is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT failures FROM runlimit_attempts")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(matches!(
+        limiter.admit(s).await.unwrap(),
+        AttemptAdmission::Denied(AttemptDenial::Busy { .. })
+    ));
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn malformed_completion_response_retains_decode_source_and_rolls_back() {
+    let db = Database::new().await;
+    let limiter = PostgresAttemptLimiter::new(db.pool.clone());
+    let p = policy();
+    let h = KeyHasher::new([7; 32]).unwrap();
+    let s = h.hash_attempt_for(&p, b"user");
+    let r = receipt(limiter.admit(s).await.unwrap());
+    sqlx::raw_sql("ALTER TABLE runlimit_attempts ALTER COLUMN failures DROP NOT NULL; CREATE FUNCTION null_attempt_completion() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN NEW.failures=NULL; RETURN NEW; END $$; CREATE TRIGGER null_attempt_completion BEFORE UPDATE ON runlimit_attempts FOR EACH ROW EXECUTE FUNCTION null_attempt_completion();").execute(&db.pool).await.unwrap();
+    let error = limiter
+        .complete(r, AttemptOutcome::Success)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.consumption(),
+        runlimit_core::ConsumptionStatus::NotConsumed
+    );
+    let runlimit_postgres::CheckError::StorageInvariant(error) = error else {
+        panic!("expected storage invariant")
+    };
+    assert_eq!(error.detail(), "decode attempt completion response");
+    assert!(
+        std::error::Error::source(&error)
+            .is_some_and(|source| source.downcast_ref::<sqlx::Error>().is_some())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT failures FROM runlimit_attempts")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(matches!(
+        limiter.admit(s).await.unwrap(),
+        AttemptAdmission::Denied(AttemptDenial::Busy { .. })
+    ));
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn lowered_capacity_reclaims_expired_rows_across_denied_cleanup_batches() {
+    let db = Database::new().await;
+    let broad = PostgresAttemptLimiter::new(db.pool.clone());
+    let narrow = PostgresAttemptLimiter::new(db.pool.clone()).with_config(
+        PostgresConfig::new()
+            .with_maximum_rows_per_shard(1)
+            .unwrap(),
+    );
+    let p = policy();
+    let h = KeyHasher::new([7; 32]).unwrap();
+    let first = h.hash_attempt_for(&p, b"seed");
+    let shard = first.into_unbound_subject_key().as_bytes()[0];
+    let subjects: Vec<String> = (0..100_000)
+        .map(|value| value.to_string())
+        .filter(|value| {
+            h.hash_attempt_for(&p, value)
+                .into_unbound_subject_key()
+                .as_bytes()[0]
+                == shard
+        })
+        .take(34)
+        .collect();
+    assert_eq!(subjects.len(), 34);
+    for subject in &subjects[..33] {
+        drop(receipt(
+            broad.admit(h.hash_attempt_for(&p, subject)).await.unwrap(),
+        ));
+    }
+    sqlx::query("UPDATE runlimit_attempts SET lease_until_ms=0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let fresh = h.hash_attempt_for(&p, &subjects[33]);
+    assert!(matches!(
+        narrow.admit(fresh).await.unwrap(),
+        AttemptAdmission::Denied(AttemptDenial::StorageCapacity)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runlimit_attempts")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        17
+    );
+    assert!(matches!(
+        narrow.admit(fresh).await.unwrap(),
+        AttemptAdmission::Denied(AttemptDenial::StorageCapacity)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runlimit_attempts")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    drop(receipt(narrow.admit(fresh).await.unwrap()));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runlimit_attempts")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    db.close().await;
+}

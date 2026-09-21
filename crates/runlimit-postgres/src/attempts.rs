@@ -121,6 +121,11 @@ impl PostgresAttemptLimiter {
     /// Admits one bounded verification lease, using database time after locks.
     /// An unpolled future performs no work. Dropping a receipt leaves its lease
     /// to expire as a failure; it never refunds or resets the subject.
+    /// A capacity denial may still commit cleanup of at most 16 already-expired
+    /// rows, allowing repeated calls to converge after an operational cap is
+    /// lowered. It creates no reservation or failure transition. That denial
+    /// remains authoritative even when cleanup's commit acknowledgement is lost;
+    /// the uncertain connection is retired and a later call can repeat cleanup.
     ///
     /// # Errors
     /// [`CheckError`] distinguishes no committed effect from uncertain commit.
@@ -178,9 +183,7 @@ impl PostgresAttemptLimiter {
             let rows = transaction
                 .fetch_all(PHASE, completion_query(&receipt, outcome, None))
                 .await?;
-            let result = completion_result(&rows, outcome).map_err(|error| {
-                ConnectionOutcome::Reusable(CheckError::DefinitelyNotConsumed(error))
-            })?;
+            let result = completion_result(&rows, outcome).map_err(ConnectionOutcome::Reusable)?;
             transaction.commit().await?;
             Ok::<_, ConnectionOutcome<CheckError>>(match result {
                 StagedAttemptCompletion::Applied(done) => AttemptCompletionResult::Applied(done),
@@ -229,15 +232,20 @@ async fn admit_transaction(
     tx.execute(PHASE, sqlx::query("DELETE FROM runlimit_attempts WHERE (config_fingerprint, subject_key) IN (SELECT config_fingerprint,subject_key FROM runlimit_attempts WHERE capacity_shard=$1 AND COALESCE(lease_until_ms,last_failure_ms)+quiet_ms <= floor(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::bigint ORDER BY COALESCE(lease_until_ms,last_failure_ms)+quiet_ms LIMIT 16 FOR UPDATE SKIP LOCKED)").bind(shard)).await?;
     let rows = tx.fetch_all(PHASE, sqlx::query("SELECT failures,last_failure_ms,retry_at_ms,lease_until_ms FROM runlimit_attempts WHERE config_fingerprint=$1 AND subject_key=$2 FOR UPDATE").bind(fingerprint.as_slice()).bind(subject.as_slice())).await?;
     let time = tx.fetch_one(PHASE, sqlx::query("SELECT floor(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::bigint AS now_ms")).await?;
-    let decode = |error| ConnectionOutcome::Reusable(CheckError::DefinitelyNotConsumed(error));
+    let decode = |error| {
+        ConnectionOutcome::Reusable(CheckError::storage_decode_invariant(
+            "decode attempt admission response",
+            error,
+        ))
+    };
     let now: i64 = time.try_get("now_ms").map_err(decode)?;
     let mut failures = 0_u32;
     let mut last_failure = now;
     if let Some(row) = rows.first() {
         failures =
             u32::try_from(row.try_get::<i64, _>("failures").map_err(decode)?).map_err(|_| {
-                decode(sqlx::Error::Protocol(
-                    "invalid attempt failure count".into(),
+                ConnectionOutcome::Reusable(CheckError::storage_invariant(
+                    "invalid attempt failure count",
                 ))
             })?;
         last_failure = row.try_get("last_failure_ms").map_err(decode)?;
@@ -272,9 +280,25 @@ async fn admit_transaction(
         }
     }
     let token_row = if rows.is_empty() {
+        // A lower runtime bound counts every retained row, including slots
+        // allocated by replicas using a higher bound. A hole in the new slot
+        // interval is not proof that total shard occupancy is below the cap.
+        let occupancy = tx
+            .fetch_one(
+                PHASE,
+                sqlx::query(
+                    "SELECT count(*) AS row_count FROM runlimit_attempts WHERE capacity_shard=$1",
+                )
+                .bind(shard),
+            )
+            .await?;
+        let row_count: i64 = occupancy.try_get("row_count").map_err(decode)?;
+        if row_count >= i64::from(maximum) {
+            return Ok(finish_capacity_denial(tx).await);
+        }
         let slot = tx.fetch_one(PHASE, sqlx::query("SELECT min(slot)::integer AS slot FROM generate_series(0, $2::integer-1) AS slot WHERE NOT EXISTS (SELECT 1 FROM runlimit_attempts WHERE capacity_shard=$1 AND capacity_slot=slot)").bind(shard).bind(i64::from(maximum))).await?;
         let Some(slot) = slot.try_get::<Option<i32>, _>("slot").map_err(decode)? else {
-            return finish_denial(tx, AttemptDenial::StorageCapacity).await;
+            return Ok(finish_capacity_denial(tx).await);
         };
         tx.fetch_one(PHASE, sqlx::query("INSERT INTO runlimit_attempts (config_fingerprint,subject_key,capacity_slot,failures,last_failure_ms,retry_at_ms,quiet_ms,lease_until_ms,lease_token) VALUES ($1,$2,$3,0,$4,$4,$5,$6,pg_catalog.gen_random_uuid()::text) RETURNING lease_token").bind(fingerprint.as_slice()).bind(subject.as_slice()).bind(slot).bind(now).bind(integer(policy.quiet_period().millis())).bind(now.saturating_add(integer(policy.lease().millis())))).await?
     } else {
@@ -298,6 +322,19 @@ async fn finish_denial(
     // A successful rollback restores cleanup too. A rollback failure must close
     // the connection before reporting the otherwise valid denial.
     Ok(tx.deny(AttemptAdmission::Denied(denial)).await)
+}
+async fn finish_capacity_denial(
+    tx: CheckTransaction<'_>,
+) -> ConnectionOutcome<AttemptAdmission<PgAttemptReceipt>> {
+    // No reservation was inserted. Preserve bounded expired-row cleanup even
+    // when a lowered cap still denies this call; otherwise rolling back every
+    // batch can make an over-cap shard permanently unreclaimable. The admission
+    // denial remains certain even if cleanup's commit acknowledgement is lost.
+    let denial = AttemptAdmission::Denied(AttemptDenial::StorageCapacity);
+    match tx.commit().await {
+        Ok(()) => ConnectionOutcome::Reusable(denial),
+        Err(outcome) => outcome.map(|_| denial),
+    }
 }
 fn integer(value: u64) -> i64 {
     i64::try_from(value).expect("validated policy duration fits i64")
@@ -325,19 +362,23 @@ fn completion_query<'a>(
 fn completion_result(
     rows: &[PgRow],
     outcome: AttemptOutcome,
-) -> Result<StagedAttemptCompletion, sqlx::Error> {
+) -> Result<StagedAttemptCompletion, CheckError> {
     let Some(row) = rows.first() else {
         return Ok(StagedAttemptCompletion::Stale);
     };
-    let failures = u32::try_from(row.try_get::<i64, _>("failures")?)
-        .map_err(|_| sqlx::Error::Protocol("invalid attempt failure count".into()))?;
-    let retry: i64 = row.try_get("delay_ms")?;
+    let decode =
+        |error| CheckError::storage_decode_invariant("decode attempt completion response", error);
+    let failures = u32::try_from(row.try_get::<i64, _>("failures").map_err(decode)?)
+        .map_err(|_| CheckError::storage_invariant("invalid attempt failure count"))?;
+    let retry: i64 = row.try_get("delay_ms").map_err(decode)?;
     if retry < 0 {
-        return Err(sqlx::Error::Protocol("invalid attempt delay".into()));
+        return Err(CheckError::storage_invariant("invalid attempt delay"));
     }
     AttemptCompletion::new(outcome, failures, delay(retry))
         .map(StagedAttemptCompletion::Applied)
-        .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+        .map_err(|_| {
+            CheckError::storage_invariant("attempt completion metadata contradicts its outcome")
+        })
 }
 
 /// Explicit integration seam for a transaction owner such as Batter.
@@ -369,7 +410,12 @@ pub mod low_level {
         match row {
             Some(row) => Ok(PgAttemptClaimResult::Claimed(PgAttemptClaim {
                 receipt,
-                transaction_id: row.try_get("transaction_id")?,
+                transaction_id: row.try_get("transaction_id").map_err(|error| {
+                    sqlx::Error::Decode(Box::new(crate::CheckError::storage_decode_invariant(
+                        "decode attempt claim response",
+                        error,
+                    )))
+                })?,
             })),
             None => Ok(PgAttemptClaimResult::Stale),
         }
@@ -389,7 +435,7 @@ pub mod low_level {
         let rows = completion_query(&claim.receipt, outcome, Some(&claim.transaction_id))
             .fetch_all(executor)
             .await?;
-        completion_result(&rows, outcome)
+        completion_result(&rows, outcome).map_err(|error| sqlx::Error::Decode(Box::new(error)))
     }
     /// Stages one fenced completion in a caller-owned transaction, in one SQL statement.
     ///
@@ -404,6 +450,6 @@ pub mod low_level {
         let rows = completion_query(&receipt, outcome, None)
             .fetch_all(executor)
             .await?;
-        completion_result(&rows, outcome)
+        completion_result(&rows, outcome).map_err(|error| sqlx::Error::Decode(Box::new(error)))
     }
 }
