@@ -125,7 +125,10 @@ impl<T> ConnectionOutcome<T> {
 mod admission;
 pub mod attempts;
 mod gcra;
-pub use gcra::{CREATE_RUNLIMIT_GCRA_SQL, GCRA_MIGRATOR, PostgresGcraLimiter};
+pub use gcra::{
+    CREATE_RUNLIMIT_GCRA_SQL, GCRA_MIGRATOR, INDEX_RUNLIMIT_GCRA_SHARD_EXPIRY_SQL,
+    PostgresGcraLimiter,
+};
 mod config;
 mod errors;
 mod maintenance;

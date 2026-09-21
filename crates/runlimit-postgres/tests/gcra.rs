@@ -15,7 +15,8 @@ use runlimit_core::{
 };
 use runlimit_memory::{Clock, GcraStore, MemoryStoreConfig};
 use runlimit_postgres::{
-    BatchCheckError, CheckError, GCRA_MIGRATOR, MIGRATOR, PostgresConfig, PostgresGcraLimiter,
+    BatchCheckError, CREATE_RUNLIMIT_GCRA_SQL, CheckError, GCRA_MIGRATOR,
+    INDEX_RUNLIMIT_GCRA_SHARD_EXPIRY_SQL, MIGRATOR, PostgresConfig, PostgresGcraLimiter,
 };
 use sqlx::{AssertSqlSafe, PgPool, postgres::PgPoolOptions};
 use tokio::sync::Barrier;
@@ -30,6 +31,12 @@ struct Database {
 
 impl Database {
     async fn new() -> Self {
+        let db = Self::unmigrated().await;
+        db.limiter().migrate().await.unwrap();
+        db
+    }
+
+    async fn unmigrated() -> Self {
         let url = std::env::var("RUNLIMIT_POSTGRES_TEST_DATABASE_URL")
             .expect("disposable PostgreSQL URL required");
         let admin = PgPoolOptions::new()
@@ -63,10 +70,6 @@ impl Database {
                 })
             })
             .connect(&url)
-            .await
-            .unwrap();
-        PostgresGcraLimiter::new(pool.clone())
-            .migrate()
             .await
             .unwrap();
         Self {
@@ -168,7 +171,14 @@ impl Observer for Recorder {
 #[test]
 fn migration_streams_are_independent_and_trait_remains_generic() {
     fn accepts<L: Limiter<Policy = GcraPolicy>>() {}
-    assert_eq!(GCRA_MIGRATOR.iter().count(), 1);
+    let migrations: Vec<_> = GCRA_MIGRATOR.iter().collect();
+    assert_eq!(migrations.len(), 2);
+    assert_eq!(migrations[0].sql.as_ref(), CREATE_RUNLIMIT_GCRA_SQL);
+    assert_eq!(
+        migrations[1].sql.as_ref(),
+        INDEX_RUNLIMIT_GCRA_SHARD_EXPIRY_SQL
+    );
+    assert!(migrations[0].version < migrations[1].version);
     assert!(
         MIGRATOR
             .iter()
@@ -215,6 +225,43 @@ async fn installation_is_opt_in_and_preserves_unrelated_migrations() {
         .await
         .unwrap();
     db.limiter().migrate().await.unwrap();
+    db.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn canonical_migration_upgrades_original_gcra_storage_without_rewriting_it() {
+    let db = Database::unmigrated().await;
+    let original = GCRA_MIGRATOR.iter().next().unwrap().clone();
+    sqlx::migrate::Migrator::with_migrations(vec![original])
+        .run(&db.pool)
+        .await
+        .unwrap();
+    let policy = policy(1, 1000, 1);
+    db.seed_historical_counter(&policy).await;
+    let index_absent: bool =
+        sqlx::query_scalar("SELECT to_regclass('runlimit_gcra_shard_expiry') IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(index_absent);
+
+    db.limiter().migrate().await.unwrap();
+    db.limiter().migrate().await.unwrap();
+    let index_definition: String =
+        sqlx::query_scalar("SELECT pg_get_indexdef('runlimit_gcra_shard_expiry'::REGCLASS)")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(index_definition.contains("(capacity_shard, expires_at_ms)"));
+    let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(applied, 2);
+    assert_eq!(db.row_count().await, 1);
+    assert_eq!(db.watermark().await, 1000);
+    assert_eq!(db.limiter().cleanup_expired(1).await.unwrap(), 1);
     db.teardown().await;
 }
 
@@ -504,6 +551,105 @@ async fn cleanup_clamps_regressing_clock_and_recreated_counter_cannot_refill_twi
         .unwrap();
     assert_eq!(u64::try_from(expiry).unwrap(), logical_time + 1000);
     assert!(!limiter.check(&check).await.unwrap().permits_request());
+    db.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn cleanup_reclaims_full_shard_at_logical_expiry_while_wall_clock_is_behind() {
+    let db = Database::new().await;
+    let start = db.freeze_time().await;
+    let policy = policy(1, 1000, 1);
+    let limiter = db.limiter().with_config(
+        PostgresConfig::new()
+            .with_maximum_rows_per_shard(1)
+            .unwrap(),
+    );
+    let old = Check::new(subject(1, 0, &policy).bind(&policy));
+    let fresh = Check::new(subject(2, 0, &policy).bind(&policy));
+    assert!(limiter.check(&old).await.unwrap().permits_request());
+    assert_eq!(limiter.cleanup_expired(1).await.unwrap(), 0);
+
+    // A committed clock observation has reached expiry, then the physical
+    // clock regresses below both. Cleanup must use the committed boundary.
+    let expiry = i64::try_from(start + 1000).unwrap();
+    sqlx::query("UPDATE runlimit_gcra_shards SET observed_at_ms = $1 WHERE capacity_shard = 0")
+        .bind(expiry)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let denied = limiter.check(&fresh).await.unwrap();
+    assert!(matches!(
+        denied.view(),
+        DecisionView::Denied {
+            denial: Denial::StorageCapacity { .. }
+        }
+    ));
+    assert_eq!(limiter.cleanup_expired(1).await.unwrap(), 1);
+    assert_eq!(db.watermark().await, expiry);
+    assert!(limiter.check(&fresh).await.unwrap().permits_request());
+    assert!(!limiter.check(&fresh).await.unwrap().permits_request());
+    assert_eq!(limiter.cleanup_expired(1).await.unwrap(), 0);
+    assert_eq!(db.row_count().await, 1);
+    let (ledger, stored_expiry): (i64, i64) = sqlx::query_as(
+        "SELECT shard.row_count, counter.expires_at_ms FROM runlimit_gcra_shards AS shard JOIN runlimit_gcra AS counter USING (capacity_shard) WHERE capacity_shard = 0",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(ledger, 1);
+    assert_eq!(stored_expiry, expiry + 1000);
+    db.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn logical_expiry_cleanup_skips_busy_shards_and_preserves_other_shards_clocks() {
+    let db = Database::new().await;
+    let start = db.freeze_time().await;
+    let policy = policy(1, 1000, 1);
+    let limiter = db.limiter();
+    for shard in 0..3 {
+        assert!(
+            limiter
+                .check(&Check::new(subject(1, shard, &policy).bind(&policy)))
+                .await
+                .unwrap()
+                .permits_request()
+        );
+    }
+    // Shards 0 and 1 have observed their counters' expiry, but shard 2 has not.
+    sqlx::query(
+        "UPDATE runlimit_gcra_shards SET observed_at_ms = $1 WHERE capacity_shard IN (0, 1)",
+    )
+    .bind(i64::try_from(start + 1000).unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let mut blocker = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM runlimit_gcra_shards WHERE capacity_shard = 0 FOR UPDATE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    assert_eq!(limiter.cleanup_expired(1).await.unwrap(), 1);
+    let remaining: Vec<i16> =
+        sqlx::query_scalar("SELECT capacity_shard FROM runlimit_gcra ORDER BY capacity_shard")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, [0, 2]);
+    blocker.rollback().await.unwrap();
+    assert_eq!(limiter.cleanup_expired(1).await.unwrap(), 1);
+    assert_eq!(limiter.cleanup_expired(1).await.unwrap(), 0);
+    assert_eq!(db.row_count().await, 1);
+    let (shard, observed): (i16, i64) = sqlx::query_as(
+        "SELECT capacity_shard, observed_at_ms FROM runlimit_gcra_shards WHERE row_count = 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(shard, 2);
+    assert_eq!(u64::try_from(observed).unwrap(), start);
     db.teardown().await;
 }
 

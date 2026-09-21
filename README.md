@@ -374,7 +374,10 @@ accepts the same policy-bound checks as `GcraStore`. Call its `migrate()` before
 serving traffic and schedule `cleanup_expired(maximum_rows)` to reclaim expired
 storage. Its separate `gcra-migrations` stream installs only GCRA tables;
 existing fixed-window consumers need no schema or workflow change. Strict host
-migrators may vendor `CREATE_RUNLIMIT_GCRA_SQL` instead. Shared SQLx migration
+migrators may vendor `CREATE_RUNLIMIT_GCRA_SQL` followed by
+`INDEX_RUNLIMIT_GCRA_SHARD_EXPIRY_SQL` instead. The canonical `migrate()` applies
+both in order, including when upgrading a database with the first migration
+already installed. Shared SQLx migration
 histories require every participating migrator to ignore unrelated versions.
 
 The memory and PostgreSQL GCRA implementations share one pure, exact evaluator
@@ -392,7 +395,11 @@ ceiling of 65,536 rows per shard, and configurable lower operational bounds via
 `PostgresConfig`. Admission locks affected ledger rows in ascending shard order
 before reading or writing counters, including absent keys. This deliberately
 serializes keys in the same shard. Cleanup follows the same order, skips busy
-shards, and deletes at most its requested bound. Active rows are never evicted;
+shards, and deletes at most its requested bound. Discovery makes at most 256
+shard/expiry index probes under each shard's clamped clock. Deletion reads at
+most the requested number of eligible entries per locked shard before selecting
+the globally oldest requested rows; unrelated active entries are outside these
+index ranges. Active rows are never evicted;
 expired rows still occupy a slot until cleanup, but remain reusable for their
 existing key. The shard derivation and locking order are persistent protocol
 and cannot change in place during rolling deploys.

@@ -157,6 +157,14 @@ Memory completion has a dedicated poisoned-state error. Eight memory and
 17 live PostgreSQL attempt cases, workspace tests and Clippy pass after these
 fixes. GCRA and fixed-window behavior are unchanged. Final review is pending.
 
+The third review found a distinct cleanup discovery defect: wall-clock candidate
+selection skipped rows expired by their shard's committed logical clock after
+clock regression. Cleanup now uses indexed per-shard clamped-clock probes and
+bounded deletion. A forward-only index migration is included by the canonical
+migrator and tested as an upgrade from the original schema. Validation passed:
+17 attempt, 20 GCRA and 32 existing fixed-window live tests, workspace tests,
+Clippy, formatting and packaged-consumer smoke. The earlier findings did not recur.
+
 Storage reclamation is deliberately backend-specific: memory immediately removes
 a successful subject; PostgreSQL retains reset state until bounded quiet-period
 cleanup. Both permit an immediate next attempt for that subject and preserve

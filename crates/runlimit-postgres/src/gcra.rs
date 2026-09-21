@@ -32,6 +32,11 @@ use crate::{
 pub const CREATE_RUNLIMIT_GCRA_SQL: &str =
     include_str!("../gcra-migrations/20260922000000_create_runlimit_gcra.sql");
 
+/// Additive shard/expiry index for bounded cleanup under regressing clocks.
+/// Strict host migrators apply this after [`CREATE_RUNLIMIT_GCRA_SQL`].
+pub const INDEX_RUNLIMIT_GCRA_SHARD_EXPIRY_SQL: &str =
+    include_str!("../gcra-migrations/20260922000001_index_runlimit_gcra_shard_expiry.sql");
+
 /// Raw GCRA migrator with `SQLx`'s strict defaults. Prefer
 /// [`PostgresGcraLimiter::migrate`] for cancellation-safe pooled migration.
 pub static GCRA_MIGRATOR: Migrator = sqlx::migrate!("./gcra-migrations");
@@ -56,9 +61,16 @@ const CLEANUP_LOCKS: &str = r"
 WITH sample AS MATERIALIZED (
     SELECT floor(extract(epoch FROM pg_catalog.clock_timestamp()) * 1000)::BIGINT AS now_ms
 ), candidates AS MATERIALIZED (
-    SELECT capacity_shard FROM runlimit_gcra
-    WHERE expires_at_ms <= (SELECT now_ms FROM sample)
-    ORDER BY expires_at_ms LIMIT $1
+    -- At most 256 indexed probes, each returning at most one candidate. Using
+    -- the same shard clock as admission makes logically expired slots
+    -- reclaimable even while the physical clock remains behind its watermark.
+    SELECT shard.capacity_shard FROM runlimit_gcra_shards AS shard
+    CROSS JOIN LATERAL (
+        SELECT 1 FROM runlimit_gcra AS counter
+        WHERE counter.capacity_shard = shard.capacity_shard
+            AND counter.expires_at_ms <= greatest((SELECT now_ms FROM sample), shard.observed_at_ms)
+        ORDER BY counter.expires_at_ms LIMIT 1
+    ) AS expired
 )
 SELECT capacity.capacity_shard FROM runlimit_gcra_shards AS capacity
 WHERE capacity.capacity_shard IN (SELECT capacity_shard FROM candidates)
@@ -73,13 +85,17 @@ WITH sample AS MATERIALIZED (
 UPDATE runlimit_gcra_shards SET observed_at_ms = (SELECT now_ms FROM clamped)
 WHERE capacity_shard = ANY($1)";
 const CLEANUP_DELETE: &str = r"
-WITH sample AS MATERIALIZED (
-    SELECT max(observed_at_ms) AS now_ms FROM runlimit_gcra_shards
-    WHERE capacity_shard = ANY($1)
-), expired AS MATERIALIZED (
-    SELECT config_fingerprint, subject_key FROM runlimit_gcra
-    WHERE capacity_shard = ANY($1) AND expires_at_ms <= (SELECT now_ms FROM sample)
-    ORDER BY expires_at_ms LIMIT $2
+WITH expired AS MATERIALIZED (
+    SELECT candidate.config_fingerprint, candidate.subject_key
+    FROM runlimit_gcra_shards AS shard
+    CROSS JOIN LATERAL (
+        SELECT config_fingerprint, subject_key, expires_at_ms FROM runlimit_gcra AS counter
+        WHERE counter.capacity_shard = shard.capacity_shard
+            AND counter.expires_at_ms <= shard.observed_at_ms
+        ORDER BY counter.expires_at_ms LIMIT $2
+    ) AS candidate
+    WHERE shard.capacity_shard = ANY($1)
+    ORDER BY candidate.expires_at_ms LIMIT $2
 )
 DELETE FROM runlimit_gcra AS stored USING expired
 WHERE stored.config_fingerprint = expired.config_fingerprint AND stored.subject_key = expired.subject_key";
@@ -536,9 +552,7 @@ async fn cleanup_transaction(
     let rows = maintenance_before_commit(
         deadline,
         CleanupPhase::DeletingExpiredWindows,
-        sqlx::query(CLEANUP_LOCKS)
-            .bind(i64::from(maximum))
-            .fetch_all(&mut *transaction),
+        sqlx::query(CLEANUP_LOCKS).fetch_all(&mut *transaction),
     )
     .await?;
     let shards = rows
