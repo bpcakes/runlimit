@@ -63,6 +63,12 @@ pub enum MemoryAttemptError {
     SequenceExhausted,
 }
 
+/// The only process-local completion failure: poisoned attempt state.
+/// Completion consumes an existing receipt and allocates no sequence number.
+#[derive(Debug, Error)]
+#[error("attempt state mutex poisoned")]
+pub struct MemoryAttemptCompletionError;
+
 impl MemoryAttemptLimiter {
     /// Creates a hard-bounded limiter using monotonic system time.
     pub fn new(capacity: NonZeroUsize) -> Self {
@@ -150,17 +156,17 @@ impl<C: Clock> MemoryAttemptLimiter<C> {
     /// Completes a reservation once. Stale receipts never mutate current state.
     ///
     /// # Errors
-    /// Returns an error when the state mutex is poisoned.
+    /// Returns [`MemoryAttemptCompletionError`] when the state mutex is poisoned.
     #[allow(clippy::needless_pass_by_value)] // A receipt is deliberately single-use.
     pub fn complete(
         &self,
         receipt: MemoryAttemptReceipt,
         outcome: AttemptOutcome,
-    ) -> Result<AttemptCompletionResult, MemoryAttemptError> {
+    ) -> Result<AttemptCompletionResult, MemoryAttemptCompletionError> {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| MemoryAttemptError::Poisoned)?;
+            .map_err(|_| MemoryAttemptCompletionError)?;
         state.now = state.now.max(self.clock.now());
         let now = state.now;
         let valid_store = Weak::ptr_eq(&receipt.store, &Arc::downgrade(&self.state));

@@ -256,3 +256,31 @@ fn quiet_expiry_never_evicts_a_longer_active_lease() {
         AttemptCompletionResult::Applied(_)
     ));
 }
+
+#[test]
+fn completion_error_can_only_report_poisoned_state() {
+    use runlimit_memory::attempts::MemoryAttemptCompletionError;
+    use std::sync::atomic::AtomicBool;
+    #[derive(Clone)]
+    struct PanickingClock(Arc<AtomicBool>);
+    impl Clock for PanickingClock {
+        fn now(&self) -> Duration {
+            assert!(!self.0.load(Ordering::SeqCst), "injected clock panic");
+            Duration::ZERO
+        }
+    }
+    let panic_clock = Arc::new(AtomicBool::new(false));
+    let store = MemoryAttemptLimiter::with_clock(
+        NonZeroUsize::new(1).unwrap(),
+        PanickingClock(panic_clock.clone()),
+    );
+    let policy = policy();
+    let h = KeyHasher::new([7; 32]).unwrap();
+    let subject = h.hash_attempt_for(&policy, b"user");
+    let r = receipt(store.admit(subject).unwrap());
+    panic_clock.store(true, Ordering::SeqCst);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.admit(subject))).is_err()
+    );
+    let MemoryAttemptCompletionError = store.complete(r, AttemptOutcome::Success).unwrap_err();
+}

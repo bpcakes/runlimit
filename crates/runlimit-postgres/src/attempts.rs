@@ -41,7 +41,9 @@ pub struct PgAttemptReceipt {
 }
 /// A live receipt fenced to the exact PostgreSQL transaction that locked it.
 /// Completion may outlive its admission lease while the transaction retains
-/// the row lock. Rolling back leaves the original reservation to expire.
+/// the row lock. Claiming transactionally rotates its private token, so rolling
+/// back a containing savepoint invalidates the escaped claim even when the
+/// outer transaction ID stays the same. The original reservation then expires.
 pub struct PgAttemptClaim {
     receipt: PgAttemptReceipt,
     transaction_id: String,
@@ -398,25 +400,32 @@ pub mod low_level {
     /// is validated after acquiring the lock, against authoritative server time.
     /// Hold the same transaction through [`finish_in`] and final commit. An
     /// autocommit executor produces a claim unusable in subsequent transactions.
+    /// Rolling back the savepoint containing this operation invalidates the
+    /// claim by reverting its private token rotation; releasing that savepoint
+    /// retains the lock and the claim remains valid in the outer transaction.
     ///
     /// # Errors
     /// Returns database/decode failures; the transaction owner must rollback.
     pub async fn claim_in<'e, E: Executor<'e, Database = Postgres>>(
         executor: E,
-        receipt: PgAttemptReceipt,
+        mut receipt: PgAttemptReceipt,
     ) -> Result<PgAttemptClaimResult, sqlx::Error> {
-        let row = sqlx::query("WITH locked AS MATERIALIZED (SELECT lease_token,lease_until_ms FROM runlimit_attempts WHERE config_fingerprint=$1 AND subject_key=$2 FOR UPDATE), sampled AS MATERIALIZED (SELECT *, floor(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::bigint AS now_ms FROM locked) SELECT pg_catalog.pg_current_xact_id()::text AS transaction_id FROM sampled WHERE lease_token=$3 AND lease_until_ms>now_ms")
+        let row = sqlx::query("WITH locked AS MATERIALIZED (SELECT config_fingerprint,subject_key,lease_token,lease_until_ms FROM runlimit_attempts WHERE config_fingerprint=$1 AND subject_key=$2 FOR UPDATE), sampled AS MATERIALIZED (SELECT *, floor(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::bigint AS now_ms FROM locked) UPDATE runlimit_attempts AS attempts SET lease_token=pg_catalog.gen_random_uuid()::text FROM sampled WHERE attempts.config_fingerprint=sampled.config_fingerprint AND attempts.subject_key=sampled.subject_key AND sampled.lease_token=$3 AND sampled.lease_until_ms>sampled.now_ms RETURNING attempts.lease_token,pg_catalog.pg_current_xact_id()::text AS transaction_id")
             .bind(receipt.policy.fingerprint().into_bytes().to_vec()).bind(receipt.subject.to_vec()).bind(&receipt.token).fetch_optional(executor).await?;
+        let decode = |error| {
+            sqlx::Error::Decode(Box::new(crate::CheckError::storage_decode_invariant(
+                "decode attempt claim response",
+                error,
+            )))
+        };
         match row {
-            Some(row) => Ok(PgAttemptClaimResult::Claimed(PgAttemptClaim {
-                receipt,
-                transaction_id: row.try_get("transaction_id").map_err(|error| {
-                    sqlx::Error::Decode(Box::new(crate::CheckError::storage_decode_invariant(
-                        "decode attempt claim response",
-                        error,
-                    )))
-                })?,
-            })),
+            Some(row) => {
+                receipt.token = row.try_get("lease_token").map_err(decode)?;
+                Ok(PgAttemptClaimResult::Claimed(PgAttemptClaim {
+                    receipt,
+                    transaction_id: row.try_get("transaction_id").map_err(decode)?,
+                }))
+            }
             None => Ok(PgAttemptClaimResult::Stale),
         }
     }

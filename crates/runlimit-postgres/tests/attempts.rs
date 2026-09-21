@@ -729,3 +729,107 @@ async fn lowered_capacity_reclaims_expired_rows_across_denied_cleanup_batches() 
     );
     db.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn rolled_back_savepoint_invalidates_claim_even_in_same_transaction() {
+    use sqlx::Acquire;
+    let db = Database::new().await;
+    let limiter = PostgresAttemptLimiter::new(db.pool.clone());
+    let p = policy();
+    let h = KeyHasher::new([7; 32]).unwrap();
+    let r = receipt(
+        limiter
+            .admit(h.hash_attempt_for(&p, b"user"))
+            .await
+            .unwrap(),
+    );
+    let mut outer = db.pool.begin().await.unwrap();
+    let xid_before: String = sqlx::query_scalar("SELECT pg_current_xact_id()::text")
+        .fetch_one(&mut *outer)
+        .await
+        .unwrap();
+    let mut savepoint = outer.begin().await.unwrap();
+    let PgAttemptClaimResult::Claimed(claim) =
+        low_level::claim_in(&mut *savepoint, r).await.unwrap()
+    else {
+        panic!()
+    };
+    savepoint.rollback().await.unwrap();
+    let xid_after: String = sqlx::query_scalar("SELECT pg_current_xact_id()::text")
+        .fetch_one(&mut *outer)
+        .await
+        .unwrap();
+    assert_eq!(xid_before, xid_after);
+    // The lease is now expired, and the savepoint has reverted the private
+    // token rotation. Reacquiring the row under the same XID cannot revive it.
+    sqlx::query("UPDATE runlimit_attempts SET lease_until_ms=0,failures=2")
+        .execute(&mut *outer)
+        .await
+        .unwrap();
+    assert_eq!(
+        low_level::finish_in(&mut *outer, claim, AttemptOutcome::Success)
+            .await
+            .unwrap(),
+        StagedAttemptCompletion::Stale
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT failures FROM runlimit_attempts")
+            .fetch_one(&mut *outer)
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT lease_token IS NOT NULL FROM runlimit_attempts")
+            .fetch_one(&mut *outer)
+            .await
+            .unwrap()
+    );
+    outer.rollback().await.unwrap();
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn released_savepoint_preserves_claim_and_lock_past_admission_expiry() {
+    use sqlx::Acquire;
+    let db = Database::new().await;
+    let limiter = PostgresAttemptLimiter::new(db.pool.clone());
+    let p = policy();
+    let h = KeyHasher::new([7; 32]).unwrap();
+    let r = receipt(
+        limiter
+            .admit(h.hash_attempt_for(&p, b"user"))
+            .await
+            .unwrap(),
+    );
+    let mut outer = db.pool.begin().await.unwrap();
+    let mut savepoint = outer.begin().await.unwrap();
+    let PgAttemptClaimResult::Claimed(claim) =
+        low_level::claim_in(&mut *savepoint, r).await.unwrap()
+    else {
+        panic!()
+    };
+    savepoint.commit().await.unwrap();
+    sqlx::query("UPDATE runlimit_attempts SET lease_until_ms=0")
+        .execute(&mut *outer)
+        .await
+        .unwrap();
+    assert!(matches!(
+        low_level::finish_in(&mut *outer, claim, AttemptOutcome::Success)
+            .await
+            .unwrap(),
+        StagedAttemptCompletion::Applied(_)
+    ));
+    outer.commit().await.unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT lease_token IS NULL AND failures=0 FROM runlimit_attempts"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    );
+    db.close().await;
+}

@@ -149,6 +149,14 @@ formatting, workspace tests, all-target/all-feature Clippy, and 15 attempt,
 17 GCRA and 32 original fixed-window live cases. Full original-range re-review
 and PR delivery remain pending.
 
+The second review found two new defects, not recurrences: a savepoint rollback
+could preserve an escaped claim's top-level XID, and memory completion exposed
+an unreachable admission-only error. Claiming now transactionally rotates the
+private token; rollback invalidates it while releasing a savepoint preserves it.
+Memory completion has a dedicated poisoned-state error. Eight memory and
+17 live PostgreSQL attempt cases, workspace tests and Clippy pass after these
+fixes. GCRA and fixed-window behavior are unchanged. Final review is pending.
+
 Storage reclamation is deliberately backend-specific: memory immediately removes
 a successful subject; PostgreSQL retains reset state until bounded quiet-period
 cleanup. Both permit an immediate next attempt for that subject and preserve

@@ -583,7 +583,10 @@ uses the explicitly low-level PostgreSQL seam:
 4. Commit, then publish the result. Roll back on `Stale`, errors, or cancellation.
 
 A claim is fenced to the exact PostgreSQL transaction ID as well as the opaque
-receipt token. After a valid claim, time elapsed during application work does
+receipt token, which is rotated transactionally during claim. Rolling back a
+containing savepoint reverts the token and invalidates an escaped claim even
+though the outer transaction ID remains unchanged. Releasing a savepoint retains
+the claim and its row lock. After a valid claim, time elapsed during application work does
 not expire its held row lock. Using the claim in a different transaction returns
 `Stale`. No transaction remains open during expensive credential verification.
 The low-level API cannot own commit acknowledgement; its distinct
