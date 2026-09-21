@@ -22,12 +22,12 @@ jobs:
     name: Format, lint, and test
     runs-on: ubuntu-latest
     steps:
-      # actions/checkout v4.3.1
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
-      # Swatinem/rust-cache v2.9.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      # Swatinem/rust-cache v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: cargo +stable fmt --all -- --check
       - name: Lint default features
         run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
@@ -62,14 +62,14 @@ jobs:
     name: Packaged archive smoke
     runs-on: ubuntu-latest
     steps:
-      # actions/checkout v4.3.1
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install Rust toolchains
         run: |
           rustup toolchain install stable --profile minimal
           rustup toolchain install 1.94.0 --profile minimal
-      # Swatinem/rust-cache v2.9.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      # Swatinem/rust-cache v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Test packaged crates as an external consumer
         run: ./scripts/run-external-consumer-smoke.sh
 
@@ -77,12 +77,12 @@ jobs:
     name: Rust 1.94
     runs-on: ubuntu-latest
     steps:
-      # actions/checkout v4.3.1
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install minimum supported Rust
         run: rustup toolchain install 1.94.0 --profile minimal
-      # Swatinem/rust-cache v2.9.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      # Swatinem/rust-cache v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Check default features
         run: cargo +1.94.0 check --workspace --all-targets --locked
       - name: Check all features
@@ -114,12 +114,12 @@ jobs:
     env:
       RUNLIMIT_POSTGRES_TEST_DATABASE_URL: postgresql://runlimit:runlimit@127.0.0.1:5432/runlimit
     steps:
-      # actions/checkout v4.3.1
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
-      # Swatinem/rust-cache v2.9.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      # Swatinem/rust-cache v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Run PostgreSQL integration tests (default features)
         run: >-
           cargo +stable test
@@ -144,8 +144,8 @@ jobs:
     name: Cargo deny
     runs-on: ubuntu-latest
     steps:
-      # actions/checkout v4.3.1
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
       - name: Install cargo-deny
