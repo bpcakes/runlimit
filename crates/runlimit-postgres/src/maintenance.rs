@@ -64,7 +64,7 @@ async fn run_cleanup_transaction_inner(
     Ok(rows_affected)
 }
 
-async fn maintenance_before_commit<T, F>(
+pub(crate) async fn maintenance_before_commit<T, F>(
     deadline: Instant,
     phase: CleanupPhase,
     future: F,
@@ -87,7 +87,7 @@ where
         })
 }
 
-async fn set_maintenance_server_timeouts(
+pub(crate) async fn set_maintenance_server_timeouts(
     transaction: &mut Transaction<'_, Postgres>,
     deadline: Instant,
     phase: CleanupPhase,
@@ -107,7 +107,7 @@ async fn set_maintenance_server_timeouts(
     .map(|_| ())
 }
 
-async fn commit_maintenance(
+pub(crate) async fn commit_maintenance(
     deadline: Instant,
     mut transaction: Transaction<'_, Postgres>,
 ) -> Result<(), ConnectionOutcome<MaintenanceError>> {

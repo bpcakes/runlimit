@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 runlimit-core = { version = "0.3.0", path = "../../crates/runlimit-core" }
 runlimit-memory = { version = "0.3.0", path = "../../crates/runlimit-memory" }
+runlimit-postgres = { version = "0.3.1", path = "../../crates/runlimit-postgres" }
 
 # Keep this package outside Runlimit's workspace so it exercises path
 # dependency resolution from an independent consumer.

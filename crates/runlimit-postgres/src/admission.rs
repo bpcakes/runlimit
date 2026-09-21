@@ -263,13 +263,13 @@ pub(crate) async fn run_check_transaction<D>(
 /// Keeps every SQL phase on the same remaining operation budget. `PostgreSQL`
 /// timeouts are per statement/lock, so a value set once at BEGIN is stale after
 /// an earlier phase waits. No query method exposes the underlying transaction.
-struct CheckTransaction<'c> {
+pub(crate) struct CheckTransaction<'c> {
     inner: Transaction<'c, Postgres>,
     deadline: Instant,
 }
 
 impl<'c> CheckTransaction<'c> {
-    async fn begin(
+    pub(crate) async fn begin(
         connection: &'c mut PoolConnection<Postgres>,
         deadline: Instant,
     ) -> Result<Self, ConnectionOutcome<CheckError>> {
@@ -286,7 +286,7 @@ impl<'c> CheckTransaction<'c> {
         set_check_server_timeouts(&mut self.inner, self.deadline, phase).await
     }
 
-    async fn execute(
+    pub(crate) async fn execute(
         &mut self,
         phase: CheckPhase,
         query: Query<'_, Postgres, PgArguments>,
@@ -295,7 +295,7 @@ impl<'c> CheckTransaction<'c> {
         check_before_commit(self.deadline, phase, query.execute(&mut *self.inner)).await
     }
 
-    async fn fetch_all(
+    pub(crate) async fn fetch_all(
         &mut self,
         phase: CheckPhase,
         query: Query<'_, Postgres, PgArguments>,
@@ -304,7 +304,7 @@ impl<'c> CheckTransaction<'c> {
         check_before_commit(self.deadline, phase, query.fetch_all(&mut *self.inner)).await
     }
 
-    async fn fetch_one(
+    pub(crate) async fn fetch_one(
         &mut self,
         phase: CheckPhase,
         query: Query<'_, Postgres, PgArguments>,
@@ -313,9 +313,13 @@ impl<'c> CheckTransaction<'c> {
         check_before_commit(self.deadline, phase, query.fetch_one(&mut *self.inner)).await
     }
 
-    async fn commit(mut self) -> Result<(), ConnectionOutcome<CheckError>> {
+    pub(crate) async fn commit(mut self) -> Result<(), ConnectionOutcome<CheckError>> {
         self.prepare(CheckPhase::PreparingCommit).await?;
         commit_check(self.deadline, self.inner).await
+    }
+
+    pub(crate) async fn deny<D>(self, decision: D) -> ConnectionOutcome<D> {
+        finish_denied_transaction(self.deadline, decision, self.inner.rollback()).await
     }
 }
 

@@ -143,7 +143,7 @@ Run the required database suite against disposable PostgreSQL with:
 
 ```sh
 RUNLIMIT_POSTGRES_TEST_DATABASE_URL=postgresql://... \
-  cargo test -p runlimit-postgres --test postgres -- --ignored --test-threads=1
+  cargo test -p runlimit-postgres --tests -- --ignored --test-threads=1
 ```
 
 <!-- bv-agent-instructions-v3 -->

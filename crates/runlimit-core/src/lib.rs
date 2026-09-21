@@ -14,10 +14,12 @@
 //! wire types. Opaque [`SubjectKey`], [`CounterKey`], and
 //! [`PolicyFingerprint`] values intentionally remain non-serializable.
 
+pub mod attempts;
 mod batch;
 mod check;
 mod counter;
 mod decision;
+pub mod gcra;
 mod identifier;
 mod key;
 mod limiter;

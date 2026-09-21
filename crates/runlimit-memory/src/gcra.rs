@@ -1,13 +1,11 @@
-use std::{
-    fmt,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{fmt, sync::Arc, time::Instant};
 
 use runlimit_core::{
-    AdmissionObservation, Allowance, BatchDecision, Capacity, CapacityObservation, Check,
-    CleanupObservation, CleanupOutcome, ConsumptionStatus, CounterKey, Decision, GcraPolicy,
-    Limiter, Observation, Observer, QuotaDenial, QuotaMode, observe_safely, validate_batch,
+    AdmissionObservation, Allowance, BatchDecision, CapacityObservation, Check, CleanupObservation,
+    CleanupOutcome, ConsumptionStatus, CounterKey, Decision, GcraPolicy, Limiter, Observation,
+    Observer, QuotaMode,
+    gcra::{ArithmeticOverflow, Evaluation as QuotaEvaluation, PendingAllowance, evaluate},
+    observe_safely, validate_batch,
 };
 use thiserror::Error;
 
@@ -27,52 +25,16 @@ struct Entry {
 impl Shard<Entry> {
     fn evaluate(
         &self,
-        check: &PreparedCheck,
+        check: &PreparedCheck<'_>,
         now_millis: u128,
     ) -> Result<QuotaEvaluation, ArithmeticOverflow> {
-        let scaled_now = now_millis
-            .checked_mul(u128::from(check.quota))
-            .ok_or(ArithmeticOverflow)?;
         let active_tat = self
             .active_entry(check.counter_key, now_millis)
-            .map_or(scaled_now, |(entry, _)| entry.tat_scaled.max(scaled_now));
-        let increment = u128::from(check.cost)
-            .checked_mul(u128::from(check.period_millis))
-            .ok_or(ArithmeticOverflow)?;
-        let candidate = active_tat
-            .checked_add(increment)
-            .ok_or(ArithmeticOverflow)?;
-        let burst_span = u128::from(check.burst_capacity.get())
-            .checked_mul(u128::from(check.period_millis))
-            .ok_or(ArithmeticOverflow)?;
-        let ceiling = scaled_now
-            .checked_add(burst_span)
-            .ok_or(ArithmeticOverflow)?;
-
-        if candidate > ceiling {
-            let retry_millis = div_ceil(candidate - ceiling, u128::from(check.quota));
-            return Ok(QuotaEvaluation::Denied(QuotaDenial::new(
-                check.burst_capacity,
-                duration_from_millis(retry_millis),
-            )));
-        }
-
-        let available = (ceiling - candidate) / u128::from(check.period_millis);
-        let replenish_millis = div_ceil(candidate - scaled_now, u128::from(check.quota));
-        let expires_at_millis = now_millis
-            .checked_add(replenish_millis)
-            .ok_or(ArithmeticOverflow)?;
-
-        Ok(QuotaEvaluation::Allowed(PendingAllowance {
-            tat_scaled: candidate,
-            expires_at_millis,
-            available: u64::try_from(available)
-                .expect("available allowance cannot exceed the u64 burst capacity"),
-            replenishes_after: duration_from_millis(replenish_millis),
-        }))
+            .map(|(entry, _)| entry.tat_scaled);
+        evaluate(&check.check, now_millis, active_tat)
     }
 
-    fn consume(&mut self, check: &PreparedCheck, allowance: PendingAllowance) -> Allowance {
+    fn consume(&mut self, check: &PreparedCheck<'_>, allowance: PendingAllowance) -> Allowance {
         self.replace(
             check.counter_key,
             Entry {
@@ -81,20 +43,9 @@ impl Shard<Entry> {
             allowance.expires_at_millis,
         );
 
-        // `available` is `(ceiling - candidate) / period` with
-        // `ceiling - candidate <= burst_capacity * period`, so it never exceeds
-        // the burst capacity.
-        Allowance::new(
-            check.burst_capacity,
-            allowance.available,
-            allowance.replenishes_after,
-        )
-        .expect("GCRA availability is bounded by the burst capacity")
+        allowance.allowance
     }
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ArithmeticOverflow;
 
 /// Failure of a single GCRA memory-store check.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -124,42 +75,22 @@ impl From<PoisonedShardError> for GcraBatchError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QuotaEvaluation {
-    Allowed(PendingAllowance),
-    Denied(QuotaDenial),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingAllowance {
-    tat_scaled: u128,
-    expires_at_millis: u128,
-    available: u64,
-    replenishes_after: Duration,
-}
-
 #[derive(Clone, Copy, Debug)]
-struct PreparedCheck {
+struct PreparedCheck<'a> {
     input_index: usize,
     counter_key: CounterKey,
     shard_position: usize,
-    quota: u64,
-    period_millis: u64,
-    burst_capacity: Capacity,
-    cost: u64,
+    check: Check<'a, GcraPolicy>,
     quota_mode: QuotaMode,
 }
 
-impl PreparedCheck {
-    fn new(input_index: usize, check: &Check<'_, GcraPolicy>, shard_position: usize) -> Self {
+impl<'a> PreparedCheck<'a> {
+    fn new(input_index: usize, check: &Check<'a, GcraPolicy>, shard_position: usize) -> Self {
         Self {
             input_index,
             counter_key: check.counter_key(),
             shard_position,
-            quota: check.policy().quota().get(),
-            period_millis: check.policy().period().millis(),
-            burst_capacity: check.policy().burst_capacity(),
-            cost: check.cost(),
+            check: *check,
             quota_mode: check.policy().quota_mode(),
         }
     }
@@ -545,22 +476,6 @@ impl<C: Clock> GcraStore<C> {
         let admission = build_observation();
         observe_safely(observer.as_ref(), &Observation::Admission(admission));
     }
-}
-
-const fn div_ceil(numerator: u128, denominator: u128) -> u128 {
-    numerator / denominator
-        + if numerator.is_multiple_of(denominator) {
-            0
-        } else {
-            1
-        }
-}
-
-fn duration_from_millis(millis: u128) -> Duration {
-    Duration::from_millis(
-        u64::try_from(millis)
-            .expect("GCRA policy validation bounds every reported duration to u64"),
-    )
 }
 
 // Both async bodies contain no `.await`: they exist to defer the synchronous

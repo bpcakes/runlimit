@@ -10,6 +10,11 @@ use runlimit_memory::{
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
+    fn accepts_gcra<L: runlimit_core::Limiter<Policy = runlimit_core::GcraPolicy>>() {}
+    check_attempt_api()?;
+    accepts_gcra::<runlimit_postgres::PostgresGcraLimiter>();
+    assert!(!runlimit_postgres::CREATE_RUNLIMIT_GCRA_SQL.is_empty());
+    assert!(!runlimit_postgres::GCRA_MIGRATOR.migrations.is_empty());
     let gcra_error = GcraBatchError::from(MemoryBatchError::from(PoisonedShardError {
         shard_index: 0,
     }));
@@ -92,5 +97,52 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn check_attempt_api() -> Result<(), Box<dyn Error>> {
+    use runlimit_core::{
+        Delay, QuotaPeriod,
+        attempts::{
+            AttemptAdmission, AttemptCompletion, AttemptCompletionResult, AttemptOutcome,
+            AttemptPolicy, AttemptPolicyError,
+        },
+    };
+    use runlimit_memory::attempts::MemoryAttemptLimiter;
+    let period = QuotaPeriod::new(Duration::from_secs(1))?;
+    let policy = AttemptPolicy::new(
+        PolicyId::new("login")?,
+        ScopeId::new("account")?,
+        period,
+        period,
+        period,
+        period,
+    )?;
+    let invalid = AttemptPolicy::new(
+        policy.id().clone(),
+        policy.scope().clone(),
+        period,
+        QuotaPeriod::new(Duration::from_millis(1))?,
+        period,
+        period,
+    );
+    assert_eq!(invalid, Err(AttemptPolicyError::MaximumBelowInitial));
+    assert!(
+        AttemptCompletion::new(AttemptOutcome::Success, 1, Delay::new(Duration::ZERO)).is_err()
+    );
+    let limiter = MemoryAttemptLimiter::new(std::num::NonZeroUsize::new(2).unwrap());
+    let hasher = KeyHasher::new([7; 32])?;
+    let AttemptAdmission::Admitted(receipt) =
+        limiter.admit(hasher.hash_attempt_for(&policy, b"opaque-subject"))?
+    else {
+        panic!("empty store denied")
+    };
+    let AttemptCompletionResult::Applied(completion) =
+        limiter.complete(receipt, AttemptOutcome::Success)?
+    else {
+        panic!("fresh receipt stale")
+    };
+    assert_eq!(completion.consecutive_failures(), 0);
+    assert!(!runlimit_postgres::attempts::CREATE_RUNLIMIT_ATTEMPTS_SQL.is_empty());
     Ok(())
 }

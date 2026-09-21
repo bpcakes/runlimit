@@ -141,6 +141,26 @@ impl Clone for KeyHasher {
 }
 
 impl KeyHasher {
+    /// Derives an opaque subject bound to an outcome-aware attempt policy.
+    /// Application normalization remains caller-owned. This domain is distinct
+    /// from ordinary quota subjects even for identical identifiers.
+    pub fn hash_attempt_for<'a>(
+        &self,
+        policy: &'a crate::attempts::AttemptPolicy,
+        subject: impl AsRef<[u8]>,
+    ) -> crate::attempts::AttemptSubject<'a> {
+        let mut mac = self.template.clone();
+        mac.update(b"attempt/v1\0");
+        mac.update(policy.id().as_str().as_bytes());
+        mac.update(&[0]);
+        mac.update(policy.scope().as_str().as_bytes());
+        mac.update(&[0]);
+        mac.update(subject.as_ref());
+        crate::attempts::AttemptSubject {
+            policy,
+            subject: SubjectKey::from_digest(mac.finalize().into_bytes().into()),
+        }
+    }
     /// Minimum accepted secret length in bytes.
     pub const MINIMUM_SECRET_LENGTH: usize = 32;
 
