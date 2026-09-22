@@ -2,8 +2,8 @@
 
 > **Development has moved to [Batter](https://github.com/bpcakes/batter/tree/master/runlimit).**
 > Runlimit is now maintained as native crates inside the Batter workspace.
-> See [Moving to Batter](MOVED_TO_BATTER.md) for consumer guidance. The standalone
-> installation, development and release instructions below are historical; use
+> See [Moving to Batter](MOVED_TO_BATTER.md) for consumer guidance. Installation below
+> uses Batter; standalone development and release instructions are historical. See
 > [the current Runlimit documentation](https://github.com/bpcakes/batter/blob/master/runlimit/README.md) for new work.
 
 Runlimit is a framework-neutral Rust library for keyed rate limiting. It
@@ -24,31 +24,29 @@ by Identitypro authentication throttling.
 | `runlimit-memory` | Sharded, hard-bounded process-local storage with bounded cleanup work. |
 | `runlimit-postgres` | Replica-safe SQLx/PostgreSQL storage, migrations, and bounded maintenance. |
 
-The latest published release is `0.3.0`. Choose the backend needed by the
-application:
+## Installation
+
+For current development, depend on the native Runlimit packages in Batter
+using a full Git revision. Choose the backend needed by the application:
 
 ```toml
 [dependencies]
-runlimit-core = "0.3.0"
-runlimit-memory = "0.3.0"
-# Optional Axum/Tower admission middleware:
-# runlimit-axum = "0.3.0"
+runlimit-core = { git = "https://github.com/bpcakes/batter.git", rev = "70cc6a05be6857aca6ea2f5f127258e75e673d8c" }
+runlimit-memory = { git = "https://github.com/bpcakes/batter.git", rev = "70cc6a05be6857aca6ea2f5f127258e75e673d8c" }
+# Optional shared PostgreSQL storage:
+# runlimit-postgres = { git = "https://github.com/bpcakes/batter.git", rev = "70cc6a05be6857aca6ea2f5f127258e75e673d8c" }
 # Optional typed HTTP response metadata:
-# runlimit-http = "0.3.0"
-# Or, for a shared cross-replica quota:
-# runlimit-postgres = "0.3.0"
+# runlimit-http = { git = "https://github.com/bpcakes/batter.git", rev = "70cc6a05be6857aca6ea2f5f127258e75e673d8c" }
+# Optional Axum/Tower admission middleware:
+# runlimit-axum = { git = "https://github.com/bpcakes/batter.git", rev = "70cc6a05be6857aca6ea2f5f127258e75e673d8c" }
 ```
 
-During development from a source checkout, a sibling project can use path
-dependencies:
-
-```toml
-[dependencies]
-runlimit-core = { path = "../runlimit/crates/runlimit-core" }
-runlimit-memory = { path = "../runlimit/crates/runlimit-memory" }
-```
-
-Use a pinned Git revision instead when builds do not share a filesystem.
+The pin selects a merged Batter commit containing Runlimit and Runledger.
+Cargo resolves the named packages from the Git repository; no sibling checkout
+or consumer `[patch]` is needed. Keep related native packages and any direct
+Batter dependencies on the same URL and revision. Existing crates.io releases
+remain available but do not follow the repository move. See
+[Moving to Batter](MOVED_TO_BATTER.md) for upgrade guidance.
 
 ## Memory backend example
 
