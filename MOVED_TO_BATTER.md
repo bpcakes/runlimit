@@ -30,21 +30,26 @@ this move automatically. They continue to select their original source. The
 Batter workspace packages have publishing disabled; their retained version
 numbers do not announce a replacement crates.io release.
 
-To follow ongoing development, use a complete Batter checkout. A sibling
-application can select its native packages with paths such as:
+Use Cargo Git dependencies pinned to a full Batter commit. Cargo finds the
+named packages inside the repository; no sibling checkout or consumer
+`[patch]` is required:
 
 ```toml
 [dependencies]
-runlimit-core = { path = "../batter/runlimit/runlimit-core" }
-runlimit-memory = { path = "../batter/runlimit/runlimit-memory" }
+runlimit-core = { git = "https://github.com/bpcakes/batter.git", rev = "70cc6a05be6857aca6ea2f5f127258e75e673d8c" }
+runlimit-memory = { git = "https://github.com/bpcakes/batter.git", rev = "70cc6a05be6857aca6ea2f5f127258e75e673d8c" }
 # Optional shared PostgreSQL storage:
-# runlimit-postgres = { path = "../batter/runlimit/runlimit-postgres" }
+# runlimit-postgres = { git = "https://github.com/bpcakes/batter.git", rev = "70cc6a05be6857aca6ea2f5f127258e75e673d8c" }
+# Optional typed HTTP response metadata:
+# runlimit-http = { git = "https://github.com/bpcakes/batter.git", rev = "70cc6a05be6857aca6ea2f5f127258e75e673d8c" }
+# Optional Axum/Tower admission middleware:
+# runlimit-axum = { git = "https://github.com/bpcakes/batter.git", rev = "70cc6a05be6857aca6ea2f5f127258e75e673d8c" }
 ```
 
-For Git dependencies, use `https://github.com/bpcakes/batter.git` and pin related
-packages to the same full commit from Batter's `master` containing the migration.
-Keep the whole workspace when using paths; copying one crate alone loses its
-workspace dependencies and build assets. Follow Batter's
+This example pins a merged Batter commit containing both native libraries.
+When upgrading, choose a reviewed full commit from Batter's `master` containing
+the migrations. Pin all related native packages, including Runledger if used,
+and any direct Batter dependencies to the same URL and revision. Follow Batter's
 [compatibility guidance](https://github.com/bpcakes/batter/blob/master/docs/reference-compatibility.md),
 regenerate the application's lockfile with Cargo, and validate its dependency
 graph and application tests before deploying an upgrade.
