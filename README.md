@@ -279,7 +279,7 @@ on a backend also enables it for `runlimit-core`:
 
 ```toml
 [dependencies]
-runlimit-memory = { version = "0.3.0", features = ["serde"] }
+runlimit-memory = { git = "https://github.com/bpcakes/batter.git", rev = "70cc6a05be6857aca6ea2f5f127258e75e673d8c", features = ["serde"] }
 ```
 
 The feature serializes validated policy and scope identifiers as strings;
