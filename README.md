@@ -1,5 +1,11 @@
 # Runlimit
 
+> **Development has moved to [Batter](https://github.com/bpcakes/batter/tree/master/runlimit).**
+> Runlimit is now maintained as native crates inside the Batter workspace.
+> See [Moving to Batter](MOVED_TO_BATTER.md) for consumer guidance. The standalone
+> installation, development and release instructions below are historical; use
+> [the current Runlimit documentation](https://github.com/bpcakes/batter/blob/master/runlimit/README.md) for new work.
+
 Runlimit is a framework-neutral Rust library for keyed rate limiting. It
 provides anchored fixed windows in memory or across PostgreSQL-backed replicas,
 plus hard-bounded memory and PostgreSQL GCRA backends for continuously replenished

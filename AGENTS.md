@@ -1,5 +1,11 @@
 # Runlimit contributor guide
 
+Ongoing Runlimit development, issues and pull requests belong in
+[Batter](https://github.com/bpcakes/batter/tree/master/runlimit). Read its root
+and native Runlimit agent guides before making changes there. This guide remains
+applicable when inspecting or maintaining this historical standalone checkout.
+See [the relocation notice](MOVED_TO_BATTER.md).
+
 Runlimit is a framework-neutral rate-limiting library. Keep application policy
 at the application boundary and keep backend behavior aligned.
 
